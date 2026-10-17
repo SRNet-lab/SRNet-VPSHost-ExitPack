@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SRNet <121732083+SRNet-lab@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH 5/5] Exit policy: routed-range=public (mask 0) match-all;
+ enforce configured dest port
+
+Without the mask-0 fix, routed-range=public could
+reject every destination (to_base(0) shift UB), so lease-admitted clients reached
+the exit but all packets were dropped (found in live testing). The port match
+makes policy=tcp/443 mean port 443 only, so omitting tcp/53 and udp/53 denies DNS.
+---
+ src/net/policy.cpp | 23 ++++++++++++++++++++---
+ src/net/policy.hpp |  2 +-
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/src/net/policy.cpp b/src/net/policy.cpp
+index 753dfd5..42a4b4b 100644
+--- a/src/net/policy.cpp
++++ b/src/net/policy.cpp
+@@ -37,16 +37,33 @@ namespace srouter
+             throw std::invalid_argument{"Cannot determine protocol name for IP Protocol: {}"_format(proto)};
+         }
+ 
+-        bool ProtocolInfo::matches_packet_proto(const IPPacket& pkt) const { return pkt.protocol() == protocol; }
++        bool ProtocolInfo::matches_packet_proto(const IPPacket& pkt) const
++        {
++            if (pkt.protocol() != protocol)
++                return false;
++            // When a port is configured (e.g. policy=tcp/443 or udp/53), require a dest-port match so
++            // tcp/443 does not silently allow all TCP, and omitting tcp/53 / udp/53 really denies DNS.
++            if (port)
++            {
++                auto dp = pkt.dest_port();
++                if (not dp or *dp != *port)
++                    return false;
++            }
++            return true;
++        }
+ 
+         bool ExitPolicy::allow_ip_traffic(const IPPacket& pkt) const
+         {
+             // ranges are always the allow list (if empty, we route nothing).  Add a 0.0.0.0/0 or
+             // ::/0 if you want to allow everything.
+             auto accept_range = pkt.is_ipv4()
+-                ? std::ranges::any_of(ranges, [dest = *pkt.dest_ipv4()](const auto& r) { return r.contains(dest); })
++                // mask==0 means "all addresses" (routed-range=public); to_base(0) shifts by the full
++                // width (UB) so contains() can wrongly reject. Treat mask 0 as match-all.
++                ? std::ranges::any_of(
++                      ranges, [dest = *pkt.dest_ipv4()](const auto& r) { return r.mask == 0 or r.contains(dest); })
+                 : pkt.is_ipv6()
+-                ? std::ranges::any_of(ranges_v6, [dest = *pkt.dest_ipv6()](const auto& r) { return r.contains(dest); })
++                ? std::ranges::any_of(
++                      ranges_v6, [dest = *pkt.dest_ipv6()](const auto& r) { return r.mask == 0 or r.contains(dest); })
+                 : false;
+ 
+             if (!accept_range)
+diff --git a/src/net/policy.hpp b/src/net/policy.hpp
+index ee17fb0..148e458 100644
+--- a/src/net/policy.hpp
++++ b/src/net/policy.hpp
+@@ -130,7 +130,7 @@ namespace srouter
+             /// protocols that are explicity allowed.  If empty, allow all.
+             std::set<ProtocolInfo> protocols;
+ 
+-            bool empty() const { return ranges.empty() and protocols.empty(); }
++            bool empty() const { return ranges.empty() and ranges_v6.empty() and protocols.empty(); }
+ 
+             void bt_encode(oxenc::bt_dict_producer&& btdp) const;
+ 

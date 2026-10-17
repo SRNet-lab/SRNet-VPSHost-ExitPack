@@ -1,0 +1,704 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SRNet <121732083+SRNet-lab@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH 1/5] Exit auth: enforce validate before map/accept; signed
+ lease admission
+
+- Call SessionEndpoint::validate in session_post_init before any map/accept
+  and in map_session_v4/v6 (upstream parsed auth-type=whitelist but never
+  enforced it, so stock exits admitted everyone).
+- After open/static-token/whitelist, admit a client holding a signed v2
+  exit_lease admission for this exit (.sesh) and that client (.sesh),
+  unexpired, Ed25519-signed by SR_EXIT_LEASE_ISSUER_PUBKEY, read from
+  SR_EXIT_LEASE_ADMISSIONS. Fail closed; unsigned v1 records refused.
+- Unit tests (test_exit_lease_admission) and exit-lease-verify tool.
+---
+ src/auth/EXIT-LEASE-ADMISSION.md        |  32 +++
+ src/auth/exit_lease_admission.hpp       | 272 ++++++++++++++++++++++++
+ src/handlers/session.cpp                |  97 ++++++++-
+ test/CMakeLists.txt                     |  16 ++
+ test/auth/test_exit_lease_admission.cpp | 194 +++++++++++++++++
+ 5 files changed, 604 insertions(+), 7 deletions(-)
+ create mode 100644 src/auth/EXIT-LEASE-ADMISSION.md
+ create mode 100644 src/auth/exit_lease_admission.hpp
+ create mode 100644 test/auth/test_exit_lease_admission.cpp
+
+diff --git a/src/auth/EXIT-LEASE-ADMISSION.md b/src/auth/EXIT-LEASE-ADMISSION.md
+new file mode 100644
+index 0000000..d4e4218
+--- /dev/null
++++ b/src/auth/EXIT-LEASE-ADMISSION.md
+@@ -0,0 +1,32 @@
++# Exit lease admission
++
++`SessionEndpoint::validate` (src/handlers/session.cpp) runs before any inbound map/accept
++(`session_post_init`) and again in `map_session_v4` / `map_session_v6`. Upstream never called it,
++which is why `auth-type=whitelist` used to be ignored.
++
++Checks, in order:
++
++1. Explicit open: `auth-type` none **and** no static tokens **and** an empty whitelist.
++2. Static token hit.
++3. Whitelist hit.
++4. A **signed v2 admission** in the store file `SR_EXIT_LEASE_ADMISSIONS`, signed by the Ed25519
++   issuer key `SR_EXIT_LEASE_ISSUER_PUBKEY` (64 hex characters).
++
++A v2 record:
++
++| Field | Rule |
++|-------|------|
++| `kind` | `exit_lease_admission` |
++| `scope` | `exit_lease` |
++| `v` | `2` (unsigned v1 is refused) |
++| `lock_seller_id` | exact match to this exit's own client `.sesh` |
++| `client_sesh` | exact match to the inbound `remote` |
++| `exp` | unix seconds, `exp > now` |
++| `tid` | optional string, covered by the signature |
++| `sig` | hex Ed25519 over `srnet-exit-admission/v2\n{seller}\n{client}\n{exp}\n{tid}` |
++
++The check fails closed: if either env var is unset, or the record is malformed, forged, for the
++wrong seller or client, or expired, nobody is admitted by step 4.
++
++The seller-side issuer is `contrib/exit-lease/admission.py`. To check a record exactly the way the
++exit would, run `exit-lease-verify`.
+diff --git a/src/auth/exit_lease_admission.hpp b/src/auth/exit_lease_admission.hpp
+new file mode 100644
+index 0000000..147653c
+--- /dev/null
++++ b/src/auth/exit_lease_admission.hpp
+@@ -0,0 +1,272 @@
++#pragma once
++
++// Exit-side lease admission.
++//
++// A buyer who paid for seller S is admitted to S's exit without any
++// hand-edited whitelist. The seller's own admission issuer (seller pack
++// daemon, which checks payment on chain) writes signed admission records into
++// a local store file. The exit admits an inbound client `remote` only when a
++// record:
++//
++//   kind           == "exit_lease_admission"
++//   scope          == "exit_lease"
++//   v              == 2
++//   lock_seller_id == this exit's own client .sesh   (exact string)
++//   client_sesh    == remote.to_string()             (exact string)
++//   exp            >  now (unix seconds)
++//   sig            == hex Ed25519 detached signature by the issuer key over
++//                     admission_message(lock_seller_id, client_sesh, exp, tid)
++//
++// Store file: env SR_EXIT_LEASE_ADMISSIONS (path). Any JSON shape; every
++// object anywhere in the document is considered (admissions map keyed by tid,
++// an array, or a single {"admission": {...}}).
++// Issuer key: env SR_EXIT_LEASE_ISSUER_PUBKEY (64 hex chars, Ed25519 public).
++//
++// Fail closed: no store, unreadable/oversized/invalid JSON, no issuer key, or
++// a bad issuer key admits nobody by this path. Unsigned v1 records are
++// NOT accepted. Static token / whitelist / explicit open behaviour is
++// unchanged and evaluated first.
++
++#include <nlohmann/json.hpp>
++#include <sodium/crypto_sign.h>
++
++#include <array>
++#include <cstdint>
++#include <fstream>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace srouter::auth
++{
++    struct ExitLeaseAuthResult
++    {
++        bool allow{false};
++        // Stable literal: open_none, static_token, whitelist, admission, no_store,
++        // no_issuer, bad_issuer, bad_file, no_match, wrong_client, wrong_seller,
++        // expired, bad_record, bad_sig.
++        const char* reason{"no_match"};
++    };
++
++    inline constexpr std::string_view ADMISSION_DOMAIN = "srnet-exit-admission/v2";
++    inline constexpr size_t ADMISSION_MAX_FILE = 4u << 20;
++
++    /// Exact bytes the issuer signs. Newline separated; fields cannot contain '\n'
++    /// (rejected on parse).
++    inline std::string admission_message(
++        std::string_view seller, std::string_view client, std::int64_t exp, std::string_view tid)
++    {
++        std::string m;
++        m.reserve(ADMISSION_DOMAIN.size() + seller.size() + client.size() + tid.size() + 32);
++        m.append(ADMISSION_DOMAIN).push_back('\n');
++        m.append(seller).push_back('\n');
++        m.append(client).push_back('\n');
++        m.append(std::to_string(exp)).push_back('\n');
++        m.append(tid);
++        return m;
++    }
++
++    namespace detail
++    {
++        inline int hexval(char c)
++        {
++            if (c >= '0' && c <= '9')
++                return c - '0';
++            if (c >= 'a' && c <= 'f')
++                return c - 'a' + 10;
++            if (c >= 'A' && c <= 'F')
++                return c - 'A' + 10;
++            return -1;
++        }
++
++        template <size_t N>
++        std::optional<std::array<unsigned char, N>> from_hex(std::string_view h)
++        {
++            if (h.size() != 2 * N)
++                return std::nullopt;
++            std::array<unsigned char, N> out{};
++            for (size_t i = 0; i < N; ++i)
++            {
++                const int a = hexval(h[2 * i]), b = hexval(h[2 * i + 1]);
++                if (a < 0 || b < 0)
++                    return std::nullopt;
++                out[i] = static_cast<unsigned char>((a << 4) | b);
++            }
++            return out;
++        }
++
++        using PubKey = std::array<unsigned char, crypto_sign_PUBLICKEYBYTES>;
++
++        struct Scan
++        {
++            bool saw_any{false}, wrong_seller{false}, wrong_client{false}, expired{false}, bad{false},
++                bad_sig{false};
++        };
++
++        inline bool get_str(const nlohmann::json& o, const char* k, std::string& out)
++        {
++            auto it = o.find(k);
++            if (it == o.end() || !it->is_string())
++                return false;
++            out = it->get<std::string>();
++            return out.find('\n') == std::string::npos;
++        }
++
++        inline bool check_record(
++            const nlohmann::json& o,
++            const PubKey& issuer,
++            std::string_view this_seller,
++            std::string_view remote,
++            std::int64_t now,
++            Scan& sc)
++        {
++            std::string kind;
++            if (!get_str(o, "kind", kind) || kind != "exit_lease_admission")
++                return false;  // not an admission object; ignore
++            sc.saw_any = true;
++            std::string scope, seller, client, tid, sig_hex;
++            const bool shape = get_str(o, "scope", scope) && scope == "exit_lease"
++                && o.contains("v") && o["v"].is_number_integer() && o["v"].get<std::int64_t>() == 2
++                && get_str(o, "lock_seller_id", seller) && get_str(o, "client_sesh", client)
++                && o.contains("exp") && o["exp"].is_number_integer() && get_str(o, "sig", sig_hex);
++            if (!shape || (o.contains("tid") && !get_str(o, "tid", tid)))
++            {
++                sc.bad = true;
++                return false;
++            }
++            if (seller != this_seller)
++            {
++                sc.wrong_seller = true;
++                return false;
++            }
++            if (client != remote)
++            {
++                sc.wrong_client = true;
++                return false;
++            }
++            const auto exp = o["exp"].get<std::int64_t>();
++            const auto sig = from_hex<crypto_sign_BYTES>(sig_hex);
++            if (!sig)
++            {
++                sc.bad_sig = true;
++                return false;
++            }
++            const auto msg = admission_message(seller, client, exp, tid);
++            if (crypto_sign_verify_detached(
++                    sig->data(), reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), issuer.data())
++                != 0)
++            {
++                sc.bad_sig = true;
++                return false;
++            }
++            if (!(exp > now))
++            {
++                sc.expired = true;
++                return false;
++            }
++            return true;
++        }
++
++        inline bool walk(
++            const nlohmann::json& j,
++            const PubKey& issuer,
++            std::string_view seller,
++            std::string_view remote,
++            std::int64_t now,
++            Scan& sc,
++            int depth = 0)
++        {
++            if (depth > 16)
++                return false;
++            if (j.is_object())
++            {
++                if (check_record(j, issuer, seller, remote, now, sc))
++                    return true;
++                for (const auto& [k, v] : j.items())
++                    if ((v.is_object() || v.is_array()) && walk(v, issuer, seller, remote, now, sc, depth + 1))
++                        return true;
++            }
++            else if (j.is_array())
++            {
++                for (const auto& v : j)
++                    if (walk(v, issuer, seller, remote, now, sc, depth + 1))
++                        return true;
++            }
++            return false;
++        }
++    }  // namespace detail
++
++    /// Pure check over the store text (unit-testable).
++    inline ExitLeaseAuthResult admission_in_text(
++        std::string_view text,
++        std::string_view issuer_pubkey_hex,
++        std::string_view this_seller,
++        std::string_view remote_client,
++        std::int64_t now_unix)
++    {
++        if (issuer_pubkey_hex.empty())
++            return {false, "no_issuer"};
++        const auto issuer = detail::from_hex<crypto_sign_PUBLICKEYBYTES>(issuer_pubkey_hex);
++        if (!issuer)
++            return {false, "bad_issuer"};
++        if (this_seller.empty() || remote_client.empty())
++            return {false, "no_match"};
++        auto j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
++        if (j.is_discarded())
++            return {false, "bad_file"};
++        detail::Scan sc;
++        if (detail::walk(j, *issuer, this_seller, remote_client, now_unix, sc))
++            return {true, "admission"};
++        if (sc.bad_sig)
++            return {false, "bad_sig"};
++        if (sc.expired)
++            return {false, "expired"};
++        if (sc.bad)
++            return {false, "bad_record"};
++        if (sc.wrong_client)
++            return {false, "wrong_client"};
++        if (sc.wrong_seller)
++            return {false, "wrong_seller"};
++        return {false, "no_match"};
++    }
++
++    /// Order matches SessionEndpoint::validate:
++    ///   1. explicit open (auth-type none AND no static lists)  2. static token
++    ///   3. whitelist  4. signed lease admission for this seller + remote.
++    inline ExitLeaseAuthResult exit_lease_auth_allows(
++        bool open_none_empty_lists,
++        bool static_token_hit,
++        bool whitelist_hit,
++        std::string_view admissions_path,
++        std::string_view issuer_pubkey_hex,
++        std::string_view this_seller,
++        std::string_view remote_client,
++        std::int64_t now_unix)
++    {
++        if (open_none_empty_lists)
++            return {true, "open_none"};
++        if (static_token_hit)
++            return {true, "static_token"};
++        if (whitelist_hit)
++            return {true, "whitelist"};
++        if (admissions_path.empty())
++            return {false, "no_store"};
++        if (issuer_pubkey_hex.empty())
++            return {false, "no_issuer"};
++
++        std::ifstream in{std::string{admissions_path}, std::ios::in | std::ios::binary};
++        if (!in)
++            return {false, "bad_file"};
++        std::string text;
++        char buf[8192];
++        while (in)
++        {
++            in.read(buf, sizeof(buf));
++            if (const auto n = in.gcount(); n > 0)
++                text.append(buf, static_cast<size_t>(n));
++            if (text.size() > ADMISSION_MAX_FILE)
++                return {false, "bad_file"};
++        }
++        return admission_in_text(text, issuer_pubkey_hex, this_seller, remote_client, now_unix);
++    }
++}  // namespace srouter::auth
+diff --git a/src/handlers/session.cpp b/src/handlers/session.cpp
+index 333ad3f..7da10e2 100644
+--- a/src/handlers/session.cpp
++++ b/src/handlers/session.cpp
+@@ -1,5 +1,10 @@
+ #include "session.hpp"
+ 
++#include "auth/exit_lease_admission.hpp"
++
++#include <cstdlib>
++#include <cstdint>
++
+ #include "constants/path.hpp"
+ #include "contact/contactdb.hpp"
+ #include "contact/relay_contact.hpp"
+@@ -1028,24 +1033,84 @@ namespace srouter::handlers
+     bool SessionEndpoint::validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth)
+     {
+         auto& netconf = router.config().network;
++        const auto auth_type = netconf.auth_type;
+         auto& tokens = netconf.auth_static_tokens;
+         auto& whitelist = netconf.auth_whitelist;
+-        if (tokens.empty() && whitelist.empty())
+-            return true;  // No auth required
+ 
+-        if (maybe_auth && tokens.contains(*maybe_auth))
+-            return true;  // valid auth token
++        // Open endpoint only when auth is explicitly disabled and no static lists are configured.
++        // Unchanged from upstream; this does not switch the endpoint to open auth.
++        const bool open_none_empty_lists =
++            auth_type == auth::AuthType::NONE && tokens.empty() && whitelist.empty();
++
++        const bool static_token_hit = maybe_auth && tokens.contains(*maybe_auth);
++
++        // Whitelist hit is checked before lease admission.
++        const bool whitelist_hit = whitelist.contains(remote);
++
++        // Lease admission: signed record from the seller's issuer (SR_EXIT_LEASE_ISSUER_PUBKEY) in the
++        // store file SR_EXIT_LEASE_ADMISSIONS. Either unset = nobody admitted by this path (fail closed).
++        // Seller is this exit's own client .sesh, never an env override.
++        const char* store_env = std::getenv("SR_EXIT_LEASE_ADMISSIONS");
++        const std::string_view store = (store_env && store_env[0]) ? std::string_view{store_env} : std::string_view{};
++        const char* issuer_env = std::getenv("SR_EXIT_LEASE_ISSUER_PUBKEY");
++        const std::string_view issuer =
++            (issuer_env && issuer_env[0]) ? std::string_view{issuer_env} : std::string_view{};
++        std::string this_seller;
++        try
++        {
++            if (!router.is_service_node)
++                this_seller = NetworkAddress{router.key_manager.router_id(), true}.to_string();
++        }
++        catch (...)
++        {
++            this_seller.clear();
++        }
+ 
+-        if (whitelist.contains(remote))
+-            return true;  // valid address
++        const auto now_unix = std::chrono::duration_cast<std::chrono::seconds>(
++                                  std::chrono::system_clock::now().time_since_epoch())
++                                  .count();
++
++        const auto decided = srouter::auth::exit_lease_auth_allows(
++            open_none_empty_lists,
++            static_token_hit,
++            whitelist_hit,
++            store,
++            issuer,
++            this_seller,
++            remote.to_string(),
++            static_cast<std::int64_t>(now_unix));
++
++        if (decided.allow && std::string_view{decided.reason} == "admission")
++        {
++            log::info(
++                logcat,
++                "Inbound session admitted by signed exit_lease admission (not whitelist) for {}: {}",
++                this_seller,
++                remote);
++        }
++        else if (!decided.allow && !store.empty())
++        {
++            log::debug(
++                logcat,
++                "exit_lease admission did not admit {} ({}): {}",
++                remote,
++                decided.reason,
++                this_seller);
++        }
+ 
+-        return false;
++        return decided.allow;
+     }
+ 
+     std::optional<ipv4> SessionEndpoint::map_session_v4(const session::Session& s)
+     {
+         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+ 
++        if (!validate(s.remote()))
++        {
++            log::warning(logcat, "Refusing ipv4 map for non-authorized remote {}", s.remote());
++            return std::nullopt;
++        }
++
+         if (const auto& tun = router.tun_endpoint())
+         {
+             log::debug(logcat, "Mapping local tun ipv4 for inbound session from {}", s.remote());
+@@ -1066,6 +1131,12 @@ namespace srouter::handlers
+     {
+         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+ 
++        if (!validate(s.remote()))
++        {
++            log::warning(logcat, "Refusing ipv6 map for non-authorized remote {}", s.remote());
++            return std::nullopt;
++        }
++
+         if (const auto& tun = router.tun_endpoint())
+         {
+             log::debug(logcat, "Successfully mapped inbound session; mapping session to local TUN IPv6");
+@@ -1117,6 +1188,18 @@ namespace srouter::handlers
+ 
+     void SessionEndpoint::session_post_init(std::shared_ptr<session::InboundSession> new_session)
+     {
++        // Enforce [network] auth-type / auth-whitelist / auth-static before any map or accept.
++        // Without this gate, auth-type=whitelist was parsed into config but never applied on the
++        // inbound path (unlisted clients were mapped and could forward).
++        if (!validate(new_session->remote()))
++        {
++            log::warning(
++                logcat,
++                "Inbound session rejected by auth policy (not whitelisted / no valid auth): {}",
++                new_session->remote());
++            return;
++        }
++
+         // FIXME: for now only tun clients can have inbound sessions, but eventually that will
+         //        not be the case and we'll need to "if tun" this.
+         if (!map_session_v6(*new_session))
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index bd5b0d3..613fb53 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -64,3 +64,19 @@ if(WIN32)
+ endif()
+ 
+ add_custom_target(check COMMAND testAll)
++
++# Exit-side lease admission test target. Standalone: does not need the full router libs.
++add_executable(test_exit_lease_admission
++  auth/test_exit_lease_admission.cpp
++  Catch2/extras/catch_amalgamated.cpp)
++target_include_directories(test_exit_lease_admission PRIVATE
++  ${PROJECT_SOURCE_DIR}/src
++  ${CMAKE_CURRENT_SOURCE_DIR}/Catch2/extras)
++target_link_libraries(test_exit_lease_admission PRIVATE nlohmann_json::nlohmann_json sodium)
++target_compile_features(test_exit_lease_admission PRIVATE cxx_std_20)
++add_custom_target(check_exit_lease COMMAND test_exit_lease_admission DEPENDS test_exit_lease_admission)
++
++add_executable(exit-lease-verify ${PROJECT_SOURCE_DIR}/contrib/exit-lease/verify_main.cpp)
++target_include_directories(exit-lease-verify PRIVATE ${PROJECT_SOURCE_DIR}/src)
++target_link_libraries(exit-lease-verify PRIVATE nlohmann_json::nlohmann_json sodium)
++target_compile_features(exit-lease-verify PRIVATE cxx_std_20)
+diff --git a/test/auth/test_exit_lease_admission.cpp b/test/auth/test_exit_lease_admission.cpp
+new file mode 100644
+index 0000000..0023fae
+--- /dev/null
++++ b/test/auth/test_exit_lease_admission.cpp
+@@ -0,0 +1,194 @@
++// Unit tests for exit-side lease admission (src/auth/exit_lease_admission.hpp).
++// Standalone: needs only nlohmann, libsodium and Catch2 (amalgamated).
++#include "auth/exit_lease_admission.hpp"
++
++#include <catch_amalgamated.hpp>
++#include <sodium.h>
++
++#include <cstdio>
++#include <fstream>
++#include <string>
++
++using namespace srouter::auth;
++using nlohmann::json;
++
++namespace
++{
++    const std::string SELLER = "testseller100000000000000000000000000000000000000000.sesh";
++    const std::string OTHER_SELLER = "testseller200000000000000000000000000000000000000000.sesh";
++    const std::string STRANGER = "testclient000000000000000000000000000000000000000.sesh";
++    const std::string OTHER_CLIENT = "testclient100000000000000000000000000000000000000000.sesh";
++    constexpr std::int64_t NOW = 1'760'000'000;
++
++    std::string hex(const unsigned char* p, size_t n)
++    {
++        static const char* d = "0123456789abcdef";
++        std::string s;
++        for (size_t i = 0; i < n; ++i)
++        {
++            s.push_back(d[p[i] >> 4]);
++            s.push_back(d[p[i] & 15]);
++        }
++        return s;
++    }
++
++    struct Issuer
++    {
++        unsigned char pk[crypto_sign_PUBLICKEYBYTES];
++        unsigned char sk[crypto_sign_SECRETKEYBYTES];
++        Issuer() { crypto_sign_keypair(pk, sk); }
++        std::string pk_hex() const { return hex(pk, sizeof pk); }
++
++        json record(
++            const std::string& seller, const std::string& client, std::int64_t exp, const std::string& tid = "t1") const
++        {
++            const auto m = admission_message(seller, client, exp, tid);
++            unsigned char sig[crypto_sign_BYTES];
++            crypto_sign_detached(sig, nullptr, reinterpret_cast<const unsigned char*>(m.data()), m.size(), sk);
++            return json{
++                {"kind", "exit_lease_admission"},
++                {"scope", "exit_lease"},
++                {"v", 2},
++                {"tid", tid},
++                {"lock_seller_id", seller},
++                {"client_sesh", client},
++                {"exp", exp},
++                {"sig", hex(sig, sizeof sig)}};
++        }
++    };
++
++    json store(std::initializer_list<json> recs)
++    {
++        json a = json::object();
++        int i = 0;
++        for (const auto& r : recs)
++            a["tid" + std::to_string(i++)] = r;
++        return json{{"admissions", a}};
++    }
++
++    std::string reason(const ExitLeaseAuthResult& r) { return r.reason; }
++}  // namespace
++
++TEST_CASE("paid stranger not on any whitelist is admitted")
++{
++    REQUIRE(sodium_init() >= 0);
++    Issuer is;
++    auto s = store({is.record(SELLER, STRANGER, NOW + 3600)}).dump();
++    auto r = admission_in_text(s, is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK(r.allow);
++    CHECK(reason(r) == "admission");
++}
++
++TEST_CASE("unpaid client (no record) is refused")
++{
++    Issuer is;
++    auto s = store({is.record(SELLER, OTHER_CLIENT, NOW + 3600)}).dump();
++    auto r = admission_in_text(s, is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK_FALSE(r.allow);
++    CHECK(reason(r) == "wrong_client");
++    CHECK(reason(admission_in_text(R"({"admissions":{}})", is.pk_hex(), SELLER, STRANGER, NOW)) == "no_match");
++}
++
++TEST_CASE("expired lease is refused, boundary exp == now refused")
++{
++    Issuer is;
++    CHECK(reason(admission_in_text(store({is.record(SELLER, STRANGER, NOW - 1)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW))
++          == "expired");
++    CHECK_FALSE(admission_in_text(store({is.record(SELLER, STRANGER, NOW)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    CHECK(admission_in_text(store({is.record(SELLER, STRANGER, NOW + 1)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++}
++
++TEST_CASE("lease for another seller does not open this exit")
++{
++    Issuer is;
++    auto r = admission_in_text(store({is.record(OTHER_SELLER, STRANGER, NOW + 3600)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK_FALSE(r.allow);
++    CHECK(reason(r) == "wrong_seller");
++}
++
++TEST_CASE("forged or tampered records are refused")
++{
++    Issuer is, mallory;
++    // Signed by someone else's key.
++    CHECK(reason(admission_in_text(store({mallory.record(SELLER, STRANGER, NOW + 3600)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW))
++          == "bad_sig");
++    // Extended exp after signing.
++    auto rec = is.record(SELLER, STRANGER, NOW + 60);
++    rec["exp"] = NOW + 999999;
++    CHECK(reason(admission_in_text(store({rec}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++    // Re-targeted to a different client after signing.
++    auto rec2 = is.record(SELLER, OTHER_CLIENT, NOW + 3600);
++    rec2["client_sesh"] = STRANGER;
++    CHECK(reason(admission_in_text(store({rec2}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++    // Changed tid after signing.
++    auto rec3 = is.record(SELLER, STRANGER, NOW + 3600, "a");
++    rec3["tid"] = "b";
++    CHECK(reason(admission_in_text(store({rec3}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++    // Garbage signature.
++    auto rec4 = is.record(SELLER, STRANGER, NOW + 3600);
++    rec4["sig"] = "zz";
++    CHECK(reason(admission_in_text(store({rec4}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++}
++
++TEST_CASE("unsigned v1 admission records are rejected")
++{
++    Issuer is;
++    json v1{{"kind", "exit_lease_admission"},
++            {"scope", "exit_lease"},
++            {"v", 1},
++            {"lock_seller_id", SELLER},
++            {"client_sesh", STRANGER},
++            {"exp", NOW + 3600}};
++    auto r = admission_in_text(store({v1}).dump(), is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK_FALSE(r.allow);
++    CHECK(reason(r) == "bad_record");
++}
++
++TEST_CASE("fail closed on missing issuer, bad issuer, bad file")
++{
++    Issuer is;
++    auto s = store({is.record(SELLER, STRANGER, NOW + 3600)}).dump();
++    CHECK(reason(admission_in_text(s, "", SELLER, STRANGER, NOW)) == "no_issuer");
++    CHECK(reason(admission_in_text(s, "abcd", SELLER, STRANGER, NOW)) == "bad_issuer");
++    CHECK(reason(admission_in_text("{not json", is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_file");
++    CHECK(reason(admission_in_text(s, is.pk_hex(), "", STRANGER, NOW)) == "no_match");
++    // Newline injection in a field is rejected as a bad record.
++    auto rec = is.record(SELLER, STRANGER, NOW + 3600);
++    rec["tid"] = "x\nexit";
++    CHECK(reason(admission_in_text(store({rec}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_record");
++}
++
++TEST_CASE("record shapes: array, present-body, mixed store")
++{
++    Issuer is;
++    json arr = json::array({is.record(SELLER, OTHER_CLIENT, NOW + 3600), is.record(SELLER, STRANGER, NOW + 3600)});
++    CHECK(admission_in_text(arr.dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    json body{{"body", {{"admission", is.record(SELLER, STRANGER, NOW + 3600)}}}};
++    CHECK(admission_in_text(body.dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    // An expired record and a valid one for the same client: valid wins.
++    auto s = store({is.record(SELLER, STRANGER, NOW - 10, "old"), is.record(SELLER, STRANGER, NOW + 10, "new")});
++    CHECK(admission_in_text(s.dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++}
++
++TEST_CASE("validate ordering: open/token/whitelist first, then store file")
++{
++    Issuer is;
++    CHECK(reason(exit_lease_auth_allows(true, false, false, "", "", SELLER, STRANGER, NOW)) == "open_none");
++    CHECK(reason(exit_lease_auth_allows(false, true, false, "", "", SELLER, STRANGER, NOW)) == "static_token");
++    CHECK(reason(exit_lease_auth_allows(false, false, true, "", "", SELLER, STRANGER, NOW)) == "whitelist");
++    CHECK(reason(exit_lease_auth_allows(false, false, false, "", is.pk_hex(), SELLER, STRANGER, NOW)) == "no_store");
++
++    const std::string path = "exit_lease_admission_test_store.json";
++    {
++        std::ofstream f{path};
++        f << store({is.record(SELLER, STRANGER, NOW + 3600)}).dump();
++    }
++    CHECK(reason(exit_lease_auth_allows(false, false, false, path, "", SELLER, STRANGER, NOW)) == "no_issuer");
++    auto r = exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK(r.allow);
++    CHECK(reason(r) == "admission");
++    CHECK_FALSE(exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, OTHER_CLIENT, NOW).allow);
++    CHECK(reason(exit_lease_auth_allows(false, false, false, "/nonexistent/x.json", is.pk_hex(), SELLER, STRANGER, NOW))
++          == "bad_file");
++    std::remove(path.c_str());
++}

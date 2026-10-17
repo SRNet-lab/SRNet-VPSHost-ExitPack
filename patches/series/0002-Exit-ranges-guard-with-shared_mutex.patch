@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SRNet <121732083+SRNet-lab@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH 2/5] Exit ranges: guard with shared_mutex
+
+RPC MapExit/UnmapExit/SwapExits (OMQ thread) mutate exit ranges while the
+packet path (TUN thread) reads them. Writers now take
+Router::exit_ranges_mutex() exclusively; exit_for_ip, remote_is_exit_broker,
+on_connected and ListExits take it shared (ListExits copies a snapshot).
+No routing/session calls are made under the exclusive lock.
+---
+ src/handlers/tun.cpp   |  7 +++++-
+ src/router/router.hpp  | 12 ++++++++++
+ src/rpc/rpc_server.cpp | 54 +++++++++++++++++++++++++++++-------------
+ 3 files changed, 55 insertions(+), 18 deletions(-)
+
+diff --git a/src/handlers/tun.cpp b/src/handlers/tun.cpp
+index 5544004..0efe6cd 100644
+--- a/src/handlers/tun.cpp
++++ b/src/handlers/tun.cpp
+@@ -5,6 +5,8 @@
+ #include <oxenc/endian.h>
+ 
+ #include <chrono>
++#include <mutex>
++#include <shared_mutex>
+ #include <span>
+ #include <variant>
+ #ifndef _WIN32
+@@ -140,7 +142,7 @@ namespace srouter::handlers
+         // Bring default route up once we have edge connectivity and reserved-range exit mappings.
+         _router.on_connected(
+             [this] {
+-                if (_route_poker and _route_poker->enabled() and not _router.config().exit.ranges.empty())
++                if (_route_poker and _route_poker->enabled() and _router.has_exit_ranges())
+                     _route_poker->put_up();
+             },
+             /*with_paths=*/false,
+@@ -370,6 +372,7 @@ namespace srouter::handlers
+     {
+         // Only remotes listed in exit.ranges are exit brokers for inbound return traffic.
+         // Do not treat an arbitrary exit-policy ClientContact peer as a broker.
++        std::shared_lock lock{_router.exit_ranges_mutex()};
+         return _router.config().exit.ranges.contains(remote);
+     }
+ 
+@@ -378,6 +381,7 @@ namespace srouter::handlers
+         // Longest-prefix match when ranges overlap (deterministic).
+         std::optional<NetworkAddress> best;
+         int best_mask = -1;
++        std::shared_lock lock{_router.exit_ranges_mutex()};
+         for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
+         {
+             for (const auto& r : range_list)
+@@ -405,6 +409,7 @@ namespace srouter::handlers
+     {
+         std::optional<NetworkAddress> best;
+         int best_mask = -1;
++        std::shared_lock lock{_router.exit_ranges_mutex()};
+         for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
+         {
+             for (const auto& r : range_list)
+diff --git a/src/router/router.hpp b/src/router/router.hpp
+index 2c0b821..7e1facb 100644
+--- a/src/router/router.hpp
++++ b/src/router/router.hpp
+@@ -21,6 +21,7 @@
+ #include <chrono>
+ #include <functional>
+ #include <memory>
++#include <shared_mutex>
+ #include <type_traits>
+ 
+ namespace oxenmq
+@@ -113,6 +114,8 @@ namespace srouter
+ 
+         Config _config;
+ 
++        mutable std::shared_mutex _exit_ranges_mtx;
++
+       public:
+         const std::shared_ptr<quic::Loop> _loop;
+ 
+@@ -270,8 +273,17 @@ namespace srouter
+         const Config& config() const { return _config; }
+ 
+         // Runtime MapExit / unmap_exit mutate reserved-range mappings.
++        // RPC (OMQ thread) writes and the packet path (TUN/loop thread) reads these
++        // ranges. Writers hold exit_ranges_mutex() exclusively; readers hold it shared.
++        // Never call into routing/session code while holding the exclusive lock.
+         auto& mutable_exit_ranges() { return _config.exit.ranges; }
+         const auto& exit_ranges() const { return _config.exit.ranges; }
++        std::shared_mutex& exit_ranges_mutex() const { return _exit_ranges_mtx; }
++        bool has_exit_ranges() const
++        {
++            std::shared_lock lock{_exit_ranges_mtx};
++            return not _config.exit.ranges.empty();
++        }
+ 
+         ContactDB& contact_db()
+         {
+diff --git a/src/rpc/rpc_server.cpp b/src/rpc/rpc_server.cpp
+index 1915461..7f27126 100644
+--- a/src/rpc/rpc_server.cpp
++++ b/src/rpc/rpc_server.cpp
+@@ -1,3 +1,5 @@
++#include <mutex>
++#include <shared_mutex>
+ #include "rpc_server.hpp"
+ 
+ #include "config/config.hpp"
+@@ -626,7 +628,7 @@ namespace srouter::rpc
+             auto* poker = router.route_poker();
+             if (not poker or not poker->enabled())
+                 return;
+-            if (router.exit_ranges().empty())
++            if (not router.has_exit_ranges())
+                 return;
+             if (poker->is_up())
+                 return;
+@@ -638,7 +640,7 @@ namespace srouter::rpc
+             auto* poker = router.route_poker();
+             if (not poker)
+                 return;
+-            if (not router.exit_ranges().empty())
++            if (router.has_exit_ranges())
+                 return;
+             if (poker->is_up())
+                 poker->put_down();
+@@ -683,9 +685,13 @@ namespace srouter::rpc
+ 
+             // Parse into temp, then atomic replace the slot.
+             auto built = build_exit_ranges(mapexit.request.ip_ranges, mapexit.request.full_tunnel);
+-            auto& ranges = _router.mutable_exit_ranges();
+-            ranges[exit_addr] = std::move(built);
+-            const auto slot_size = ranges[exit_addr].size();
++            size_t slot_size = 0;
++            {
++                std::unique_lock lock{_router.exit_ranges_mutex()};
++                auto& ranges = _router.mutable_exit_ranges();
++                ranges[exit_addr] = std::move(built);
++                slot_size = ranges[exit_addr].size();
++            }
+ 
+             // Kick session setup so CC/exit-capable can populate
+             try
+@@ -719,7 +725,12 @@ namespace srouter::rpc
+         log_print_rpc(listexits);
+ 
+         nlohmann::json exits = nlohmann::json::array();
+-        for (const auto& [addr, range_list] : _router.exit_ranges())
++        // Copy under the shared lock; session lookups below run without it.
++        auto snapshot = [this] {
++            std::shared_lock lock{_router.exit_ranges_mutex()};
++            return _router.exit_ranges();
++        }();
++        for (const auto& [addr, range_list] : snapshot)
+         {
+             nlohmann::json entry;
+             entry["address"] = addr.to_string();
+@@ -761,8 +772,12 @@ namespace srouter::rpc
+                 return;
+             }
+             NetworkAddress exit_addr{unmapexit.request.address};
+-            auto& ranges = _router.mutable_exit_ranges();
+-            if (ranges.erase(exit_addr) == 0)
++            size_t erased = 0;
++            {
++                std::unique_lock lock{_router.exit_ranges_mutex()};
++                erased = _router.mutable_exit_ranges().erase(exit_addr);
++            }
++            if (erased == 0)
+             {
+                 SetJSONError("no mapping for that address", unmapexit.response);
+                 return;
+@@ -830,22 +845,27 @@ namespace srouter::rpc
+             // Parse new ranges first (fail before erase on bad input).
+             auto built = build_exit_ranges(swapexits.request.ip_ranges, swapexits.request.full_tunnel);
+ 
+-            auto& ranges = _router.mutable_exit_ranges();
+-
+-            if (ranges.erase(old_addr) == 0)
++            size_t slot_size = 0;
++            bool now_empty = false;
+             {
+-                SetJSONError("no mapping for old address (exit_addresses[0])", swapexits.response);
+-                return;
++                std::unique_lock lock{_router.exit_ranges_mutex()};
++                auto& ranges = _router.mutable_exit_ranges();
++                if (ranges.erase(old_addr) == 0)
++                {
++                    lock.unlock();
++                    SetJSONError("no mapping for old address (exit_addresses[0])", swapexits.response);
++                    return;
++                }
++                ranges[new_addr] = std::move(built);
++                slot_size = ranges[new_addr].size();
++                now_empty = ranges.empty();
+             }
+             log::info(
+                 logcat,
+                 "EXIT_UNMAPPED address={} (SwapExits old; remount follows)",
+                 old_s);
+ 
+-            ranges[new_addr] = std::move(built);
+-            const auto slot_size = ranges[new_addr].size();
+-
+-            if (ranges.empty())
++            if (now_empty)
+                 maybe_put_down_if_no_ranges(_router);
+             else
+                 maybe_put_up_routes(_router);

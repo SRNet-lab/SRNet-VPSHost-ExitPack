@@ -1,0 +1,20 @@
+License notice for this repository
+==================================
+
+This repository contains files under two licenses.
+
+1. GPL-3.0 (LICENSE-GPL3.txt)
+   - patches/ (changes to Session Router)
+   - contrib/exit-lease/verify_main.cpp (built inside the Session Router tree)
+   These files are derived from Session Router, which is licensed under the
+   GNU General Public License v3.0. They, and any binary built by applying
+   them to Session Router, are distributed under the same license.
+
+2. Apache-2.0 (LICENSE-APACHE-2.0.txt)
+   - seller/, scripts/, cloud-init/, docker/
+   - contrib/exit-lease/ except verify_main.cpp
+   Copyright (c) 2026 SRNet contributors.
+
+The Apache-2.0 grant for the Python and shell tools does not relicense the
+Session Router patches. If you distribute a combined work that includes the
+GPL-3.0 Session Router binary, comply with GPL-3.0 for that work.

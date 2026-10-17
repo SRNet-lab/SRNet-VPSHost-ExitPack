@@ -1,0 +1,36 @@
+#cloud-config
+# SRNet exit seller: paste as "user data" when creating an Ubuntu 24.04 x86_64 server.
+# Edit the three values under write_files first. The server installs itself on first boot;
+# progress and the signed listing are written to /var/log/srnet-seller-install.log and to the
+# serial console (most providers show it in the web console), so no SSH login is needed.
+#
+# Release pins (filled in by scripts/make-release.sh; do not edit):
+#   bootstrap: @BOOTSTRAP_URL@
+#   sha256:    @BOOTSTRAP_SHA256@
+package_update: true
+packages: [curl, ca-certificates]
+write_files:
+  - path: /etc/srnet-seller/seed.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      # Payout wallet ADDRESS (0x + 40 hex). Never put a private key here.
+      SRNET_PAYOUT=
+      # Hourly price in USDC.
+      SRNET_PRICE_PER_HOUR_USDC=1.00
+      # Change to yes once you accept responsibility for forwarded web traffic
+      # (tcp/80 and tcp/443 only; DNS is never forwarded, buyers use this exit's own
+      # resolver) from this server's IP.
+      SRNET_ACCEPT_EXIT_RESPONSIBILITY=no
+runcmd:
+  - - bash
+    - -c
+    - |
+      set -euo pipefail
+      exec > >(tee -a /var/log/srnet-seller-install.log /dev/console) 2>&1
+      cd /root
+      curl -fsSL --proto '=https' --tlsv1.2 -o srnet-bootstrap.sh '@BOOTSTRAP_URL@'
+      echo '@BOOTSTRAP_SHA256@  srnet-bootstrap.sh' | sha256sum -c -
+      set -a; . /etc/srnet-seller/seed.env; set +a
+      bash srnet-bootstrap.sh --non-interactive
+      echo "SRNet seller install finished; listing: /opt/srnet-seller/listing/listing.json"

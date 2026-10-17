@@ -1,0 +1,2796 @@
+Linux base for the SRNet exit-lease patch (prerequisite, apply FIRST).
+
+Public upstream: https://github.com/session-foundation/session-router.git
+Applies to:      afb98f959f4f7e0ef996aef02fa21a6caf26b1e9 (dev, "Merge pull request #59", v1.0.2-126)
+
+Contents: exit-client RPCs (MapExit/UnmapExit/SwapExits with auth), map-only broker
+check + wait for EXIT_CAPABLE, route poker fail-closed, plus MinGW/Windows build fixes
+(all WIN32-guarded; no effect on Linux). Only src/, test/, CMakeLists.txt and
+cmake/Version.cmake are touched. Submodule pins and .gitmodules are NOT changed:
+all submodules stay at the public upstream commits recorded in afb98f959.
+Known gap: the WIN32-only PRE_LINK hook calls contrib/windows-check-libzstd-coff.sh,
+which this patch does not add; MinGW builds need that script. Linux builds are unaffected.
+0001-exit-lease-admission-and-policy.patch applies cleanly on top of this.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 915080cc5..1b2734676 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -235,6 +235,13 @@ if (NOT BUILD_STATIC_DEPS)
+   option(WITH_SYSTEMD "enable systemd integration for sd_notify" ${SD_FOUND})
+ endif()
+ 
++
++# oxen-mq only links TARGET sodium; session-deps names it sessiondep::libsodium.
++if(NOT TARGET sodium AND TARGET sessiondep::libsodium)
++  add_library(sodium INTERFACE)
++  target_link_libraries(sodium INTERFACE sessiondep::libsodium)
++endif()
++
+ add_subdirectory(external)
+ 
+ # interface library for setting common includes, linkage and flags
+diff --git a/cmake/Version.cmake b/cmake/Version.cmake
+index cee349714..c722ead87 100644
+--- a/cmake/Version.cmake
++++ b/cmake/Version.cmake
+@@ -30,7 +30,12 @@ endif()
+ 
+ 
+ if(WIN32)
+-  foreach(exe IN ITEMS session-router session-router-vpn session-router-bootstrap)
++  # MinGW/.rc: map project() hyphen vars to underscore names version.rc.in expects.
++  set(session_router_VERSION_MAJOR "${session-router_VERSION_MAJOR}")
++  set(session_router_VERSION_MINOR "${session-router_VERSION_MINOR}")
++  set(session_router_VERSION_PATCH "${session-router_VERSION_PATCH}")
++  set(session_router_VERSION "${session-router_VERSION}")
++  foreach(exe IN ITEMS session-router session-router-cntrl session-router-config)
+     set(session_router_EXE_NAME "${exe}.exe")
+     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/win32/version.rc.in" "${CMAKE_BINARY_DIR}/${exe}.rc" @ONLY)
+     set_property(SOURCE "${CMAKE_BINARY_DIR}/${exe}.rc" PROPERTY GENERATED 1)
+@@ -39,7 +44,7 @@ endif()
+ 
+ add_custom_target(genversion_cpp DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/constants/version.cpp")
+ if(WIN32)
+-  add_custom_target(genversion_rc DEPENDS "${CMAKE_BINARY_DIR}/session_router.rc" "${CMAKE_BINARY_DIR}/session-router-vpn.rc" "${CMAKE_BINARY_DIR}/session-router-bootstrap.rc")
++  add_custom_target(genversion_rc DEPENDS "${CMAKE_BINARY_DIR}/session-router.rc" "${CMAKE_BINARY_DIR}/session-router-cntrl.rc" "${CMAKE_BINARY_DIR}/session-router-config.rc")
+ else()
+   add_custom_target(genversion_rc)
+ endif()
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5d07dbe93..0965d3f83 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -119,6 +119,11 @@ session_router_add_library(session-router-utils
+ 
+ add_dependencies(session-router-utils genversion)
+ 
++# mingw: exception.cpp in session-router-utils
++if(WIN32)
++  target_sources(session-router-utils PRIVATE win32/exception.cpp)
++endif()
++
+ session_router_add_library(session-router-contact
+   contact/client_contact.cpp
+   contact/client_intro.cpp
+@@ -175,7 +180,6 @@ if (SROUTER_FULL)
+       win32/service_manager.cpp
+       win32/exec.cpp
+       win32/dll.cpp
+-      win32/exception.cpp
+       win32/wintun.cpp
+       win32/windivert.cpp)
+     target_include_directories(session-router-platform PRIVATE ${CMAKE_BINARY_DIR}/wintun/include/ ${CMAKE_BINARY_DIR}/WinDivert-${WINDIVERT_VERSION}/include/)
+diff --git a/src/context.cpp b/src/context.cpp
+index 0cafd3f1d..fe1039af7 100644
+--- a/src/context.cpp
++++ b/src/context.cpp
+@@ -10,6 +10,10 @@
+ #include <session/router_context.hpp>
+ 
+ #include <csignal>
++// MinGW: SIGKILL is not in <csignal>; POSIX value for signal() compare
++#ifndef SIGKILL
++#define SIGKILL 9
++#endif
+ #include <memory>
+ #include <stdexcept>
+ 
+diff --git a/src/daemon/CMakeLists.txt b/src/daemon/CMakeLists.txt
+index 7dc861548..85ac3591d 100644
+--- a/src/daemon/CMakeLists.txt
++++ b/src/daemon/CMakeLists.txt
+@@ -38,7 +38,16 @@ endif()
+ # cmake interface library for bunch of cmake hacks to fix final link order
+ add_library(hax_and_shims_for_cmake INTERFACE)
+ if(WIN32)
+-  target_link_libraries(hax_and_shims_for_cmake INTERFACE uvw oxenmq::oxenmq -lws2_32 -lshlwapi -ldbghelp -luser32 -liphlpapi -lpsapi -luserenv)
++  target_link_libraries(hax_and_shims_for_cmake INTERFACE oxenmq::oxenmq "${CMAKE_BINARY_DIR}/static-deps/lib/libzstd.a" -lws2_32 -lshlwapi -ldbghelp -luser32 -liphlpapi -lpsapi -luserenv)
++endif()
++
++if(WIN32)
++  foreach(exe ${exetargets})
++    target_link_libraries(${exe} PRIVATE hax_and_shims_for_cmake)
++    if(TARGET sessiondep::libzstd)
++      target_link_libraries(${exe} PRIVATE sessiondep::libzstd)
++    endif()
++  endforeach()
+ endif()
+ 
+ foreach(exe ${exetargets})
+@@ -78,3 +87,25 @@ if(SROUTER_STRIP)
+ endif()
+ 
+ set_target_properties(${exetargets} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR})
++
++# whole-archive libzstd for MinGW static (ZSTD_* from libsession-router-utils)
++if(WIN32)
++  foreach(exe ${exetargets})
++    target_link_libraries(${exe} PRIVATE
++      "-Wl,--whole-archive"
++      "${CMAKE_BINARY_DIR}/static-deps/lib/libzstd.a"
++      "-Wl,--no-whole-archive")
++    # Refuse ELF / ZSTD_trace libzstd (windows-check-libzstd-coff)
++    add_custom_command(TARGET ${exe} PRE_LINK
++      COMMAND bash "${CMAKE_SOURCE_DIR}/contrib/windows-check-libzstd-coff.sh"
++              "${CMAKE_BINARY_DIR}/static-deps/lib/libzstd.a"
++      VERBATIM)
++  endforeach()
++endif()
++
++# zstd_trace_stubs for MinGW whole-archive (ZSTD_trace_* from libzstd)
++if(WIN32)
++  foreach(exe ${exetargets})
++    target_sources(${exe} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/zstd_trace_stubs.c)
++  endforeach()
++endif()
+diff --git a/src/daemon/session_router.cpp b/src/daemon/session_router.cpp
+index ebbc1b000..97061292e 100644
+--- a/src/daemon/session_router.cpp
++++ b/src/daemon/session_router.cpp
+@@ -13,6 +13,10 @@
+ #include <session/router_context.hpp>
+ 
+ #include <csignal>
++// MinGW: SIGKILL is not in <csignal>; POSIX value for signal()
++#ifndef SIGKILL
++#define SIGKILL 9
++#endif
+ #include <memory>
+ #include <stdexcept>
+ #include <thread>
+@@ -192,7 +196,7 @@ namespace
+             srouter::log::error(logcat, "ChangeServiceConfig2 failed");
+         }
+         else
+-            srouter::log::info(log_cat, "Service description updated successfully.");
++            srouter::log::info(logcat, "Service description updated successfully.");
+ 
+         CloseServiceHandle(schService);
+         CloseServiceHandle(schSCManager);
+@@ -248,7 +252,7 @@ namespace
+                                            | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo);
+ 
+         const std::string fname =
+-            fmt::format("C:\\ProgramData\\Session-Router\\crash-{}.dump", srouter::time_now_ms().count());
++            fmt::format("C:\\ProgramData\\Session-Router\\crash-{}.dump", srouter::time_now_ms().time_since_epoch().count());
+ 
+         HANDLE hDumpFile;
+         SYSTEMTIME stLocalTime;
+diff --git a/src/daemon/zstd_trace_stubs.c b/src/daemon/zstd_trace_stubs.c
+new file mode 100644
+index 000000000..d5de13a8c
+--- /dev/null
++++ b/src/daemon/zstd_trace_stubs.c
+@@ -0,0 +1,27 @@
++/* MinGW stubs for optional ZSTD_TRACE hooks (see contrib patch). */
++#ifdef __cplusplus
++extern "C" {
++#endif
++unsigned long long ZSTD_trace_compress_begin(void const *cctx)
++{
++  (void)cctx;
++  return 0;
++}
++void ZSTD_trace_compress_end(unsigned long long ctx, void const *trace)
++{
++  (void)ctx;
++  (void)trace;
++}
++unsigned long long ZSTD_trace_decompress_begin(void const *dctx)
++{
++  (void)dctx;
++  return 0;
++}
++void ZSTD_trace_decompress_end(unsigned long long ctx, void const *trace)
++{
++  (void)ctx;
++  (void)trace;
++}
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/dns/rr.hpp b/src/dns/rr.hpp
+index e8976dc2a..59dbd488b 100644
+--- a/src/dns/rr.hpp
++++ b/src/dns/rr.hpp
+@@ -11,6 +11,13 @@
+ 
+ namespace srouter::dns
+ {
++// MinGW: minwindef.h IN/OUT macros collide with RRClass::IN
++#ifdef IN
++#undef IN
++#endif
++#ifdef OUT
++#undef OUT
++#endif
+     enum class RRClass : uint16_t
+     {
+         IN = 1,
+diff --git a/src/dns/unbound.cpp b/src/dns/unbound.cpp
+index 85088636f..6e836fb50 100644
+--- a/src/dns/unbound.cpp
++++ b/src/dns/unbound.cpp
+@@ -50,7 +50,7 @@ namespace srouter::dns
+         if (conf.unbound_hosts)
+             if (int ret = ub_ctx_hosts(
+                     ctx,
+-                    *conf.unbound_hosts == std::filesystem::path{"SYSTEM"} ? nullptr : conf.unbound_hosts->c_str());
++                    *conf.unbound_hosts == std::filesystem::path{"SYSTEM"} ? nullptr : conf.unbound_hosts->string().c_str());
+                 ret != 0)
+                 throw std::runtime_error{"Failed to register DNS hosts file: {}"_format(ub_strerror(ret))};
+ 
+diff --git a/src/ev/tcp.hpp b/src/ev/tcp.hpp
+index c86c63fe8..5498b4781 100644
+--- a/src/ev/tcp.hpp
++++ b/src/ev/tcp.hpp
+@@ -5,7 +5,13 @@
+ 
+ extern "C"
+ {
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++// MinGW has no arpa/inet.h; SOCKET/inet helpers live in winsock2/ws2tcpip.
++#else
+ #include <arpa/inet.h>
++#endif
+     struct bufferevent;
+     struct evconnlistener;
+ }
+diff --git a/src/handlers/session.cpp b/src/handlers/session.cpp
+index b84ee0e8c..333ad3fed 100644
+--- a/src/handlers/session.cpp
++++ b/src/handlers/session.cpp
+@@ -1251,6 +1251,13 @@ namespace srouter::handlers
+         return ret;
+     }
+ 
++    void SessionEndpoint::set_auth_token(const NetworkAddress& remote, std::string token)
++    {
++        if (token.empty())
++            return;
++        _auth_tokens[remote] = std::move(token);
++    }
++
+     std::shared_ptr<session::Session> SessionEndpoint::initiate_remote_session(
+         const NetworkAddress& remote,
+         std::function<void(session::Session& session)> on_attempted,
+diff --git a/src/handlers/session.hpp b/src/handlers/session.hpp
+index e56bf5442..ab092857a 100644
+--- a/src/handlers/session.hpp
++++ b/src/handlers/session.hpp
+@@ -255,6 +255,10 @@ namespace srouter
+             // incoming requests to initiate a session
+             bool validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth = std::nullopt);
+ 
++            // Live MapExit/SwapExits token: apply into the in-memory map used by session init.
++            void set_auth_token(const NetworkAddress& remote, std::string token);
++
++
+             std::optional<ipv4> map_session_v4(const session::Session& s);
+             std::optional<ipv6> map_session_v6(const session::Session& s);
+ 
+diff --git a/src/handlers/tun.cpp b/src/handlers/tun.cpp
+index dd91e36c0..554400456 100644
+--- a/src/handlers/tun.cpp
++++ b/src/handlers/tun.cpp
+@@ -18,6 +18,7 @@
+ #include "nodedb.hpp"
+ #include "router/route_poker.hpp"
+ #include "router/router.hpp"
++#include "session/session.hpp"
+ #include "util/logging/buffer.hpp"
+ #include "util/str.hpp"
+ 
+@@ -35,8 +36,16 @@ namespace srouter::handlers
+         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+ 
+         auto& net_conf = _router.config().network;
++        auto& exit_conf = _router.config().exit;
+ 
+-        _exit_policy = net_conf.traffic_policy;
++        // Prefer NetworkConfig.traffic_policy (wired from ExitConfig in process_config);
++        // fall back to ExitConfig.exit_policy directly so exit tips work even if wiring lags.
++        // If exit is enabled with an empty policy, keep an empty ExitPolicy (deny-all) rather
++        // than leaving nullopt (which used to allow all traffic).
++        if (net_conf.traffic_policy)
++            _exit_policy = net_conf.traffic_policy;
++        else if (exit_conf.exit_enabled)
++            _exit_policy = exit_conf.exit_policy;
+ 
+         _if_name = net_conf._if_name.value_or("");
+ 
+@@ -113,6 +122,36 @@ namespace srouter::handlers
+         log::debug(logcat, "Tun constructing IPRange iterator on local networks: {}, {}", _local_net, _local_ipv6_net);
+         _local_range_iterator = IPRangeIterator{_local_net};
+         _local_ipv6_range_iterator = IPv6RangeIterator{_local_ipv6_net};
++
++        // Route poker lives in the full platform (this TU). Core Router cannot link it.
++        _route_poker = std::make_shared<RoutePoker>(_router);
++        _router.set_route_poker(_route_poker);
++        _route_poker->start();
++        // Let core link layer request first-hop host routes (needed after default-via-TUN).
++        _router.set_first_hop_poker(
++            [this](const ipv4& ip) {
++                if (_route_poker)
++                    _route_poker->add_route(ip);
++            },
++            [this](const ipv6& ip) {
++                if (_route_poker)
++                    _route_poker->add_route(ip);
++            });
++        // Bring default route up once we have edge connectivity and reserved-range exit mappings.
++        _router.on_connected(
++            [this] {
++                if (_route_poker and _route_poker->enabled() and not _router.config().exit.ranges.empty())
++                    _route_poker->put_up();
++            },
++            /*with_paths=*/false,
++            /*persistent=*/true);
++        _router.on_disconnected(
++            [this] {
++                if (_route_poker)
++                    _route_poker->put_down();
++            },
++            /*with_paths=*/false,
++            /*persistent=*/true);
+     }
+ 
+     static const auto random_snode = "random.{}"_format(RELAY_TLD);
+@@ -131,6 +170,11 @@ namespace srouter::handlers
+ 
+     void TunEndpoint::stop()
+     {
++        if (_win_drain_timer)
++        {
++            _router._jq->remove(_win_drain_timer);
++            _win_drain_timer = {};
++        }
+         // stop vpn tunnel
+         if (_net_if)
+             _net_if->Stop();
+@@ -322,6 +366,82 @@ namespace srouter::handlers
+         }
+     }
+ 
++    bool TunEndpoint::remote_is_exit_broker(const NetworkAddress& remote) const
++    {
++        // Only remotes listed in exit.ranges are exit brokers for inbound return traffic.
++        // Do not treat an arbitrary exit-policy ClientContact peer as a broker.
++        return _router.config().exit.ranges.contains(remote);
++    }
++
++    std::optional<NetworkAddress> TunEndpoint::exit_for_ip(const ipv4& dest) const
++    {
++        // Longest-prefix match when ranges overlap (deterministic).
++        std::optional<NetworkAddress> best;
++        int best_mask = -1;
++        for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
++        {
++            for (const auto& r : range_list)
++            {
++                if (const auto* r4 = std::get_if<ipv4_range>(&r))
++                {
++                    // mask==0 is "all IPv4" (bare reserved-range=EXIT.sesh).  oxen-quic
++                    // ipv4::to_base(0) hits <<32 UB and contains() can wrongly return false.
++                    if (r4->mask == 0 or r4->contains(dest))
++                    {
++                        const int m = static_cast<int>(r4->mask);
++                        if (m > best_mask)
++                        {
++                            best_mask = m;
++                            best = exit_addr;
++                        }
++                    }
++                }
++            }
++        }
++        return best;
++    }
++
++    std::optional<NetworkAddress> TunEndpoint::exit_for_ip(const ipv6& dest) const
++    {
++        std::optional<NetworkAddress> best;
++        int best_mask = -1;
++        for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
++        {
++            for (const auto& r : range_list)
++            {
++                if (const auto* r6 = std::get_if<ipv6_range>(&r))
++                {
++                    if (r6->mask == 0 or r6->contains(dest))
++                    {
++                        const int m = static_cast<int>(r6->mask);
++                        if (m > best_mask)
++                        {
++                            best_mask = m;
++                            best = exit_addr;
++                        }
++                    }
++                }
++            }
++        }
++        return best;
++    }
++
++    void TunEndpoint::add_default_route()
++    {
++        if (not _net_if)
++            return;
++        log::info(logcat, "Installing default route via TUN {}", _if_name);
++        _router.vpn_platform()->RouteManager().add_default_route_via_interface(*_net_if);
++    }
++
++    void TunEndpoint::delete_default_route()
++    {
++        if (not _net_if)
++            return;
++        log::info(logcat, "Removing default route via TUN {}", _if_name);
++        _router.vpn_platform()->RouteManager().delete_default_route_via_interface(*_net_if);
++    }
++
+     // handles an outbound packet going OUT from user -> network
+     void TunEndpoint::handle_outbound_packet(IPPacket pkt)
+     {
+@@ -372,7 +492,21 @@ namespace srouter::handlers
+         // we pass `dest` because that is our local private IP on the outgoing IPPacket
+         if (auto remote = is_v4 ? _local_ipv4_mapping[dest4] : _local_ipv6_mapping[dest6])
+         {
+-            pkt.clear_addresses();
++            // Exit-return traffic: clearnet reply arrives on TUN with src=SERVER dest=mapped-client.
++            // Client from_exit rewrites dest → local TUN IP and *keeps* pkt source as the
++            // clearnet server.  clear_addresses() would zero that source and break TCP.
++            const bool exit_return =
++                is_exit_node()
++                and ((is_v4 and not _local_net.contains(src4))
++                     or ((not is_v4) and not _local_ipv6_net.contains(src6)));
++            if (not exit_return)
++                pkt.clear_addresses();
++            else
++                log::debug(
++                    logcat,
++                    "Exit-return packet to mapped client {} (preserving clearnet addrs): {}",
++                    *remote,
++                    pkt.info_line());
+ 
+             if (auto session = _router.session_endpoint().get_session(*remote))
+             {
+@@ -404,7 +538,50 @@ namespace srouter::handlers
+         }
+         else
+         {
+-            log::trace(logcat, "Could not find remote for route {}", pkt.info_line());
++            // No direct .sesh mapping for dest — try the reserved-range exit.
++            std::optional<NetworkAddress> exit_remote;
++            if (is_v4)
++                exit_remote = exit_for_ip(dest4);
++            else
++                exit_remote = exit_for_ip(dest6);
++
++            if (exit_remote)
++            {
++                // Keep original dest IP in the packet; exit will NAT/forward it.
++                // Do not send clearnet via a mapped exit until the session is live and
++                // EXIT_CAPABLE — a wrong or not-yet-ready .sesh must not get packets early.
++                auto* session = _router.session_endpoint().get_session(*exit_remote);
++                if (session and session->is_exit_capable)
++                {
++                    log::info(
++                        logcat,
++                        "Outbound packet {} routed via exit broker {}",
++                        pkt.info_line(),
++                        *exit_remote);
++                    session->send_session_data_message(pkt.span(), pkt.protocol());
++                    return;
++                }
++
++                // Session missing or not yet EXIT_CAPABLE: start/keep session, drop this packet.
++                if (not session)
++                {
++                    try
++                    {
++                        _router.session_endpoint().initiate_remote_session(*exit_remote, nullptr);
++                    }
++                    catch (const std::exception& e)
++                    {
++                        log::warning(logcat, "Failed to initiate exit session to {}: {}", *exit_remote, e.what());
++                    }
++                }
++                else
++                    log::debug(
++                        logcat,
++                        "Holding outbound packet for mapped exit {} (session not EXIT_CAPABLE yet)",
++                        *exit_remote);
++            }
++
++            log::debug(logcat, "Could not find remote for route {} (sending ICMP unreachable)", pkt.info_line());
+ 
+             // make ICMP unreachable
+             if (auto icmp = pkt.make_icmp_unreachable())
+@@ -414,19 +591,26 @@ namespace srouter::handlers
+ 
+     std::optional<ipv4> TunEndpoint::obtain_src_for_ipv4_remote(const NetworkAddress& remote)
+     {
+-        if (auto maybe_src = _local_ipv4_mapping[remote])
++        // Allocate on demand so inbound exit traffic from a new client gets a TUN-local src
++        // for NAT/MASQUERADE (map4 inserts into _local_ipv4_mapping).
++        if (auto maybe_src = map4(remote))
+             return maybe_src;
+ 
+-        log::warning(logcat, "Unable to find mapped IPv4 for inbound packet from remote {}", remote);
++        log::warning(logcat, "Unable to allocate mapped IPv4 for inbound packet from remote {}", remote);
+         return std::nullopt;
+     }
+     std::optional<ipv6> TunEndpoint::obtain_src_for_ipv6_remote(const NetworkAddress& remote)
+     {
+-        if (auto maybe_src = _local_ipv6_mapping[remote])
+-            return maybe_src;
+-
+-        log::warning(logcat, "Unable to find mapped IPv6 for inbound packet from remote {}", remote);
+-        return std::nullopt;
++        try
++        {
++            return map6(remote);
++        }
++        catch (const std::exception& e)
++        {
++            log::warning(
++                logcat, "Unable to allocate mapped IPv6 for inbound packet from remote {}: {}", remote, e.what());
++            return std::nullopt;
++        }
+     }
+ 
+     void TunEndpoint::send_packet_to_net_if(IPPacket pkt)
+@@ -445,19 +629,26 @@ namespace srouter::handlers
+         send_packet_to_net_if(std::move(pkt));
+     }
+ 
+-    // FIXME: we need separate flags for to-exit and from-exit
++    // to_exit: this node is an exit and inbound overlay packets should be forwarded to clearnet.
++    // from_exit: this node is an exit client receiving return traffic from a mapped exit.
+     void TunEndpoint::handle_inbound_packet(IPPacket pkt, traffic_type type, NetworkAddress remote)
+     {
+-        (void)type;              // TODO FIXME use this
+-        bool to_exit = false;    // TODO FIXME
+-        bool from_exit = false;  // TODO FIXME
++        (void)type;
++        const bool to_exit = is_exit_node();
++        const bool from_exit = (not to_exit) and remote_is_exit_broker(remote);
+ 
+         if (to_exit)  // traffic exiting through this node
+         {
+             log::trace(logcat, "inbound exit pkt for exit node: {}", pkt.info_line());
+             if (not is_allowing_traffic(pkt))
+             {
+-                log::warning(logcat, "Dropping inbound exit packet: denied by local traffic policy");
++                log::warning(
++                    logcat,
++                    "Dropping inbound exit packet: denied by local traffic policy ({}; proto={} dest_port={} policy={})",
++                    pkt.info_line(),
++                    static_cast<int>(pkt.protocol()),
++                    pkt.dest_port() ? std::to_string(*pkt.dest_port()) : "none",
++                    _exit_policy ? "set" : "null");
+                 return;
+             }
+ 
+@@ -499,7 +690,25 @@ namespace srouter::handlers
+ 
+     void TunEndpoint::start_poller()
+     {
+-        _poller = std::make_unique<ev::FDPoller>(_router.loop(), _net_if->PollFD(), [this] {
++        // Wintun (and apple) PollFD is always -1: packet IO is threaded. Arming
++        // ev::FDPoller(-1) can AV under MinGW (0xC0000005). Keep FDPoller OFF and
++        // drain the recv queue on a 20ms JobQueue timer instead.
++        const auto pfd = _net_if->PollFD();
++        if (pfd < 0)
++        {
++            log::warning(logcat, "Skipping TUN FDPoller; PollFD={} is not a waitable socket", pfd);
++            log::debug(logcat, "start_poller arm tun drain timer");
++            _win_drain_timer = _router._jq->add_timer(20ms, [this]() {
++                for (auto pkt = _net_if->read_next_packet(); not pkt.empty();
++                     pkt = _net_if->read_next_packet())
++                {
++                    log::trace(logcat, "packet router receiving {}", pkt.info_line());
++                    _packet_router->handle_ip_packet(std::move(pkt));
++                }
++            });
++            return;
++        }
++        _poller = std::make_unique<ev::FDPoller>(_router.loop(), pfd, [this] {
+             for (auto pkt = _net_if->read_next_packet(); not pkt.empty(); pkt = _net_if->read_next_packet())
+             {
+                 log::trace(logcat, "packet router receiving {}", pkt.info_line());
+@@ -511,7 +720,8 @@ namespace srouter::handlers
+ 
+     bool TunEndpoint::is_allowing_traffic(const IPPacket& pkt) const
+     {
+-        return _exit_policy ? _exit_policy->allow_ip_traffic(pkt) : true;
++        // Fail closed: exit enable with no policy must not forward everything.
++        return _exit_policy ? _exit_policy->allow_ip_traffic(pkt) : false;
+     }
+ 
+     std::pair<std::optional<ipv4>, std::optional<ipv6>> TunEndpoint::get_mapped_ip(const NetworkAddress& addr)
+@@ -519,6 +729,18 @@ namespace srouter::handlers
+         return {_local_ipv4_mapping[addr], _local_ipv6_mapping[addr]};
+     }
+ 
+-    TunEndpoint::~TunEndpoint() { log::trace(logcat, "TunEndpoint::~TunEndpoint()"); }
++    TunEndpoint::~TunEndpoint()
++    {
++        log::trace(logcat, "TunEndpoint::~TunEndpoint()");
++        // Ensure Wintun Stop before shared_ptr release (covers Router unwind
++        // paths that never call TunEndpoint::stop()).
++        try
++        {
++            stop();
++        }
++        catch (...)
++        {
++        }
++    }
+ 
+ }  // namespace srouter::handlers
+diff --git a/src/handlers/tun.hpp b/src/handlers/tun.hpp
+index da5a5f6c1..8c84f3ce1 100644
+--- a/src/handlers/tun.hpp
++++ b/src/handlers/tun.hpp
+@@ -2,7 +2,10 @@
+ 
+ #include "address/map.hpp"
+ #include "ev/fd_poller.hpp"
++
++#include <oxen/quic/timer_id.hpp>
+ #include "handlers/tun_interface.hpp"
++#include "router/route_poker.hpp"
+ #include "net/ip_packet.hpp"
+ #include "util/thread/threading.hpp"
+ #include "vpn/packet_router.hpp"
+@@ -35,11 +38,17 @@ namespace srouter::handlers
+ 
+         std::shared_ptr<vpn::NetworkInterface> _net_if;
+         std::unique_ptr<ev::FDPoller> _poller;
++        // Windows/Wintun: PollFD()==-1 so FDPoller is skipped; this JobQueue
++        // timer drains _recv_queue → handle_ip_packet.
++        oxen::quic::TimerID _win_drain_timer;
+ 
+         std::shared_ptr<vpn::PacketRouter> _packet_router;
+ 
+         std::optional<net::ExitPolicy> _exit_policy = std::nullopt;
+ 
++        // Owned here (full platform) — Router core cannot link RoutePoker.
++        std::shared_ptr<RoutePoker> _route_poker;
++
+         /// a file to load / store the ephemeral address map to
+         std::optional<std::filesystem::path> _persisting_addr_file = std::nullopt;
+         bool persist_addrs{false};
+@@ -69,7 +78,7 @@ namespace srouter::handlers
+ 
+         bool is_service_node() const;
+ 
+-        bool is_exit_node() const;
++        bool is_exit_node() const override;
+ 
+         // INPROGRESS: new API
+         // Handles an outbound packet going OUT to the network
+@@ -152,6 +161,14 @@ namespace srouter::handlers
+ 
+         void start_poller() override;
+ 
++        void add_default_route() override;
++        void delete_default_route() override;
++
++        // Look up which configured exit .sesh should carry traffic to dest IP (reserved-range).
++        std::optional<NetworkAddress> exit_for_ip(const ipv4& dest) const;
++        std::optional<NetworkAddress> exit_for_ip(const ipv6& dest) const;
++        bool remote_is_exit_broker(const NetworkAddress& remote) const;
++
+       private:
+         // Stores assigned IP's for each session in/out of this Session Router instance
+         //  - Reserved local addresses are directly pre-loaded from config
+diff --git a/src/handlers/tun_interface.hpp b/src/handlers/tun_interface.hpp
+index 6cb4dfb2a..1db1b4b5d 100644
+--- a/src/handlers/tun_interface.hpp
++++ b/src/handlers/tun_interface.hpp
+@@ -36,6 +36,14 @@ namespace srouter::handlers
+ 
+         virtual std::pair<std::optional<NetworkAddress>, bool> reverse_lookup(const ipv4& ip) = 0;
+         virtual std::pair<std::optional<NetworkAddress>, bool> reverse_lookup(const ipv6& ip) = 0;
++
++        // Exit-client tip: install / remove OS default route via this TUN (route poker).
++        // No-op default so embedded/core builds stay free of vpn types.
++        virtual void add_default_route() {}
++        virtual void delete_default_route() {}
++
++        // True when this tip is operating as a clear exit (config [exit] enable=true).
++        virtual bool is_exit_node() const { return false; }
+     };
+ 
+ }  // namespace srouter::handlers
+diff --git a/src/link/endpoint.cpp b/src/link/endpoint.cpp
+index e80f4fef3..5d233522e 100644
+--- a/src/link/endpoint.cpp
++++ b/src/link/endpoint.cpp
+@@ -303,10 +303,38 @@ namespace srouter::link
+         if (manager.is_stopping)
+             return;
+ 
+-        for (const auto& [rid, relay] : relay_conns)
++        // Relays store peer links in relay_conns; clients store edge links in client_conns.
++        // RoutePoker (and gossip) need both — otherwise client tips poke zero host routes
++        // before default-via-TUN and blackhole their own edge traffic.
++        if (router.is_service_node)
++        {
++            for (const auto& [rid, relay] : relay_conns)
++            {
++                assert(relay.conn);
++                func(rid, *relay.conn);
++            }
++        }
++        else
++        {
++            for (const auto& [rid, conn] : client_conns)
++            {
++                assert(conn && conn->conn);
++                func(rid, *conn);
++            }
++        }
++    }
++
++    void Endpoint::for_each_pending_outbound(std::function<void(const RouterID&, link::Connection&)> func) const
++    {
++        assert(router.loop().inside());
++
++        if (manager.is_stopping)
++            return;
++
++        for (const auto& [rid, conn] : pending_outbound)
+         {
+-            assert(relay.conn);
+-            func(rid, *relay.conn);
++            if (conn and conn->conn)
++                func(rid, *conn);
+         }
+     }
+ 
+@@ -477,6 +505,10 @@ namespace srouter::link
+         if (!pending)
+         {
+             log::debug(logcat, "Initiating new connection to send to {}", rid.short_string());
++            // If default is via TUN, ensure a host route to this relay exists first.
++            router.poke_first_hop(rc.addr());
++            if (rc.addr6())
++                router.poke_first_hop(*rc.addr6());
+             auto conn = endpoint->connect(
+                 quic::RemoteAddress{rid.to_view(), rc.addr()},
+                 tls_creds,
+diff --git a/src/link/endpoint.hpp b/src/link/endpoint.hpp
+index 63ecd9a5b..3e3466afb 100644
+--- a/src/link/endpoint.hpp
++++ b/src/link/endpoint.hpp
+@@ -286,6 +286,10 @@ namespace srouter::link
+         // connections, this is only called for the preferred direction.
+         void for_each_relay_conn(std::function<void(const RouterID&, link::Connection&)> func) const;
+ 
++        // In-flight outbound dials not yet promoted into client_conns / relay_conns.
++        // RoutePoker put_up must flush these remotes before default-via-TUN.
++        void for_each_pending_outbound(std::function<void(const RouterID&, link::Connection&)> func) const;
++
+         void close_connection(const RouterID& rid);
+ 
+         // Closes all connections and stops the network event loop
+diff --git a/src/messages/common.hpp b/src/messages/common.hpp
+index 6763eff3f..29f71f90f 100644
+--- a/src/messages/common.hpp
++++ b/src/messages/common.hpp
+@@ -10,6 +10,25 @@ namespace srouter::messages
+     inline constexpr auto STATUS_KEY = "!"sv;
+     std::string serialize_status_response(std::string_view value);
+ 
++// MinGW: winnt.h STATUS_* macros collide with these string-view names
++#ifdef STATUS_OK
++#undef STATUS_OK
++#endif
++#ifdef STATUS_TIMEOUT
++#undef STATUS_TIMEOUT
++#endif
++#ifdef STATUS_ERROR
++#undef STATUS_ERROR
++#endif
++#ifdef STATUS_NOT_FOUND
++#undef STATUS_NOT_FOUND
++#endif
++#ifdef STATUS_EXPIRED
++#undef STATUS_EXPIRED
++#endif
++#ifdef STATUS_FUTURE
++#undef STATUS_FUTURE
++#endif
+     constexpr auto STATUS_OK = "OK"sv;
+     constexpr auto STATUS_TIMEOUT = "TIMEOUT"sv;
+     constexpr auto STATUS_ERROR = "ERROR"sv;
+diff --git a/src/net/ip_headers.hpp b/src/net/ip_headers.hpp
+index b811e8785..e0cabc01d 100644
+--- a/src/net/ip_headers.hpp
++++ b/src/net/ip_headers.hpp
+@@ -1,6 +1,18 @@
+ #pragma once
+ 
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++// MinGW lacks netinet/ip6.h; in6_addr is in ws2tcpip.h.
++// Map glibc-style endian macros to GCC builtins for bitfield layouts.
++#ifndef __BYTE_ORDER
++#define __BYTE_ORDER __BYTE_ORDER__
++#define __LITTLE_ENDIAN __ORDER_LITTLE_ENDIAN__
++#define __BIG_ENDIAN __ORDER_BIG_ENDIAN__
++#endif
++#else
+ #include <netinet/ip6.h>
++#endif
+ #include <oxenc/endian.h>
+ 
+ namespace srouter
+diff --git a/src/net/policy.cpp b/src/net/policy.cpp
+index 758b6deaa..753dfd5d8 100644
+--- a/src/net/policy.cpp
++++ b/src/net/policy.cpp
+@@ -8,7 +8,12 @@
+ 
+ extern "C"
+ {
++#ifdef _WIN32
++#include <winsock2.h>
++// MinGW has no netdb.h; getprotobyname/getprotobynumber are in winsock2.
++#else
+ #include <netdb.h>
++#endif
+ }
+ 
+ namespace srouter
+diff --git a/src/net/win32.cpp b/src/net/win32.cpp
+index 8ce38153c..15ea87cb1 100644
+--- a/src/net/win32.cpp
++++ b/src/net/win32.cpp
+@@ -1,16 +1,12 @@
+-#include "constants/platform.hpp"
+-#include "net_if.hpp"
++#include "address/ip_range.hpp"
+ #include "platform.hpp"
+ #include "util/logging.hpp"
+-#include "util/str.hpp"
++#include "win32/adapters.hpp"
+ #include "win32/exception.hpp"
+ 
+ #include <iphlpapi.h>
+ 
+-#include <cstdio>
+-#include <list>
+-#include <stdexcept>
+-#include <type_traits>
++#include <vector>
+ 
+ namespace srouter::net
+ {
+@@ -18,118 +14,166 @@ namespace srouter::net
+ 
+     class Platform_Impl : public Platform
+     {
+-        template <typename adapter_t>
+-        bool adapter_has_ip(adapter_t* a, ipaddr_t ip) const
++      public:
++        std::optional<quic::Address> get_best_public_address(bool want_ipv4, uint16_t port) const override
+         {
+-            for (auto* addr = a->FirstUnicastAddress; addr; addr = addr->Next)
+-            {
+-                quic::Address saddr{*addr->Address.lpSockaddr};
+-
+-                log::debug(logcat, "'{}' has address '{}", a->AdapterName, saddr);
+-                if (saddr.getIP() == ip)
+-                    return true;
+-            }
+-            return false;
+-        }
++            std::optional<quic::Address> found;
+ 
+-        template <typename adapter_t>
+-        bool adapter_has_fam(adapter_t* a, int af) const
+-        {
+-            for (auto* addr = a->FirstUnicastAddress; addr; addr = addr->Next)
+-            {
+-                quic::Address saddr{*addr->Address.lpSockaddr};
+-                if (saddr.Family() == af)
+-                    return true;
+-            }
+-            return false;
++            win32::iter_adapters([&](auto* adapter) {
++                if (found)
++                    return;
++                for (auto* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next)
++                {
++                    if (!addr->Address.lpSockaddr)
++                        continue;
++                    quic::Address a{addr->Address.lpSockaddr};
++                    if (want_ipv4 ? !a.is_ipv4() : !a.is_ipv6())
++                        continue;
++                    if (!a.is_public_ip())
++                        continue;
++                    a.set_port(port);
++                    found = std::move(a);
++                    return;
++                }
++            });
++
++            log::info(logcat, "get_best_public_address returned: {}", found);
++            return found;
+         }
+ 
+-      public:
+-        std::optional<int> get_interface_index(ip ip) const override
++        std::optional<ipv4_net> find_free_ipv4_net(uint8_t mask) const override
+         {
+-            std::optional<int> found;
+-            int af{AF_INET};
++            std::vector<ipv4_range> current_ranges;
+ 
+-            if (std::holds_alternative<ipv6>(ip))
+-                af = AF_INET6;
++            win32::iter_adapters([&](auto* adapter) {
++                for (auto* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next)
++                {
++                    if (!addr->Address.lpSockaddr)
++                        continue;
++                    if (addr->Address.lpSockaddr->sa_family != AF_INET)
++                        continue;
++                    quic::Address a{addr->Address.lpSockaddr};
++                    auto prefix = static_cast<uint8_t>(addr->OnLinkPrefixLength);
++                    log::debug(logcat, "Adding {}/{} to excluded search ranges", a.to_ipv4(), prefix);
++                    current_ranges.emplace_back(a.to_ipv4(), prefix);
++                }
++            });
+ 
+-            win32::iter_adapters(
+-                [&found, ip, this](auto* adapter) {
+-                    if (found)
+-                        return;
++            return find_private_ipv4_net(std::move(current_ranges), mask);
++        }
++
++        std::string find_free_tun([[maybe_unused]] std::string_view suggest) const override
++        {
++            // Windows uses a fixed TUN name (cannot freely invent interface names like Linux).
++            return "sr-tun0";
++        }
+ 
+-                    log::debug(
+-                        logcat,
+-                        "Visit adapter looking for '{}': '{} idx={}",
+-                        ip,
+-                        adapter->AdapterName,
+-                        adapter->IfIndex);
++        std::optional<int> get_interface_index(ipv4 ip) const override
++        {
++            std::optional<int> found;
+ 
+-                    if (adapter_has_ip(adapter, ip))
++            win32::iter_adapters([&](auto* adapter) {
++                if (found)
++                    return;
++                for (auto* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next)
++                {
++                    if (!addr->Address.lpSockaddr)
++                        continue;
++                    if (addr->Address.lpSockaddr->sa_family != AF_INET)
++                        continue;
++                    quic::Address a{addr->Address.lpSockaddr};
++                    if (a.to_ipv4() == ip)
+                     {
+-                        found = adapter->IfIndex;
++                        found = static_cast<int>(adapter->IfIndex);
++                        return;
+                     }
+-                },
+-                af);
++                }
++            });
+ 
+             return found;
+         }
+ 
+-        std::optional<quic::Address> get_interface_addr(std::string_view name, int af) const override
++        std::optional<int> get_interface_index(ipv6 ip) const override
+         {
+-            std::optional<quic::Address> found;
++            std::optional<int> found;
+ 
+-            win32::iter_adapters([name = std::string{name}, af, &found, this](auto* a) {
++            win32::iter_adapters([&](auto* adapter) {
+                 if (found)
+                     return;
+-                if (std::string{a->AdapterName} != name)
+-                    return;
+-
+-                if (adapter_has_fam(a, af))
+-                    found = quic::Address{*a->FirstUnicastAddress->Address.lpSockaddr};
++                for (auto* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next)
++                {
++                    if (!addr->Address.lpSockaddr)
++                        continue;
++                    if (addr->Address.lpSockaddr->sa_family != AF_INET6)
++                        continue;
++                    quic::Address a{addr->Address.lpSockaddr};
++                    if (a.to_ipv6() == ip)
++                    {
++                        auto idx = adapter->Ipv6IfIndex ? adapter->Ipv6IfIndex : adapter->IfIndex;
++                        found = static_cast<int>(idx);
++                        return;
++                    }
++                }
+             });
+ 
+             return found;
+         }
+ 
+-        std::optional<quic::Address> all_interfaces(quic::Address fallback) const override
++        std::optional<ipv4> get_interface_ipv4(std::string_view ifname) const override
+         {
+-            (void)fallback;
+-            // windows seems to not give a shit about source address
+-            return quic::Address{};
+-        }
++            std::optional<ipv4> found;
+ 
+-        std::string find_free_tun() const override { return "sr-tun0"; }
++            win32::iter_adapters([&](auto* adapter) {
++                if (found)
++                    return;
++                if (std::string{adapter->AdapterName} != ifname)
++                    return;
++                for (auto* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next)
++                {
++                    if (!addr->Address.lpSockaddr)
++                        continue;
++                    if (addr->Address.lpSockaddr->sa_family != AF_INET)
++                        continue;
++                    found = quic::Address{addr->Address.lpSockaddr}.to_ipv4();
++                    return;
++                }
++            });
+ 
+-        std::optional<quic::Address> get_best_public_address(bool, uint16_t) const override
+-        {
+-            // TODO: implement me ?
+-            return std::nullopt;
++            return found;
+         }
+ 
+-        std::optional<IPRange> find_free_range(bool ipv6_enabled) const override
++        std::optional<ipv6> get_interface_ipv6(std::string_view ifname) const override
+         {
+-            std::list<IPRange> currentRanges;
++            std::optional<ipv6> found;
+ 
+-            win32::iter_adapters([&currentRanges](auto* i) {
+-                for (auto* addr = i->FirstUnicastAddress; addr; addr = addr->Next)
++            win32::iter_adapters([&](auto* adapter) {
++                if (found)
++                    return;
++                if (std::string{adapter->AdapterName} != ifname)
++                    return;
++                for (auto* addr = adapter->FirstUnicastAddress; addr; addr = addr->Next)
+                 {
+-                    quic::Address saddr{*addr->Address.lpSockaddr};
+-
+-                    bool is_ipv6 = addr->Address.lpSockaddr->sa_family == AF_INET6 ? true : false;
+-
+-                    // TOFIX: wtf is this
+-                    uint8_t m = is_ipv6 ? reinterpret_cast<sockaddr_in6*>(*addr->Address.lpSockaddr)->sin6_addr.s6_addr
+-                                        : reinterpret_cast<sockaddr_in*>(*addr->Address.lpSockaddr)->sin_addr.s_addr;
+-
+-                    currentRanges.emplace_back(std::move(saddr), m);
++                    if (!addr->Address.lpSockaddr)
++                        continue;
++                    if (addr->Address.lpSockaddr->sa_family != AF_INET6)
++                        continue;
++                    found = quic::Address{addr->Address.lpSockaddr}.to_ipv6();
++                    return;
+                 }
+             });
+ 
+-            return IPRange::find_private_range(currentRanges);
++            return found;
+         }
+ 
+-        bool has_interface_address(ip ip) const override { return get_interface_index(ip) != std::nullopt; }
++        bool has_interface_address(ipv4 ip) const override
++        {
++            return get_interface_index(ip) != std::nullopt;
++        }
++
++        bool has_interface_address(ipv6 ip) const override
++        {
++            return get_interface_index(ip) != std::nullopt;
++        }
+     };
+ 
+     const Platform_Impl g_plat{};
+diff --git a/src/router/route_poker.cpp b/src/router/route_poker.cpp
+index 3bb180463..36c6218cf 100644
+--- a/src/router/route_poker.cpp
++++ b/src/router/route_poker.cpp
+@@ -1,5 +1,6 @@
+ #include "route_poker.hpp"
+ 
++#include "handlers/tun.hpp"
+ #include "link/link_manager.hpp"
+ #include "router.hpp"
+ 
+@@ -7,19 +8,30 @@ namespace srouter
+ {
+     static auto logcat = log::Cat("route_poker");
+ 
+-    RoutePoker::RoutePoker(Router& r) : _router{r} {}
++    RoutePoker::RoutePoker(Router& r) : _router{r}
++    {
++        _enabled = r.config().network.enable_route_poker;
++        if (_enabled)
++            log::info(logcat, "Route poker enabled by [network] auto-routing");
++    }
+ 
+     template <IP46 IP>
+     void RoutePoker::add_route(const IP& ip)
+     {
+-        if (not _up)
+-            return;
+-
+-        // set up route and apply as needed
++        // Always record the hop so pre-put_up poke_first_hop is not dropped on the floor.
++        // When !_up we only store (empty gateway); put_up flushes via refresh/enable before
++        // installing default-via-TUN.
+         auto& poked_rs = poked_routes<IP>();
+         auto [it, new_route] = poked_rs.emplace(ip, IP{});
+         auto& gw = it->second;
+ 
++        if (not _up)
++        {
++            if (new_route)
++                log::debug(logcat, "RoutePoker: recorded first-hop {} pending put_up", ip);
++            return;
++        }
++
+         auto& current_gw = current_gateway<IP>();
+         if (!current_gw)
+         {
+@@ -28,7 +40,7 @@ namespace srouter
+         }
+ 
+         // remove existing mapping as needed
+-        if (!new_route)
++        if (!new_route and gw != IP{})
+             disable_route(ip, gw);
+         // update and add new mapping
+         gw = *current_gw;
+@@ -77,14 +89,8 @@ namespace srouter
+             return;
+         }
+ 
+-        // TODO FIXME: this should be enabled again, but it doesn't seem very nice to have this on
+-        // such a tight timer.  Perhaps we could trigger it from the appropriate place, and if not,
+-        // at least reduce the timer frequency.
+-
+-        // router.loop()->call_every(100ms, weak_from_this(), [self = weak_from_this()]() {
+-        //     if (auto ptr = self.lock())
+-        //         ptr->update();
+-        // });
++        // Discover gateway once at start; put_up() re-discovers.  Avoid 100ms hammer.
++        update();
+     }
+ 
+     void RoutePoker::disable_all_routes()
+@@ -112,61 +118,74 @@ namespace srouter
+         _router.vpn_platform()->RouteManager().delete_blackhole();
+     }
+ 
+-    void RoutePoker::update()
++void RoutePoker::update()
+     {
+-        // TODO FIXME
+-        //
+-        // // ensure we have an endpoint
+-        // auto ep = router.hidden_service_context().GetDefault();
+-        // if (ep == nullptr)
+-        //   return;
+-        // // ensure we have a vpn platform
+-        // auto* platform = router.vpn_platform();
+-        // if (platform == nullptr)
+-        //   return;
+-        // // ensure we have a vpn interface
+-        // auto* vpn = ep->GetVPNInterface();
+-        // if (vpn == nullptr)
+-        //   return;
+-
+-        // auto& route = platform->RouteManager();
+-
+-        // // get current gateways, assume sorted by lowest metric first
+-        // auto gateways = route.get_non_interface_gateways(*vpn);
+-        // std::optional<quic::Address> next_gw;
+-
+-        // for (auto& g : gateways)
+-        // {
+-        //   if (g.is_ipv4())
+-        //   {
+-        //     next_gw = g;
+-        //     break;
+-        //   }
+-        // }
+-
+-        // // update current gateway and apply state changes as needed
+-        // if (!(current_gateway == next_gw))
+-        // {
+-        //   if (next_gw and current_gateway)
+-        //   {
+-        //     log::info(logcat, "default gateway changed from {} to {}", *current_gateway,
+-        //     *next_gw); current_gateway = next_gw; refresh_all_routes();
+-        //   }
+-        //   else if (current_gateway)
+-        //   {
+-        //     log::warning(logcat, "default gateway {} has gone away", *current_gateway);
+-        //     current_gateway = next_gw;
+-        //   }
+-        //   else  // next_gw and not m_CurrentGateway
+-        //   {
+-        //     log::info(logcat, "default gateway found at {}", *next_gw);
+-        //     current_gateway = next_gw;
+-        //   }
+-        // }
+-        // else if (router.HasClientExit())
+-        //   put_up();
++        // Discover non-TUN gateways via VPN RouteManager (same path as linux.hpp).
++        // TunEndpoint is full-platform only; RoutePoker lives in the same TU/link unit.
++        auto platform = _router.vpn_platform();
++        if (not platform)
++            return;
++        auto& tun_base = _router.tun_endpoint();
++        if (not tun_base)
++            return;
++        auto* tun = dynamic_cast<handlers::TunEndpoint*>(tun_base.get());
++        if (tun == nullptr)
++            return;
++        auto* vpn = tun->get_vpn_interface();
++        if (vpn == nullptr)
++            return;
++
++        auto gateways = platform->RouteManager().get_non_interface_gateways(*vpn);
++
++        std::optional<ipv4> next4;
++        std::optional<ipv6> next6;
++        for (auto& g : gateways)
++        {
++            if (g.is_ipv4() and not next4)
++            {
++                auto v4 = g.to_ipv4();
++                if (v4 != ipv4{})
++                    next4 = v4;
++            }
++            else if (g.is_ipv6() and not next6)
++            {
++                auto v6 = g.to_ipv6();
++                if (v6 != ipv6{})
++                    next6 = v6;
++            }
++        }
++
++        bool changed = false;
++        if (next4 != current_gateway4)
++        {
++            if (next4 and current_gateway4)
++                log::info(logcat, "IPv4 default gateway changed from {} to {}", *current_gateway4, *next4);
++            else if (current_gateway4)
++                log::warning(logcat, "IPv4 default gateway {} has gone away", *current_gateway4);
++            else if (next4)
++                log::info(logcat, "IPv4 default gateway found at {}", *next4);
++            current_gateway4 = next4;
++            changed = true;
++        }
++        if (next6 != current_gateway6)
++        {
++            if (next6 and current_gateway6)
++                log::info(logcat, "IPv6 default gateway changed from {} to {}", *current_gateway6, *next6);
++            else if (current_gateway6)
++                log::warning(logcat, "IPv6 default gateway {} has gone away", *current_gateway6);
++            else if (next6)
++                log::info(logcat, "IPv6 default gateway found at {}", *next6);
++            current_gateway6 = next6;
++            changed = true;
++        }
++
++        if (changed)
++            refresh_all_routes();
++        // Do not call put_up() here — put_up() itself calls update(); auto-up is
++        // driven by TunEndpoint on_connected when exit.ranges is non-empty.
+     }
+ 
++
+     template <IP46 IP>
+     inline static constexpr auto ip_name = std::same_as<IP, ipv4> ? "IPv4"sv : "IPv6"sv;
+ 
+@@ -174,7 +193,6 @@ namespace srouter
+     {
+         if (_up)
+             return;
+-        _up = true;
+ 
+         if (!_enabled)
+         {
+@@ -182,9 +200,21 @@ namespace srouter
+             return;
+         }
+ 
+-        if (!current_gateway4 && !current_gateway6)
++        // Refresh non-TUN gateway discovery before installing routes.
++        update();
++
++        if (not _router.vpn_platform())
+         {
+-            log::warning(logcat, "RoutePoker came up, but we don't appear to have any gateways!");
++            log::warning(logcat, "RoutePoker: no vpn platform; refuse put_up");
++            return;
++        }
++
++        // Fail closed: no default-via-TUN without a discovered non-TUN gateway.
++        if (not current_gateway4 and not current_gateway6)
++        {
++            log::warning(
++                logcat,
++                "RoutePoker: no non-TUN gateway discovered; refuse default route via TUN");
+             return;
+         }
+ 
+@@ -196,63 +226,113 @@ namespace srouter
+         if (_router.config().network.blackhole_routes)
+             route.add_blackhole();
+ 
+-        // explicit route pokes for first hops
+-        _router.link_manager().endpoint.for_each_relay_conn([this](const RouterID&, link::Connection& conn) {
+-            auto remote = conn.conn->remote();
++        // IMPORTANT: flush *all* first-hop /32s (pre-up recorded + established + pending
++        // outbound) *before* default-via-TUN, or edge QUIC is blackholed into the TUN and
++        // path builds to the exit time out.
++        const auto recorded = poked_routes4.size() + poked_routes6.size();
++        // Mark _up so add_route actually installs (enable_route) during flush.
++        _up = true;
++        refresh_all_routes();
++
++        int poked = 0;
++        auto poke_remote = [this, &poked](const quic::Address& remote) {
++            if (remote.is_any_addr())
++                return;
+             if (remote.is_ipv4())
+                 add_route(remote.to_ipv4());
+             else
+                 add_route(remote.to_ipv6());
+-        });
++            ++poked;
++        };
++
++        // Established client/relay edges.
++        _router.link_manager().endpoint.for_each_relay_conn(
++            [&poke_remote](const RouterID&, link::Connection& conn) {
++                poke_remote(conn.conn->remote());
++            });
++
++        // In-flight dials not yet in client_conns (pending_outbound).
++        _router.link_manager().endpoint.for_each_pending_outbound(
++            [&poke_remote](const RouterID&, link::Connection& conn) {
++                if (conn.conn)
++                    poke_remote(conn.conn->remote());
++            });
+ 
+         auto& local = _router.link_manager().local();
+-        if (local.is_ipv4())
+-            add_route(local.to_ipv4());
++        if (not local.is_any_addr())
++            poke_remote(local);
++
++        const auto installed = poked_routes4.size() + poked_routes6.size();
++        log::info(
++            logcat,
++            "RoutePoker: flushed {} pre-up recorded hop(s); poked {} live/pending edge remote(s); "
++            "pin map size {}",
++            recorded,
++            poked,
++            installed);
++
++        // Fail closed: empty pin list / zero host routes — do not install default-via-TUN.
++        if (installed == 0)
++        {
++            log::warning(
++                logcat,
++                "RoutePoker: pin list empty after flush; refuse default route via TUN");
++            _up = false;
++            if (_router.config().network.blackhole_routes)
++                route.delete_blackhole();
++            return;
++        }
++
++        // Default route via Session Router TUN — only AFTER successful first-hop pins.
++        if (auto& tun = _router.tun_endpoint())
++        {
++            try
++            {
++                tun->add_default_route();
++                log::info(logcat, "route poker: default route via TUN installed");
++            }
++            catch (const std::exception& e)
++            {
++                log::warning(logcat, "route poker: default route via TUN failed: {}; rolling back", e.what());
++                delete_all_routes();
++                if (_router.config().network.blackhole_routes)
++                    route.delete_blackhole();
++                _up = false;
++                return;
++            }
++        }
+         else
+-            add_route(local.to_ipv6());
+-        // add default route
+-        //
+-        // TODO FIXME -- with this commented out exit mode cannot work!!
+-        //
+-        log::critical(logcat, "FIXME TODO: not adding default route yet because ???");
+-        // const auto ep = router.hidden_service_context().GetDefault();
+-        // if (auto* vpn = ep->GetVPNInterface())
+-        //   route.add_default_route_via_interface(*vpn);
++        {
++            log::warning(logcat, "route poker: no TUN endpoint; cannot install default route");
++            _up = false;
++            return;
++        }
+         log::info(logcat, "route poker up");
+-
+-        // TODO FIXME
+-        // set_dns_mode(true);
+     }
+ 
+     void RoutePoker::put_down()
+     {
+         if (!_up)
+             return;
++        // Clear _up first so a reconnect during slow win32 route DELETE can put_up again.
++        _up = false;
+ 
+-        // unpoke routes for first hops
+-        _router.link_manager().endpoint.for_each_relay_conn([this](const RouterID&, link::Connection& conn) {
+-            auto remote = conn.conn->remote();
+-            if (remote.is_ipv4())
+-                delete_route(remote.to_ipv4());
+-            else
+-                delete_route(remote.to_ipv6());
+-        });
++        // Delete every recorded host pin (not only current relay_conns).
++        delete_all_routes();
+ 
+         if (_enabled)
+         {
+-            // TODO FIXME
+-            // vpn::AbstractRouteManager& route = router.vpn_platform()->RouteManager();
+-            // const auto ep = router.hidden_service_context().GetDefault();
+-            // if (auto* vpn = ep->GetVPNInterface())
+-            //   route.delete_default_route_via_interface(*vpn);
+-
+-            // delete route blackhole
+-            // route.delete_blackhole();
+-            // log::info(logcat, "route poker down");
++            if (auto& tun = _router.tun_endpoint())
++                tun->delete_default_route();
++
++            if (_router.vpn_platform())
++            {
++                vpn::AbstractRouteManager& route = _router.vpn_platform()->RouteManager();
++                if (_router.config().network.blackhole_routes)
++                    route.delete_blackhole();
++            }
++            log::info(logcat, "route poker down");
+         }
+-
+-        // set_dns_mode(false);
+-        _up = false;
+     }
+ 
+ }  // namespace srouter
+diff --git a/src/router/route_poker.hpp b/src/router/route_poker.hpp
+index 00a2b636a..fe45fdc83 100644
+--- a/src/router/route_poker.hpp
++++ b/src/router/route_poker.hpp
+@@ -45,8 +45,12 @@ namespace srouter
+         /// set dns resolver
+         /// pass in if we are using exit node mode right now  as a bool
+         // void set_dns_mode(bool using_exit_mode) const;
++        // NOTE: without set_dns_mode, OS on-link DNS resolvers can leak outside the tunnel
++        // when a default route via TUN is up. Document for operators; wire later if needed.
+ 
+         bool enabled() const { return _enabled; }
++        bool is_up() const { return _up; }
++        void set_enabled(bool v) { _enabled = v; }
+ 
+       private:
+         void update();
+diff --git a/src/router/router.cpp b/src/router/router.cpp
+index d6c1cbbcc..a202505ca 100644
+--- a/src/router/router.cpp
++++ b/src/router/router.cpp
+@@ -447,6 +447,14 @@ namespace srouter
+         if (!embedded())
+             sys::service_manager->starting();
+ 
++        // Fail closed: [exit] enable with no routed-range / policy must not forward everything.
++        if (_config.exit.exit_enabled and _config.exit.exit_policy.empty())
++        {
++            throw std::runtime_error{
++                "[exit] enable=true requires at least one routed-range (or policy); "
++                "empty policy would forward all traffic"};
++        }
++
+         if (_config.exit.exit_enabled and is_service_node)
+             throw std::runtime_error{
+                 "Session Router cannot simultaneously operate as a service node and client-operated exit node "
+@@ -612,7 +620,6 @@ namespace srouter
+ 
+     std::string Router::_stats_line(sys_ms now) const
+     {
+-        using namespace fmt::literals;
+         auto [rcs, rids, bs] = _node_db->db_stats();
+         auto [s_in, s_out_r, s_out_c, s_out_r_pending, s_out_c_pending] = _session_endpoint->session_stats();
+         auto [in_paths, out_r_paths, out_c_paths] = _session_endpoint->path_stats(now);
+@@ -623,16 +630,16 @@ namespace srouter
+                 "relays: {relays} conns ({rin}↓, {rout}↑{pending}{full_mesh}), RC/RIDs: {rcs}/{rids}; "
+                 "{clients} clients; sessions: {sess_in}↓; paths: {paths_in}",
+ 
+-                "relays"_a = relays,
+-                "rin"_a = rin,
+-                "rout"_a = rout,
+-                "pending"_a = rpending ? ", {} pending"_format(rpending) : "",
+-                "full_mesh"_a = relays >= rids - 1 ? ", #" : "",
+-                "clients"_a = clients,
+-                "sess_in"_a = s_in,
+-                "paths_in"_a = in_paths,
+-                "rcs"_a = rcs,
+-                "rids"_a = rids);
++                fmt::arg("relays", relays),
++                fmt::arg("rin", rin),
++                fmt::arg("rout", rout),
++                fmt::arg("pending", rpending ? ", {} pending"_format(rpending) : ""),
++                fmt::arg("full_mesh", relays >= rids - 1 ? ", #" : ""),
++                fmt::arg("clients", clients),
++                fmt::arg("sess_in", s_in),
++                fmt::arg("paths_in", in_paths),
++                fmt::arg("rcs", rcs),
++                fmt::arg("rids", rids));
+         }
+ 
+         auto [nconns, npending] = link_endpoint().client_connection_counts();
+@@ -641,16 +648,16 @@ namespace srouter
+             "paths: {paths_in}↓/{paths_out}↑, {path_percent:.1f}% of {path_total} attempts; "
+             "RC/RIDs: {rcs}/{rids}",
+ 
+-            "conns"_a = nconns + npending,
+-            "sess_in"_a = s_in,
+-            "sess_out_c"_a = s_out_c,
+-            "sess_out_r"_a = s_out_r,
+-            "paths_in"_a = in_paths,
+-            "paths_out"_a = out_r_paths + out_c_paths,
+-            "path_percent"_a = (double)path_builds.success * 100.0 / (double)path_builds.attempts,
+-            "path_total"_a = path_builds.attempts,
+-            "rcs"_a = rcs,
+-            "rids"_a = rids);
++            fmt::arg("conns", nconns + npending),
++            fmt::arg("sess_in", s_in),
++            fmt::arg("sess_out_c", s_out_c),
++            fmt::arg("sess_out_r", s_out_r),
++            fmt::arg("paths_in", in_paths),
++            fmt::arg("paths_out", out_r_paths + out_c_paths),
++            fmt::arg("path_percent", (double)path_builds.success * 100.0 / (double)path_builds.attempts),
++            fmt::arg("path_total", path_builds.attempts),
++            fmt::arg("rcs", rcs),
++            fmt::arg("rids", rids));
+     }
+ 
+     void Router::report_stats()
+@@ -864,7 +871,10 @@ namespace srouter
+                 try_calling(logcat, callback);
+ 
+             if (persistent || !fire_now)
+-                (with_paths ? _on_path_disconnected : _on_path_connected).emplace_back(std::move(callback), persistent);
++                // with_paths=false → edge disconnect (NOT path-connected; that was an upstream typo
++                // that tore down RoutePoker as soon as the first inbound path established).
++                (with_paths ? _on_path_disconnected : _on_edge_disconnected)
++                    .emplace_back(std::move(callback), persistent);
+         });
+     }
+ 
+@@ -881,6 +891,28 @@ namespace srouter
+         }
+     }
+ 
++    void Router::set_first_hop_poker(std::function<void(const ipv4&)> v4, std::function<void(const ipv6&)> v6)
++    {
++        _first_hop_poke_v4 = std::move(v4);
++        _first_hop_poke_v6 = std::move(v6);
++    }
++
++    void Router::poke_first_hop(const quic::Address& addr)
++    {
++        if (addr.is_any_addr())
++            return;
++        if (addr.is_ipv4())
++        {
++            if (_first_hop_poke_v4)
++                _first_hop_poke_v4(addr.to_ipv4());
++        }
++        else if (addr.is_ipv6())
++        {
++            if (_first_hop_poke_v6)
++                _first_hop_poke_v6(addr.to_ipv6());
++        }
++    }
++
+     void Router::on_edge_conn_change()
+     {
+         assert(_loop->inside());
+diff --git a/src/router/router.hpp b/src/router/router.hpp
+index cb4c8fdbc..2c0b821bd 100644
+--- a/src/router/router.hpp
++++ b/src/router/router.hpp
+@@ -160,6 +160,8 @@ namespace srouter
+         std::shared_ptr<dns::Listener> _dns;
+         std::shared_ptr<vpn::Platform> _vpn;
+         std::shared_ptr<RoutePoker> _route_poker;
++        std::function<void(const ipv4&)> _first_hop_poke_v4;
++        std::function<void(const ipv6&)> _first_hop_poke_v6;
+ 
+         std::promise<void> _close_promise;
+ 
+@@ -267,6 +269,10 @@ namespace srouter
+ 
+         const Config& config() const { return _config; }
+ 
++        // Runtime MapExit / unmap_exit mutate reserved-range mappings.
++        auto& mutable_exit_ranges() { return _config.exit.ranges; }
++        const auto& exit_ranges() const { return _config.exit.ranges; }
++
+         ContactDB& contact_db()
+         {
+             assert(_contact_db);
+@@ -326,8 +332,14 @@ namespace srouter
+ 
+         bool looks_alive() const { return steady_now_ms() - _last_tick <= 30s; }
+ 
+-        // RoutePoker& route_poker() { return *_route_poker; }
+-        // const RoutePoker& route_poker() const { return *_route_poker; }
++        RoutePoker* route_poker() { return _route_poker.get(); }
++        const RoutePoker* route_poker() const { return _route_poker.get(); }
++        void set_route_poker(std::shared_ptr<RoutePoker> p) { _route_poker = std::move(p); }
++
++        // Full platform (TunEndpoint) registers these so core link code can request a host
++        // route to a relay first hop without linking RoutePoker into session-router-core.
++        void set_first_hop_poker(std::function<void(const ipv4&)> v4, std::function<void(const ipv6&)> v6);
++        void poke_first_hop(const quic::Address& addr);
+ 
+         std::string status_line();
+ 
+diff --git a/src/rpc/rpc_request_definitions.hpp b/src/rpc/rpc_request_definitions.hpp
+index 1ce6891cb..490bb6501 100644
+--- a/src/rpc/rpc_request_definitions.hpp
++++ b/src/rpc/rpc_request_definitions.hpp
+@@ -166,6 +166,7 @@ namespace srouter::rpc
+         struct request_parameters
+         {
+             std::string address;
++            bool full_tunnel{false};
+             std::vector<std::string> ip_ranges;
+             std::string token;
+         } request;
+@@ -216,6 +217,8 @@ namespace srouter::rpc
+         struct request_parameters
+         {
+             std::vector<std::string> exit_addresses;
++            bool full_tunnel{false};
++            std::vector<std::string> ip_ranges;
+             std::string token;
+         } request;
+     };
+diff --git a/src/rpc/rpc_request_parser.cpp b/src/rpc/rpc_request_parser.cpp
+index 6e9ea7edd..9c9c48391 100644
+--- a/src/rpc/rpc_request_parser.cpp
++++ b/src/rpc/rpc_request_parser.cpp
+@@ -58,6 +58,8 @@ namespace srouter::rpc
+             input,
+             "address",
+             mapexit.request.address,
++            "full_tunnel",
++            mapexit.request.full_tunnel,
+             "ip_ranges",
+             mapexit.request.ip_ranges,
+             "token",
+@@ -71,7 +73,16 @@ namespace srouter::rpc
+ 
+     void parse_request(SwapExits& swapexits, rpc_input input)
+     {
+-        get_values(input, "exit_addresses", swapexits.request.exit_addresses, "token", swapexits.request.token);
++        get_values(
++            input,
++            "exit_addresses",
++            swapexits.request.exit_addresses,
++            "full_tunnel",
++            swapexits.request.full_tunnel,
++            "ip_ranges",
++            swapexits.request.ip_ranges,
++            "token",
++            swapexits.request.token);
+     }
+ 
+ #if 0
+diff --git a/src/rpc/rpc_server.cpp b/src/rpc/rpc_server.cpp
+index c4682013b..1915461c4 100644
+--- a/src/rpc/rpc_server.cpp
++++ b/src/rpc/rpc_server.cpp
+@@ -78,8 +78,18 @@ namespace srouter::rpc
+ 
+         for (const auto& addr : _router.config().api.rpc_bind_addrs)
+         {
+-            _omq.listen_plain(addr);
+-            log::debug(logcat, "Bound RPC server to {}", addr);
++            // Loopback / IPC get admin; everything else is denied.  MapExit family
++            // (and the rest of the llarp category) require AuthLevel::admin.
++            _omq.listen_plain(
++                addr,
++                [](std::string_view remote, std::string_view /*pubkey*/, bool /*sn*/) {
++                    if (remote.starts_with("127.") or remote.starts_with("::1") or remote.starts_with("[::1]")
++                        or remote.find("localhost") != std::string_view::npos or remote.starts_with("/")
++                        or remote.starts_with("ipc://"))
++                        return oxenmq::AuthLevel::admin;
++                    return oxenmq::AuthLevel::denied;
++                });
++            log::debug(logcat, "Bound RPC server to {} (admin for loopback/IPC only)", addr);
+         }
+ 
+         AddCategories();
+@@ -100,7 +110,10 @@ namespace srouter::rpc
+ 
+     void RPCServer::AddCategories()
+     {
+-        _omq.add_category("llarp", oxenmq::AuthLevel::none).add_request_command("logs", [this](oxenmq::Message& msg) {
++        // AuthLevel::admin: MapExit/UnmapExit/SwapExits (and other llarp commands) are not
++        // freely usable once the API is bound.  Loopback/IPC connections are granted admin
++        // by the listen_plain AllowFunc above.  Do not lower this back to none.
++        _omq.add_category("llarp", oxenmq::AuthLevel::admin).add_request_command("logs", [this](oxenmq::Message& msg) {
+             HandleLogsSubRequest(msg);
+         });
+ 
+@@ -505,32 +518,235 @@ namespace srouter::rpc
+         // });
+     }
+ 
++    namespace
++    {
++        // Privacy profile: MapExit accepts IP CIDRs only. Reject hostname-looking entries
++        // (alpha chars that do not parse as IPv4/IPv6 CIDR — IPv6 hex a-f still OK).
++        bool ip_range_looks_like_hostname(std::string_view rstr)
++        {
++            bool has_alpha = false;
++            for (char c : rstr)
++            {
++                if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z'))
++                {
++                    has_alpha = true;
++                    break;
++                }
++            }
++            if (not has_alpha)
++                return false;
++            try
++            {
++                if (rstr.find(':') != std::string_view::npos)
++                    (void)parse_ipv6_range(rstr, 128);
++                else
++                    (void)parse_ipv4_range(rstr, 32);
++                return false;  // parsed as CIDR (e.g. IPv6 with hex letters)
++            }
++            catch (const std::exception&)
++            {
++                return true;
++            }
++        }
++
++        // True for RFC1918 / loopback / link-local / multicast IPv4 (and common IPv6 equivalents).
++        bool range_is_non_public(const std::variant<ipv4_range, ipv6_range>& r)
++        {
++            if (const auto* r4 = std::get_if<ipv4_range>(&r))
++            {
++                const auto base = r4->mask == 0 ? ipv4{0} : r4->ip.to_base(r4->mask);
++                const uint32_t a = base.addr;
++                if ((a & 0xff000000u) == 0x0a000000u)  // 10.0.0.0/8
++                    return true;
++                if ((a & 0xfff00000u) == 0xac100000u)  // 172.16.0.0/12
++                    return true;
++                if ((a & 0xffff0000u) == 0xc0a80000u)  // 192.168.0.0/16
++                    return true;
++                if ((a & 0xff000000u) == 0x7f000000u)  // 127.0.0.0/8
++                    return true;
++                if ((a & 0xffff0000u) == 0xa9fe0000u)  // 169.254.0.0/16 link-local
++                    return true;
++                if ((a & 0xf0000000u) == 0xe0000000u)  // 224.0.0.0/4 multicast
++                    return true;
++                if (a == 0)  // 0.0.0.0/N — treat as non-explicit private carve-out only when mask>0
++                    return r4->mask > 0;
++                return false;
++            }
++            const auto& r6 = std::get<ipv6_range>(r);
++            // fc00::/7 ULA, fe80::/10 link-local, ff00::/8 multicast, ::1/128 loopback
++            if ((r6.ip.hi & 0xfe00000000000000ull) == 0xfc00000000000000ull)
++                return true;
++            if ((r6.ip.hi & 0xffc0000000000000ull) == 0xfe80000000000000ull)
++                return true;
++            if ((r6.ip.hi & 0xff00000000000000ull) == 0xff00000000000000ull)
++                return true;
++            if (r6.ip.hi == 0 and r6.ip.lo == 1)
++                return true;
++            return false;
++        }
++
++        // Build mapped ranges into a temp list. Empty ip_ranges requires full_tunnel=true.
++        // full_tunnel installs 0.0.0.0/0 only (explicit); private/link-local/multicast CIDRs
++        // in the request are kept when the caller lists them explicitly.
++        std::vector<std::variant<ipv4_range, ipv6_range>> build_exit_ranges(
++            const std::vector<std::string>& ip_ranges, bool full_tunnel)
++        {
++            std::vector<std::variant<ipv4_range, ipv6_range>> out;
++            if (ip_ranges.empty())
++            {
++                if (not full_tunnel)
++                    throw std::invalid_argument{
++                        "ip_ranges empty: pass full_tunnel=true for 0.0.0.0/0, or list CIDRs"};
++                out.push_back(ipv4{0} / 0);
++                return out;
++            }
++            for (const auto& rstr : ip_ranges)
++            {
++                std::variant<ipv4_range, ipv6_range> parsed;
++                if (rstr.find(':') != std::string::npos)
++                    parsed = parse_ipv6_range(rstr, 128);
++                else
++                    parsed = parse_ipv4_range(rstr, 32);
++                // Bare 0.0.0.0/0 or ::/0 also requires full_tunnel (same as empty ranges).
++                const bool is_all = std::visit(
++                    [](const auto& r) { return r.mask == 0; }, parsed);
++                if (is_all and not full_tunnel)
++                    throw std::invalid_argument{
++                        "0.0.0.0/0 or ::/0 requires full_tunnel=true (refusing silent full-tunnel)"};
++                // Private / link-local / multicast CIDRs are allowed only when listed explicitly
++                // in ip_ranges (this branch).  full_tunnel alone does not expand into those.
++                (void)range_is_non_public(parsed);
++                out.push_back(std::move(parsed));
++            }
++            return out;
++        }
++
++        void maybe_put_up_routes(Router& router)
++        {
++            auto* poker = router.route_poker();
++            if (not poker or not poker->enabled())
++                return;
++            if (router.exit_ranges().empty())
++                return;
++            if (poker->is_up())
++                return;
++            poker->put_up();
++        }
++
++        void maybe_put_down_if_no_ranges(Router& router)
++        {
++            auto* poker = router.route_poker();
++            if (not poker)
++                return;
++            if (not router.exit_ranges().empty())
++                return;
++            if (poker->is_up())
++                poker->put_down();
++        }
++    }  // namespace
++
+     void RPCServer::invoke(MapExit& mapexit)
+     {
+         log_print_rpc(mapexit);
+ 
+-        MapExit exit_request;
+-        // steal replier from exit RPC endpoint
+-        exit_request.replier.emplace(mapexit.move());
+-
+-        // TODO: connect this to remote service session management (service::Handler)
+-        // _router.hidden_service_context().GetDefault()->map_exit(
+-        //     mapexit.request.address,
+-        //     mapexit.request.token,
+-        //     mapexit.request.ip_range,
+-        //     [exit = std::move(exit_request)](bool success, std::string result) mutable {
+-        //       if (success)
+-        //         exit.send_response({{"result"}, std::move(result)});
+-        //       else
+-        //         exit.send_response({{"error"}, std::move(result)});
+-        //     });
++        // Controlled clear-exit mapping (IP ranges only — no hostname resolve).
++        try
++        {
++            if (mapexit.request.address.empty())
++            {
++                SetJSONError("address (.sesh) required", mapexit.response);
++                return;
++            }
++
++            NetworkAddress exit_addr{mapexit.request.address};
++            if (not exit_addr.client())
++            {
++                SetJSONError("exit address must be a client .sesh", mapexit.response);
++                return;
++            }
++
++            // Apply auth token into live SessionEndpoint map (not parse-and-ignore).
++            if (not mapexit.request.token.empty())
++                _router.session_endpoint().set_auth_token(exit_addr, mapexit.request.token);
++
++            // Reject hostname-looking ip_ranges before mutating state (privacy: IP-only).
++            for (const auto& rstr : mapexit.request.ip_ranges)
++            {
++                if (ip_range_looks_like_hostname(rstr))
++                {
++                    SetJSONError(
++                        "ip_ranges must be IP CIDRs only (privacy profile); hostname rejected: {}"_format(rstr),
++                        mapexit.response);
++                    return;
++                }
++            }
++
++            // Parse into temp, then atomic replace the slot.
++            auto built = build_exit_ranges(mapexit.request.ip_ranges, mapexit.request.full_tunnel);
++            auto& ranges = _router.mutable_exit_ranges();
++            ranges[exit_addr] = std::move(built);
++            const auto slot_size = ranges[exit_addr].size();
++
++            // Kick session setup so CC/exit-capable can populate
++            try
++            {
++                _router.session_endpoint().initiate_remote_session(exit_addr, nullptr);
++            }
++            catch (const std::exception& e)
++            {
++                log::warning(logcat, "MapExit: session initiate deferred/failed: {}", e.what());
++            }
++
++            maybe_put_up_routes(_router);
++
++            log::info(
++                logcat,
++                "EXIT_MAPPED address={} ranges={} (MapExit; wait for EXIT_CAPABLE when session live)",
++                mapexit.request.address,
++                slot_size);
++
++            SetJSONResponse(
++                "mapped {} range(s) via {}"_format(slot_size, mapexit.request.address), mapexit.response);
++        }
++        catch (const std::exception& e)
++        {
++            SetJSONError(e.what(), mapexit.response);
++        }
+     }
+ 
+     void RPCServer::invoke(ListExits& listexits)
+     {
+         log_print_rpc(listexits);
+ 
+-        // TODO: this
++        nlohmann::json exits = nlohmann::json::array();
++        for (const auto& [addr, range_list] : _router.exit_ranges())
++        {
++            nlohmann::json entry;
++            entry["address"] = addr.to_string();
++            nlohmann::json rs = nlohmann::json::array();
++            for (const auto& r : range_list)
++            {
++                // Human CIDR for JSON (encode() is binary BT for ClientContact — not for ListExits).
++                if (const auto* r4 = std::get_if<ipv4_range>(&r))
++                    rs.push_back(r4->to_string());
++                else
++                    rs.push_back(std::get<ipv6_range>(r).to_string());
++            }
++            entry["ranges"] = std::move(rs);
++            if (auto* s = _router.session_endpoint().get_session(addr))
++            {
++                entry["session_live"] = true;
++                entry["exit_capable"] = s->is_exit_capable;
++                entry["last_activity"] = s->last_activity_at().time_since_epoch().count();
++            }
++            else
++            {
++                entry["session_live"] = false;
++                entry["exit_capable"] = false;
++            }
++            exits.push_back(std::move(entry));
++        }
++        SetJSONResponse(exits, listexits.response);
+     }
+ 
+     void RPCServer::invoke(UnmapExit& unmapexit)
+@@ -539,28 +755,130 @@ namespace srouter::rpc
+ 
+         try
+         {
+-            // for (auto& ip : unmapexit.request.ip_range)
+-            //   _router.hidden_service_context().GetDefault()->UnmapExitRange(ip);
++            if (unmapexit.request.address.empty())
++            {
++                SetJSONError("address required", unmapexit.response);
++                return;
++            }
++            NetworkAddress exit_addr{unmapexit.request.address};
++            auto& ranges = _router.mutable_exit_ranges();
++            if (ranges.erase(exit_addr) == 0)
++            {
++                SetJSONError("no mapping for that address", unmapexit.response);
++                return;
++            }
++            maybe_put_down_if_no_ranges(_router);
++            log::info(
++                logcat,
++                "EXIT_UNMAPPED address={} (UnmapExit; remount via MapExit or reserved-range restart to restore)",
++                unmapexit.request.address);
++            SetJSONResponse("OK", unmapexit.response);
+         }
+         catch (std::exception& e)
+         {
+-            SetJSONError("Unable to unmap to given range", unmapexit.response);
+-            return;
++            SetJSONError(e.what(), unmapexit.response);
+         }
+-
+-        SetJSONResponse("OK", unmapexit.response);
+     }
+ 
+-    //  Sequentially calls map_exit and unmap_exit to hotswap mapped connection from old exit
+-    //  to new exit. Similar to how map_exit steals the oxenmq deferredsend object, swapexit
+-    //  moves the replier object to the unmap_exit struct, as that is called second. Rather than
+-    //  the nested lambda within map_exit making the reply call, it instead calls the unmap_exit
+-    //  logic and leaves the message handling to the unmap_exit struct
++    //  Sequentially UnmapExit(old) then MapExit(new) to hotswap mapped connection.
++    //  exit_addresses[0]=old, [1]=new. Empty ip_ranges requires full_tunnel=true.
++    //  Same-address [A,A] is a valid remount (erase then re-map).
+     void RPCServer::invoke(SwapExits& swapexits)
+     {
+         log_print_rpc(swapexits);
+ 
+-        // TODO: this
++        try
++        {
++            if (swapexits.request.exit_addresses.size() < 2)
++            {
++                SetJSONError(
++                    "exit_addresses requires [old, new] (.sesh); index0=old index1=new",
++                    swapexits.response);
++                return;
++            }
++
++            const std::string& old_s = swapexits.request.exit_addresses[0];
++            const std::string& new_s = swapexits.request.exit_addresses[1];
++            if (old_s.empty() or new_s.empty())
++            {
++                SetJSONError("exit_addresses[0] (old) and [1] (new) must be non-empty", swapexits.response);
++                return;
++            }
++
++            NetworkAddress old_addr{old_s};
++            NetworkAddress new_addr{new_s};
++            if (not old_addr.client() or not new_addr.client())
++            {
++                SetJSONError("exit addresses must be client .sesh", swapexits.response);
++                return;
++            }
++
++            if (not swapexits.request.token.empty())
++                _router.session_endpoint().set_auth_token(new_addr, swapexits.request.token);
++
++            for (const auto& rstr : swapexits.request.ip_ranges)
++            {
++                if (ip_range_looks_like_hostname(rstr))
++                {
++                    SetJSONError(
++                        "ip_ranges must be IP CIDRs only (privacy profile); hostname rejected: {}"_format(rstr),
++                        swapexits.response);
++                    return;
++                }
++            }
++
++            // Parse new ranges first (fail before erase on bad input).
++            auto built = build_exit_ranges(swapexits.request.ip_ranges, swapexits.request.full_tunnel);
++
++            auto& ranges = _router.mutable_exit_ranges();
++
++            if (ranges.erase(old_addr) == 0)
++            {
++                SetJSONError("no mapping for old address (exit_addresses[0])", swapexits.response);
++                return;
++            }
++            log::info(
++                logcat,
++                "EXIT_UNMAPPED address={} (SwapExits old; remount follows)",
++                old_s);
++
++            ranges[new_addr] = std::move(built);
++            const auto slot_size = ranges[new_addr].size();
++
++            if (ranges.empty())
++                maybe_put_down_if_no_ranges(_router);
++            else
++                maybe_put_up_routes(_router);
++
++            try
++            {
++                _router.session_endpoint().initiate_remote_session(new_addr, nullptr);
++            }
++            catch (const std::exception& e)
++            {
++                log::warning(logcat, "SwapExits: session initiate deferred/failed: {}", e.what());
++            }
++
++            log::info(
++                logcat,
++                "EXIT_MAPPED address={} ranges={} (SwapExits new; wait for EXIT_CAPABLE when session live)",
++                new_s,
++                slot_size);
++            log::info(
++                logcat,
++                "EXIT_SWAPPED old={} new={} ranges={}",
++                old_s,
++                new_s,
++                slot_size);
++
++            SetJSONResponse(
++                "swapped {} -> {} ({} range(s))"_format(old_s, new_s, slot_size),
++                swapexits.response);
++        }
++        catch (const std::exception& e)
++        {
++            SetJSONError(e.what(), swapexits.response);
++        }
+     }
+ 
+ #if 0
+diff --git a/src/session/session.cpp b/src/session/session.cpp
+index 3aa730fea..a06faa85a 100644
+--- a/src/session/session.cpp
++++ b/src/session/session.cpp
+@@ -1417,6 +1417,13 @@ namespace srouter::session
+             /*allow_cache=*/false);
+     }
+ 
++    void Session::set_exit_capable(bool v)
++    {
++        if (v and not is_exit_capable)
++            log::info(logcat, "EXIT_CAPABLE address={} (session marked exit-capable)", _remote);
++        is_exit_capable = v;
++    }
++
+     void OutboundClientSession::update_intros(const ClientContact& cc)
+     {
+         log::debug(logcat, "Update session {} intros from client contact: {}", *this, cc);
+@@ -1425,6 +1432,7 @@ namespace srouter::session
+         _next_cc_update = now + CC_FETCH_STALE;
+         _cc_last_signed = cc.signed_at();
+         _cc_protos = cc.protocols();
++        set_exit_capable(cc.exit_policy().has_value() and not cc.exit_policy()->empty());
+         last_inbound_activity = now;  // so we don't just fetch for inactivity again right away
+         auto intros = cc.intros();
+         _intros.assign(intros.begin(), intros.end());
+diff --git a/src/session/session.hpp b/src/session/session.hpp
+index 975b2d6a1..8c7e6e1b8 100644
+--- a/src/session/session.hpp
++++ b/src/session/session.hpp
+@@ -255,9 +255,13 @@ namespace srouter
+             // InboundRelaySession- or OutboundRelaySession-derived).
+             const bool is_relay_session;
+ 
+-            // TODO FIXME: make this do something.  When the session establishes we should get some
+-            // capabilities metadata, such as whether it supports exit.
+-            const bool is_exit_capable{false};
++            // Set when the remote ClientContact advertises an exit policy ("e"), or when local
++            // config maps this peer as an exit via reserved-range / MapExit.
++            bool is_exit_capable{false};
++            void set_exit_capable(bool v);
++
++            // Last packet activity time (unix ms), for ListExits.
++            sys_ms last_activity_at() const { return last_activity; }
+ 
+             const NetworkAddress& remote() const { return _remote; }
+ 
+diff --git a/src/vpn/win32.cpp b/src/vpn/win32.cpp
+index 77732c27d..22e8d12d1 100644
+--- a/src/vpn/win32.cpp
++++ b/src/vpn/win32.cpp
+@@ -8,18 +8,12 @@
+ 
+ namespace srouter::win32
+ {
+-    namespace
+-    {
+-        template <typename T>
+-        std::string ip_to_string(T ip)
+-        {
+-            return var::visit([](auto&& ip) { return ip.to_string(); }, ip);
+-        }
+-    }  // namespace
+ 
+     void VPNPlatform::make_route(std::string ip, std::string gw, std::string cmd)
+     {
+-        srouter::win32::Exec(
++        // Check exit codes (ADD failures are logged by ExecChecked).  Caller (put_up)
++        // fail-closes when the pin map stays empty.
++        (void)srouter::win32::ExecChecked(
+             "route.exe", fmt::format("{} {} MASK 255.255.255.255 {} METRIC {}", cmd, ip, gw, m_Metric));
+     }
+ 
+@@ -35,31 +29,86 @@ namespace srouter::win32
+     void VPNPlatform::route_via_interface(NetworkInterface& vpn, std::string addr, std::string mask, std::string cmd)
+     {
+         const auto& info = vpn.interface_info();
+-        auto ifaddr = ip_to_string(info[0]);
+-        // this changes the last 1 to a 0 so that it routes over the interface
+-        // this is required because windows is idiotic af
+-        ifaddr.back()--;
+-        srouter::win32::Exec("route.exe", fmt::format("{} {} MASK {} {} METRIC {}", cmd, addr, mask, ifaddr, m_Metric));
++        if (info.addrs.empty())
++            throw std::runtime_error{"win32 route_via_interface: interface has no addresses"};
++        // Next hop: IPv4 network address of the TUN (ip.to_base(mask)), not "last char--".
++        // The old last-char trick only worked when the TUN address ended in .1.
++        std::string nexthop;
++        if (const auto* n4 = std::get_if<ipv4_net>(&info.addrs[0]))
++            nexthop = n4->ip.to_base(n4->mask).to_string();
++        else
++            nexthop = std::visit([](const auto& a) { return a.ip.to_string(); }, info.addrs[0]);
++        (void)srouter::win32::ExecChecked(
++            "route.exe", fmt::format("{} {} MASK {} {} METRIC {}", cmd, addr, mask, nexthop, m_Metric));
+     }
+ 
+-    void VPNPlatform::add_route(quic::Address ip, quic::Address gateway)
++    namespace
++    {
++        std::string ipv4_netmask_dotted(uint8_t mask)
++        {
++            if (mask == 0)
++                return "0.0.0.0";
++            uint32_t m = (mask >= 32) ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - mask));
++            return fmt::format("{}.{}.{}.{}", (m >> 24) & 0xff, (m >> 16) & 0xff, (m >> 8) & 0xff, m & 0xff);
++        }
++    }  // namespace
++
++    void VPNPlatform::add_route(ipv4 ip, ipv4 gateway)
+     {
+         make_route(ip.to_string(), gateway.to_string(), "ADD");
+     }
+ 
+-    void VPNPlatform::delete_route(quic::Address ip, quic::Address gateway)
++    void VPNPlatform::add_route(ipv6 ip, ipv6 gateway)
++    {
++        srouter::win32::Exec(
++            "route.exe",
++            fmt::format("-6 ADD {}/128 {} METRIC {}", ip.to_string(), gateway.to_string(), m_Metric));
++    }
++
++    void VPNPlatform::delete_route(ipv4 ip, ipv4 gateway)
+     {
+         make_route(ip.to_string(), gateway.to_string(), "DELETE");
+     }
+ 
+-    void VPNPlatform::add_route_via_interface(NetworkInterface& vpn, IPRange range)
++    void VPNPlatform::delete_route(ipv6 ip, ipv6 gateway)
++    {
++        srouter::win32::Exec(
++            "route.exe",
++            fmt::format("-6 DELETE {}/128 {}", ip.to_string(), gateway.to_string()));
++    }
++
++    void VPNPlatform::add_route_via_interface(NetworkInterface& vpn, ipv4_range range)
+     {
+-        route_via_interface(vpn, range.BaseAddressString(), range.NetmaskString(), "ADD");
++        route_via_interface(vpn, range.ip.to_string(), ipv4_netmask_dotted(range.mask), "ADD");
++    }
++
++    void VPNPlatform::add_route_via_interface(NetworkInterface& vpn, ipv6_range range)
++    {
++        const auto& info = vpn.interface_info();
++        srouter::win32::Exec(
++            "netsh.exe",
++            fmt::format(
++                "interface ipv6 add route {}/{} \"{}\"",
++                range.ip.to_string(),
++                range.mask,
++                info.ifname));
+     }
+ 
+-    void VPNPlatform::delete_route_via_interface(NetworkInterface& vpn, IPRange range)
++    void VPNPlatform::delete_route_via_interface(NetworkInterface& vpn, ipv4_range range)
+     {
+-        route_via_interface(vpn, range.BaseAddressString(), range.NetmaskString(), "DELETE");
++        route_via_interface(vpn, range.ip.to_string(), ipv4_netmask_dotted(range.mask), "DELETE");
++    }
++
++    void VPNPlatform::delete_route_via_interface(NetworkInterface& vpn, ipv6_range range)
++    {
++        const auto& info = vpn.interface_info();
++        srouter::win32::Exec(
++            "netsh.exe",
++            fmt::format(
++                "interface ipv6 delete route {}/{} \"{}\"",
++                range.ip.to_string(),
++                range.mask,
++                info.ifname));
+     }
+ 
+     std::vector<quic::Address> VPNPlatform::get_non_interface_gateways(NetworkInterface& vpn)
+@@ -85,7 +134,7 @@ namespace srouter::win32
+                 if (addr->Address.lpSockaddr->sa_family != AF_INET && addr->Address.lpSockaddr->sa_family != AF_INET6)
+                     continue;
+                 quic::Address adapter_addr{addr->Address.lpSockaddr, addr->Address.iSockaddrLength};
+-                auto netmask_bits = ipaddr_netmask_bits(addr->OnLinkPrefixLength, addr->Address.lpSockaddr->sa_family);
++                auto netmask_bits = addr->OnLinkPrefixLength;
+                 std::variant<ipv4_range, ipv6_range> adapter_range;
+                 if (adapter_addr.is_ipv4())
+                     adapter_range = adapter_addr.to_ipv4() / netmask_bits;
+@@ -121,22 +170,34 @@ namespace srouter::win32
+ 
+     void VPNPlatform::add_default_route_via_interface(NetworkInterface& vpn)
+     {
+-        // kill ipv6
+-        srouter::win32::Exec(
+-            "WindowsPowerShell\\v1.0\\powershell.exe",
+-            "-Command (Disable-NetAdapterBinding -Name \"* \" -ComponentID ms_tcpip6)");
++        // Scope IPv6 disable to this TUN adapter only — never Disable-NetAdapterBinding -Name "*".
++        const auto& ifname = vpn.interface_info().ifname;
++        if (not ifname.empty())
++        {
++            srouter::win32::Exec(
++                "WindowsPowerShell\\v1.0\\powershell.exe",
++                fmt::format(
++                    "-Command (Disable-NetAdapterBinding -Name \"{}\" -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue)",
++                    ifname));
++        }
+ 
+         default_route_via_interface(vpn, "ADD");
+     }
+ 
+     void VPNPlatform::delete_default_route_via_interface(NetworkInterface& vpn)
+     {
+-        // restore ipv6
+-        srouter::win32::Exec(
+-            "WindowsPowerShell\\v1.0\\powershell.exe",
+-            "-Command (Enable-NetAdapterBinding -Name \"* \" -ComponentID ms_tcpip6)");
+-
+         default_route_via_interface(vpn, "DELETE");
++
++        // Restore IPv6 on this TUN adapter only (paired with scoped disable above).
++        const auto& ifname = vpn.interface_info().ifname;
++        if (not ifname.empty())
++        {
++            srouter::win32::Exec(
++                "WindowsPowerShell\\v1.0\\powershell.exe",
++                fmt::format(
++                    "-Command (Enable-NetAdapterBinding -Name \"{}\" -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue)",
++                    ifname));
++        }
+     }
+ 
+     std::shared_ptr<NetworkInterface> VPNPlatform::obtain_interface(InterfaceInfo info, Router* router)
+diff --git a/src/vpn/win32.hpp b/src/vpn/win32.hpp
+index 7c8220a8a..b78bdc125 100644
+--- a/src/vpn/win32.hpp
++++ b/src/vpn/win32.hpp
+@@ -35,13 +35,19 @@ namespace srouter::win32
+ 
+         ~VPNPlatform() override = default;
+ 
+-        void add_route(quic::Address ip, quic::Address gateway) override;
++        // Upstream AbstractRouteManager split Address/IPRange into ipv4/ipv6 overloads;
++        // win32.hpp was still on the old quic::Address / IPRange signatures.
++        void add_route(ipv4 ip, ipv4 gateway) override;
++        void add_route(ipv6 ip, ipv6 gateway) override;
+ 
+-        void delete_route(quic::Address ip, quic::Address gateway) override;
++        void delete_route(ipv4 ip, ipv4 gateway) override;
++        void delete_route(ipv6 ip, ipv6 gateway) override;
+ 
+-        void add_route_via_interface(NetworkInterface& vpn, IPRange range) override;
++        void add_route_via_interface(NetworkInterface& vpn, ipv4_range range) override;
++        void add_route_via_interface(NetworkInterface& vpn, ipv6_range range) override;
+ 
+-        void delete_route_via_interface(NetworkInterface& vpn, IPRange range) override;
++        void delete_route_via_interface(NetworkInterface& vpn, ipv4_range range) override;
++        void delete_route_via_interface(NetworkInterface& vpn, ipv6_range range) override;
+ 
+         std::vector<quic::Address> get_non_interface_gateways(NetworkInterface& vpn) override;
+ 
+diff --git a/src/win32/exception.cpp b/src/win32/exception.cpp
+index 8ef2ca271..d2e528b15 100644
+--- a/src/win32/exception.cpp
++++ b/src/win32/exception.cpp
+@@ -1,6 +1,7 @@
+ #include "exception.hpp"
+ 
+ #include "util/str.hpp"
++#include <memory>
+ #include "windows.h"
+ 
+ #include <array>
+diff --git a/src/win32/exec.cpp b/src/win32/exec.cpp
+index b0c56893b..4341d515d 100644
+--- a/src/win32/exec.cpp
++++ b/src/win32/exec.cpp
+@@ -3,6 +3,8 @@
+ #include "exception.hpp"
+ #include "util/logging.hpp"
+ 
++#include <fmt/core.h>
++
+ #include <array>
+ 
+ namespace srouter::win32
+@@ -26,6 +28,31 @@ namespace srouter::win32
+ 
+     void Exec(std::string exe, std::string args) { OneShotExec{exe, args}; }
+ 
++    bool ExecChecked(std::string exe, std::string args)
++    {
++        const auto cmdline = fmt::format("{}\\{} {}", SystemExeDir(), exe, args);
++        log::info(logcat, "exec-checked: {}", cmdline);
++        STARTUPINFOA si{};
++        PROCESS_INFORMATION pi{};
++        std::string mutable_cmd = cmdline;
++        if (not CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, false, 0, nullptr, nullptr, &si, &pi))
++        {
++            log::warning(logcat, "exec-checked: CreateProcess failed for {}", exe);
++            return false;
++        }
++        WaitForSingleObject(pi.hProcess, 5000);
++        DWORD code = 1;
++        GetExitCodeProcess(pi.hProcess, &code);
++        CloseHandle(pi.hProcess);
++        CloseHandle(pi.hThread);
++        if (code != 0)
++        {
++            log::warning(logcat, "exec-checked: {} exited with code {}", exe, code);
++            return false;
++        }
++        return true;
++    }
++
+     OneShotExec::OneShotExec(std::string cmd, std::chrono::milliseconds timeout)
+         : _si{}, _pi{}, _timeout{static_cast<DWORD>(timeout.count())}
+     {
+diff --git a/src/win32/exec.hpp b/src/win32/exec.hpp
+index 5d46ff0e8..c81d80e68 100644
+--- a/src/win32/exec.hpp
++++ b/src/win32/exec.hpp
+@@ -44,4 +44,7 @@ namespace srouter::win32
+     /// simple wrapper to run a single command in a blocking way
+     void Exec(std::string exe, std::string args);
+ 
++    /// Like Exec, but returns false when the process exit code is non-zero.
++    bool ExecChecked(std::string exe, std::string args);
++
+ }  // namespace srouter::win32
+diff --git a/src/win32/service_manager.cpp b/src/win32/service_manager.cpp
+index e2d15952d..91ef4b109 100644
+--- a/src/win32/service_manager.cpp
++++ b/src/win32/service_manager.cpp
+@@ -83,7 +83,7 @@ namespace srouter::sys
+                 std::chrono::milliseconds{
+                     st == ServiceState::Starting       ? StartupTimeout
+                         : st == ServiceState::Stopping ? StopTimeout
+-                                                       : 0s}
++                                                       : std::chrono::seconds(0)}
+                     .count();
+             // dwCheckPoint gets incremented during a start/stop to tell windows "we're still
+             // starting/stopping" and to reset its must-be-hung timer.  We increment it here so that
+diff --git a/src/win32/service_manager.hpp b/src/win32/service_manager.hpp
+index 4a558fd5b..7c7be8776 100644
+--- a/src/win32/service_manager.hpp
++++ b/src/win32/service_manager.hpp
+@@ -20,10 +20,10 @@ namespace srouter::sys
+         // How long we tell Windows to give us to startup before assuming we have stalled/hung.  The
+         // biggest potential time here is wintun, which if it is going to fail appears to take
+         // around 15s before doing so.
+-        static constexpr auto StartupTimeout = 17s;
++        static constexpr auto StartupTimeout = std::chrono::seconds(17);
+ 
+         // How long we tell Windows to give us to fully stop before killing us.
+-        static constexpr auto StopTimeout = 5s;
++        static constexpr auto StopTimeout = std::chrono::seconds(5);
+ 
+         SVC_Manager();
+ 
+diff --git a/src/win32/windivert.cpp b/src/win32/windivert.cpp
+index c42e01ad3..fca9ea001 100644
+--- a/src/win32/windivert.cpp
++++ b/src/win32/windivert.cpp
+@@ -6,6 +6,7 @@
+ #include "util/logging.hpp"
+ #include "util/logging/buffer.hpp"
+ #include "util/thread/queue.hpp"
++#include <span>
+ 
+ #include <winsock2.h>
+ 
+@@ -27,7 +28,7 @@ namespace
+         {
+             case WINDIVERT_LAYER_NETWORK:
+                 layer_str = "WINDIVERT_LAYER_NETWORK";
+-                ifidx_str = "Network: [IfIdx: {}, SubIfIdx: {}]"_format(addr.Network.IfIdx, addr.Network.SubIfIdx);
++                ifidx_str = fmt::format("Network: [IfIdx: {}, SubIfIdx: {}]", addr.Network.IfIdx, addr.Network.SubIfIdx);
+                 break;
+             case WINDIVERT_LAYER_NETWORK_FORWARD:
+                 layer_str = "WINDIVERT_LAYER_NETWORK_FORWARD";
+@@ -174,7 +175,7 @@ namespace srouter::win32
+             {
+                 WINDIVERT_ADDRESS addr{};
+                 std::vector<uint8_t> pkt;
+-                pkt.resize(1500);  // net::IPPacket::MaxSize
++                pkt.resize(1500);  // MAX_PACKET_SIZE
+                 UINT sz{};
+                 if (not wd::recv(m_Handle, pkt.data(), pkt.size(), &sz, &addr))
+                 {
+@@ -218,19 +219,17 @@ namespace srouter::win32
+ 
+             virtual int PollFD() const { return -1; }
+ 
+-            bool write_packet(net::IPPacket) override { return false; }
++            bool write_packet(IPPacket) override { return false; }
+ 
+-            net::IPPacket read_next_packet() override
++            IPPacket read_next_packet() override
+             {
+                 auto w_pkt = m_RecvQueue.tryPopFront();
+                 if (not w_pkt)
+-                    return net::IPPacket{};
+-                net::IPPacket pkt{std::move(w_pkt->pkt)};
+-                pkt.reply = [this, addr = std::move(w_pkt->addr)](auto pkt) {
+-                    if (!m_Shutdown)
+-                        send_packet(Packet{pkt.steal(), addr});
+-                };
+-                return pkt;
++                    return IPPacket{};
++                // IPPacket no longer carries a reply callback / steal(); build from bytes.
++                // DNS reinject via write_packet is not wired (parity with prior stub write).
++                return IPPacket{std::span<const std::byte>{
++                    reinterpret_cast<const std::byte*>(w_pkt->pkt.data()), w_pkt->pkt.size()}};
+             }
+ 
+             void Start() override
+diff --git a/src/win32/wintun.cpp b/src/win32/wintun.cpp
+index d056d14ba..e1ab0bc0a 100644
+--- a/src/win32/wintun.cpp
++++ b/src/win32/wintun.cpp
+@@ -17,6 +17,9 @@ extern "C"
+ 
+ #include <map>
+ #include <unordered_set>
++#include <span>
++#include <cstring>
++#include <variant>
+ 
+ namespace srouter::win32
+ {
+@@ -74,11 +77,10 @@ namespace srouter::win32
+             DWORD size;
+             WINTUN_SESSION_HANDLE session;
+             /// copy our data into an ip packet struct
+-            net::IPPacket copy() const
++            IPPacket copy() const
+             {
+-                net::IPPacket pkt{size};
+-                std::copy_n(data, size, pkt.data());
+-                return pkt;
++                return IPPacket{
++                    std::span<const std::byte>{reinterpret_cast<const std::byte*>(data), static_cast<size_t>(size)}};
+             }
+ 
+             ~PacketWrapper() { release_read(session, data); }
+@@ -136,24 +138,74 @@ namespace srouter::win32
+             void Up(const vpn::InterfaceInfo& info) const
+             {
+                 const auto luid = GetAdapterLUID();
++                // WintunCreateAdapter can return before the InterfaceLuid is visible to
++                // IP Helper. CreateUnicastIpAddressEntry then returns ERROR_NOT_FOUND
++                // (1168). Retry with short backoff; treat 5010 (already exists) as success.
++                // CreateUnicastIpAddressEntry may mutate the row on failure; restore a
++                // clean copy each attempt so a retry cannot AV on a half-filled struct.
++                // IPv6: byte-stable SOCKADDR_INET fill (MSVC sin6_addr @ +8). Never declare
++                // a named IN6 sockaddr local or write via the Address Ipv6 union member.
++                auto set_unicast_v4 = [](const MIB_UNICASTIPADDRESS_ROW& prototype, const auto& label) {
++                    DWORD err = ERROR_SUCCESS;
++                    for (int attempt = 0; attempt < 50; ++attempt)
++                    {
++                        MIB_UNICASTIPADDRESS_ROW row = prototype;
++                        err = CreateUnicastIpAddressEntry(&row);
++                        if (err == ERROR_SUCCESS || err == 5010)
++                            return;
++                        if (err != ERROR_NOT_FOUND)
++                            break;
++                        Sleep(50);
++                    }
++                    throw win32::error{err, fmt::format("cannot set address '{}'", label)};
++                };
++                auto set_unicast_v6 = [](const MIB_UNICASTIPADDRESS_ROW& prototype, const auto& label) {
++                    DWORD err = ERROR_SUCCESS;
++                    for (int attempt = 0; attempt < 50; ++attempt)
++                    {
++                        MIB_UNICASTIPADDRESS_ROW row = prototype;
++                        err = CreateUnicastIpAddressEntry(&row);
++                        if (err == ERROR_SUCCESS || err == 5010)
++                            return;
++                        if (err != ERROR_NOT_FOUND)
++                            break;
++                        Sleep(50);
++                    }
++                    // If IPv6 address add fails, warn and continue so IPv4 still works.
++                    log::warning(
++                        logcat,
++                        "cannot set IPv6 address '{}' (winerr={}); continuing IPv4-only",
++                        label,
++                        err);
++                };
+                 for (const auto& addr : info.addrs)
+                 {
+-                    // TODO: implement ipv6
+-                    if (addr.fam != AF_INET)
+-                        continue;
+                     MIB_UNICASTIPADDRESS_ROW AddressRow;
+                     InitializeUnicastIpAddressEntry(&AddressRow);
+                     AddressRow.InterfaceLuid = luid;
+-
+-                    AddressRow.Address.Ipv4.sin_family = AF_INET;
+-                    AddressRow.Address.Ipv4.sin_addr.S_un.S_addr = ToNet(net::TruncateV6(addr.range.addr)).n;
+-                    AddressRow.OnLinkPrefixLength = addr.range.HostmaskBits();
+                     AddressRow.DadState = IpDadStatePreferred;
+ 
+-                    if (auto err = CreateUnicastIpAddressEntry(&AddressRow); err != ERROR_SUCCESS)
+-                        throw win32::error{err, fmt::format("cannot set address '{}'", addr.range)};
+-
+-                    log::debug(logcat, "Added address: {}", addr.range);
++                    if (const auto* n4 = std::get_if<ipv4_net>(&addr))
++                    {
++                        AddressRow.Address.Ipv4.sin_family = AF_INET;
++                        AddressRow.Address.Ipv4.sin_addr = static_cast<in_addr>(n4->ip);
++                        AddressRow.OnLinkPrefixLength = n4->mask;
++
++                        set_unicast_v4(AddressRow, n4->to_string());
++                        log::debug(logcat, "Added address: {}", n4->to_string());
++                    }
++                    else if (const auto* n6 = std::get_if<ipv6_net>(&addr))
++                    {
++                        // Byte-stable MSVC SOCKADDR_INET layout: si_family @0, sin6_addr @8.
++                        std::memset(&AddressRow.Address, 0, sizeof(AddressRow.Address));
++                        AddressRow.Address.si_family = AF_INET6;
++                        const in6_addr v6 = static_cast<in6_addr>(n6->ip);
++                        std::memcpy(reinterpret_cast<unsigned char*>(&AddressRow.Address) + 8, &v6, 16);
++                        AddressRow.OnLinkPrefixLength = n6->mask;
++
++                        set_unicast_v6(AddressRow, n6->to_string());
++                        log::debug(logcat, "Added address: {}", n6->to_string());
++                    }
+                 }
+             }
+ 
+@@ -166,7 +218,9 @@ namespace srouter::win32
+                 if (auto wintun_ver = get_version())
+                     log::info(
+                         logcat,
+-                        fmt::format("wintun version {}.{} loaded", (wintun_ver >> 16) & 0xff, wintun_ver & 0xff));
++                        "wintun version {}.{} loaded",
++                        (wintun_ver >> 16) & 0xff,
++                        wintun_ver & 0xff);
+                 else
+                     throw win32::error{"Failed to load wintun"};
+                 if (auto impl = start_session(_handle, WINTUN_MAX_RING_CAPACITY))
+@@ -228,11 +282,11 @@ namespace srouter::win32
+ 
+             /// write an ip packet to the interface, return 2 bools, first is did we write the
+             /// packet, second if we are terminating
+-            std::pair<bool, bool> WritePacket(net::IPPacket pkt) const
++            std::pair<bool, bool> WritePacket(IPPacket pkt) const
+             {
+                 if (auto* buf = alloc_write(_impl, pkt.size()))
+                 {
+-                    std::copy_n(pkt.data(), pkt.size(), buf);
++                    std::memcpy(buf, pkt.data(), pkt.size());
+                     send_packet(_impl, buf);
+                     return {true, false};
+                 }
+@@ -251,8 +305,8 @@ namespace srouter::win32
+             Router* const _router;
+             std::shared_ptr<WintunAdapter> _adapter;
+             std::shared_ptr<WintunSession> _session;
+-            thread::Queue<net::IPPacket> _recv_queue;
+-            thread::Queue<net::IPPacket> _send_queue;
++            thread::Queue<IPPacket> _recv_queue;
++            thread::Queue<IPPacket> _send_queue;
+             std::thread _recv_thread;
+             std::thread _send_thread;
+ 
+@@ -262,7 +316,7 @@ namespace srouter::win32
+             WintunInterface(vpn::InterfaceInfo info, Router* router)
+                 : vpn::NetworkInterface{std::move(info)},
+                   _router{router},
+-                  _adapter{std::make_shared<WintunAdapter>(m_Info.ifname)},
++                  _adapter{std::make_shared<WintunAdapter>(_info.ifname)},
+                   _session{std::make_shared<WintunSession>()},
+                   _recv_queue{packet_queue_length},
+                   _send_queue{packet_queue_length}
+@@ -270,9 +324,9 @@ namespace srouter::win32
+ 
+             void Start() override
+             {
+-                m_Info.index = 0;
++                _info.index = 0;
+                 // put the adapter and set addresses
+-                _adapter->Up(m_Info);
++                _adapter->Up(_info);
+                 // start up io session
+                 _session->Start(_adapter);
+ 
+@@ -326,22 +380,25 @@ namespace srouter::win32
+                 _adapter.reset();
+             }
+ 
+-            net::IPPacket read_next_packet() override
++            IPPacket read_next_packet() override
+             {
+-                net::IPPacket pkt{};
++                IPPacket pkt{};
+                 if (auto maybe_pkt = _recv_queue.tryPopFront())
+                     pkt = std::move(*maybe_pkt);
+                 return pkt;
+             }
+ 
+-            bool WritePacket(net::IPPacket pkt) override
++            bool write_packet(IPPacket pkt) override
+             {
+                 return _send_queue.tryPushBack(std::move(pkt)) == thread::QueueReturn::Success;
+             }
+ 
+             int PollFD() const override { return -1; }
+ 
+-            void MaybeWakeUpperLayers() const override { _router->TriggerPump(); }
++            void MaybeWakeUpperLayers() const override
++            {
++                // Router wake/pump API removed; apple leaves this empty.
++            }
+         };
+     }  // namespace
+ 

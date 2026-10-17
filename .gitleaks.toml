@@ -1,0 +1,9 @@
+title = "SRNet-VPSHost-ExitPack"
+[extend]
+useDefault = true
+[allowlist]
+description = "Public values: the exit board's .sesh public key, and the well-known Ethereum test-vector key used only in unit tests"
+regexes = [
+  '''qbhfd6kc4qijpdpjkd8nfcq55r377m1ff3o6ontfyikygsycywfo''',
+  '''0x4C0883A69102937D6231471B5DBB6204FE5129617082792AE468D01A3F362318''',
+]

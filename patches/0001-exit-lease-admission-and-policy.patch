@@ -1,0 +1,1291 @@
+diff --git a/src/auth/EXIT-LEASE-ADMISSION.md b/src/auth/EXIT-LEASE-ADMISSION.md
+new file mode 100644
+index 0000000..d4e4218
+--- /dev/null
++++ b/src/auth/EXIT-LEASE-ADMISSION.md
+@@ -0,0 +1,32 @@
++# Exit lease admission
++
++`SessionEndpoint::validate` (src/handlers/session.cpp) runs before any inbound map/accept
++(`session_post_init`) and again in `map_session_v4` / `map_session_v6`. Upstream never called it,
++which is why `auth-type=whitelist` used to be ignored.
++
++Checks, in order:
++
++1. Explicit open: `auth-type` none **and** no static tokens **and** an empty whitelist.
++2. Static token hit.
++3. Whitelist hit.
++4. A **signed v2 admission** in the store file `SR_EXIT_LEASE_ADMISSIONS`, signed by the Ed25519
++   issuer key `SR_EXIT_LEASE_ISSUER_PUBKEY` (64 hex characters).
++
++A v2 record:
++
++| Field | Rule |
++|-------|------|
++| `kind` | `exit_lease_admission` |
++| `scope` | `exit_lease` |
++| `v` | `2` (unsigned v1 is refused) |
++| `lock_seller_id` | exact match to this exit's own client `.sesh` |
++| `client_sesh` | exact match to the inbound `remote` |
++| `exp` | unix seconds, `exp > now` |
++| `tid` | optional string, covered by the signature |
++| `sig` | hex Ed25519 over `srnet-exit-admission/v2\n{seller}\n{client}\n{exp}\n{tid}` |
++
++The check fails closed: if either env var is unset, or the record is malformed, forged, for the
++wrong seller or client, or expired, nobody is admitted by step 4.
++
++The seller-side issuer is `contrib/exit-lease/admission.py`. To check a record exactly the way the
++exit would, run `exit-lease-verify`.
+diff --git a/src/auth/exit_lease_admission.hpp b/src/auth/exit_lease_admission.hpp
+new file mode 100644
+index 0000000..68ed8fb
+--- /dev/null
++++ b/src/auth/exit_lease_admission.hpp
+@@ -0,0 +1,429 @@
++#pragma once
++
++// Exit-side lease admission.
++//
++// A buyer who paid for seller S is admitted to S's exit without any
++// hand-edited whitelist. The seller's own admission issuer (seller pack
++// daemon, which checks payment on chain) writes signed admission records into
++// a local store file. The exit admits an inbound client `remote` only when a
++// record:
++//
++//   kind           == "exit_lease_admission"
++//   scope          == "exit_lease"
++//   v              == 2
++//   lock_seller_id == this exit's own client .sesh   (exact string)
++//   client_sesh    == remote.to_string()             (exact string)
++//   exp            >  now (unix seconds)
++//   sig            == hex Ed25519 detached signature by the issuer key over
++//                     admission_message(lock_seller_id, client_sesh, exp, tid)
++//
++// Store file: env SR_EXIT_LEASE_ADMISSIONS (path). Any JSON shape; every
++// object anywhere in the document is considered (admissions map keyed by tid,
++// an array, or a single {"admission": {...}}).
++// Issuer key: env SR_EXIT_LEASE_ISSUER_PUBKEY (64 hex chars, Ed25519 public).
++//
++// Fail closed: no store, unreadable/oversized/invalid JSON, no issuer key, or
++// a bad issuer key admits nobody by this path. Unsigned v1 records are
++// NOT accepted. Static token / whitelist / explicit open behaviour is
++// unchanged and evaluated first.
++
++#include <nlohmann/json.hpp>
++#include <sodium/crypto_sign.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <vector>
++
++#ifndef _WIN32
++#include <sys/stat.h>
++#endif
++
++namespace srouter::auth
++{
++    struct ExitLeaseAuthResult
++    {
++        bool allow{false};
++        // Stable literal: open_none, static_token, whitelist, admission, no_store,
++        // no_issuer, bad_issuer, bad_file, no_match, wrong_client, wrong_seller,
++        // expired, bad_record, bad_sig.
++        const char* reason{"no_match"};
++        // For reason == "admission": the latest exp (unix seconds) among matching valid records.
++        std::int64_t exp{0};
++    };
++
++    inline constexpr std::string_view ADMISSION_DOMAIN = "srnet-exit-admission/v2";
++    inline constexpr size_t ADMISSION_MAX_FILE = 4u << 20;
++
++    /// Exact bytes the issuer signs. Newline separated; fields cannot contain '\n'
++    /// (rejected on parse).
++    inline std::string admission_message(
++        std::string_view seller, std::string_view client, std::int64_t exp, std::string_view tid)
++    {
++        std::string m;
++        m.reserve(ADMISSION_DOMAIN.size() + seller.size() + client.size() + tid.size() + 32);
++        m.append(ADMISSION_DOMAIN).push_back('\n');
++        m.append(seller).push_back('\n');
++        m.append(client).push_back('\n');
++        m.append(std::to_string(exp)).push_back('\n');
++        m.append(tid);
++        return m;
++    }
++
++    namespace detail
++    {
++        inline int hexval(char c)
++        {
++            if (c >= '0' && c <= '9')
++                return c - '0';
++            if (c >= 'a' && c <= 'f')
++                return c - 'a' + 10;
++            if (c >= 'A' && c <= 'F')
++                return c - 'A' + 10;
++            return -1;
++        }
++
++        template <size_t N>
++        std::optional<std::array<unsigned char, N>> from_hex(std::string_view h)
++        {
++            if (h.size() != 2 * N)
++                return std::nullopt;
++            std::array<unsigned char, N> out{};
++            for (size_t i = 0; i < N; ++i)
++            {
++                const int a = hexval(h[2 * i]), b = hexval(h[2 * i + 1]);
++                if (a < 0 || b < 0)
++                    return std::nullopt;
++                out[i] = static_cast<unsigned char>((a << 4) | b);
++            }
++            return out;
++        }
++
++        using PubKey = std::array<unsigned char, crypto_sign_PUBLICKEYBYTES>;
++
++        struct Scan
++        {
++            bool saw_any{false}, wrong_seller{false}, wrong_client{false}, expired{false}, bad{false},
++                bad_sig{false};
++        };
++
++        inline bool get_str(const nlohmann::json& o, const char* k, std::string& out)
++        {
++            auto it = o.find(k);
++            if (it == o.end() || !it->is_string())
++                return false;
++            out = it->get<std::string>();
++            return out.find('\n') == std::string::npos;
++        }
++
++        inline bool check_record(
++            const nlohmann::json& o,
++            const PubKey& issuer,
++            std::string_view this_seller,
++            std::string_view remote,
++            std::int64_t now,
++            Scan& sc,
++            std::int64_t& exp_out)
++        {
++            std::string kind;
++            if (!get_str(o, "kind", kind) || kind != "exit_lease_admission")
++                return false;  // not an admission object; ignore
++            sc.saw_any = true;
++            std::string scope, seller, client, tid, sig_hex;
++            const bool shape = get_str(o, "scope", scope) && scope == "exit_lease"
++                && o.contains("v") && o["v"].is_number_integer() && o["v"].get<std::int64_t>() == 2
++                && get_str(o, "lock_seller_id", seller) && get_str(o, "client_sesh", client)
++                && o.contains("exp") && o["exp"].is_number_integer() && get_str(o, "sig", sig_hex);
++            if (!shape || (o.contains("tid") && !get_str(o, "tid", tid)))
++            {
++                sc.bad = true;
++                return false;
++            }
++            if (seller != this_seller)
++            {
++                sc.wrong_seller = true;
++                return false;
++            }
++            if (client != remote)
++            {
++                sc.wrong_client = true;
++                return false;
++            }
++            const auto exp = o["exp"].get<std::int64_t>();
++            const auto sig = from_hex<crypto_sign_BYTES>(sig_hex);
++            if (!sig)
++            {
++                sc.bad_sig = true;
++                return false;
++            }
++            const auto msg = admission_message(seller, client, exp, tid);
++            if (crypto_sign_verify_detached(
++                    sig->data(), reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), issuer.data())
++                != 0)
++            {
++                sc.bad_sig = true;
++                return false;
++            }
++            if (!(exp > now))
++            {
++                sc.expired = true;
++                return false;
++            }
++            exp_out = exp;
++            return true;
++        }
++
++        // Visits every object; records the latest valid exp in best_exp (0 = none).
++        inline void walk(
++            const nlohmann::json& j,
++            const PubKey& issuer,
++            std::string_view seller,
++            std::string_view remote,
++            std::int64_t now,
++            Scan& sc,
++            std::int64_t& best_exp,
++            int depth = 0)
++        {
++            if (depth > 16)
++                return;
++            if (j.is_object())
++            {
++                std::int64_t e = 0;
++                if (check_record(j, issuer, seller, remote, now, sc, e))
++                    best_exp = std::max(best_exp, e);
++                for (const auto& [k, v] : j.items())
++                    if (v.is_object() || v.is_array())
++                        walk(v, issuer, seller, remote, now, sc, best_exp, depth + 1);
++            }
++            else if (j.is_array())
++            {
++                for (const auto& v : j)
++                    walk(v, issuer, seller, remote, now, sc, best_exp, depth + 1);
++            }
++        }
++    }  // namespace detail
++
++    /// Pure check over the store text (unit-testable).
++    inline ExitLeaseAuthResult admission_in_text(
++        std::string_view text,
++        std::string_view issuer_pubkey_hex,
++        std::string_view this_seller,
++        std::string_view remote_client,
++        std::int64_t now_unix)
++    {
++        if (issuer_pubkey_hex.empty())
++            return {false, "no_issuer"};
++        const auto issuer = detail::from_hex<crypto_sign_PUBLICKEYBYTES>(issuer_pubkey_hex);
++        if (!issuer)
++            return {false, "bad_issuer"};
++        if (this_seller.empty() || remote_client.empty())
++            return {false, "no_match"};
++        auto j = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
++        if (j.is_discarded())
++            return {false, "bad_file"};
++        detail::Scan sc;
++        std::int64_t best = 0;
++        detail::walk(j, *issuer, this_seller, remote_client, now_unix, sc, best);
++        if (best > 0)
++            return {true, "admission", best};
++        if (sc.bad_sig)
++            return {false, "bad_sig"};
++        if (sc.expired)
++            return {false, "expired"};
++        if (sc.bad)
++            return {false, "bad_record"};
++        if (sc.wrong_client)
++            return {false, "wrong_client"};
++        if (sc.wrong_seller)
++            return {false, "wrong_seller"};
++        return {false, "no_match"};
++    }
++
++    /// Caches the admission store text, re-reading only when the file's identity changes
++    /// (size, mtime and, on POSIX, inode/ns-mtime; the issuer writes by atomic rename, so a
++    /// new record always changes the inode). Thread safe.
++    class StoreCache
++    {
++      public:
++        static StoreCache& instance()
++        {
++            static StoreCache c;
++            return c;
++        }
++
++        std::optional<std::string> read(std::string_view path_sv)
++        {
++            const std::string path{path_sv};
++            const auto id = identify(path);
++            std::lock_guard lock{_m};
++            if (!id)
++            {
++                _cache.erase(path);
++                return std::nullopt;
++            }
++            if (auto it = _cache.find(path); it != _cache.end() && it->second.id == *id)
++            {
++                ++_hits;
++                return it->second.text;
++            }
++            std::ifstream in{path, std::ios::in | std::ios::binary};
++            if (!in)
++                return std::nullopt;
++            std::string text;
++            char buf[8192];
++            while (in)
++            {
++                in.read(buf, sizeof(buf));
++                if (const auto n = in.gcount(); n > 0)
++                    text.append(buf, static_cast<size_t>(n));
++                if (text.size() > ADMISSION_MAX_FILE)
++                    return std::nullopt;
++            }
++            ++_loads;
++            _cache[path] = Entry{*id, text};
++            return text;
++        }
++
++        size_t loads() const
++        {
++            std::lock_guard lock{_m};
++            return _loads;
++        }
++        size_t hits() const
++        {
++            std::lock_guard lock{_m};
++            return _hits;
++        }
++
++      private:
++        struct Id
++        {
++            std::uintmax_t size{0};
++            std::int64_t mtime_ns{0};
++            std::uint64_t ino{0};
++            bool operator==(const Id&) const = default;
++        };
++        struct Entry
++        {
++            Id id;
++            std::string text;
++        };
++
++        static std::optional<Id> identify(const std::string& path)
++        {
++#ifndef _WIN32
++            struct stat st{};
++            if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
++                return std::nullopt;
++            return Id{
++                static_cast<std::uintmax_t>(st.st_size),
++                static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000 + st.st_mtim.tv_nsec,
++                static_cast<std::uint64_t>(st.st_ino)};
++#else
++            std::error_code ec;
++            const auto sz = std::filesystem::file_size(path, ec);
++            if (ec)
++                return std::nullopt;
++            const auto mt = std::filesystem::last_write_time(path, ec);
++            if (ec)
++                return std::nullopt;
++            return Id{sz, static_cast<std::int64_t>(mt.time_since_epoch().count()), 0};
++#endif
++        }
++
++        mutable std::mutex _m;
++        std::unordered_map<std::string, Entry> _cache;
++        size_t _loads{0}, _hits{0};
++    };
++
++    /// Tracks inbound sessions that were admitted by a lease (not whitelist/token) so the
++    /// session endpoint can drop them when the lease ends. due(now) returns every key whose
++    /// exp has passed, plus all tracked keys once per sweep interval (to catch revocation).
++    /// The caller re-validates each due key and calls admitted() (renewed lease), forget()
++    /// (allowed some other way, or session gone) or drops the session and forget()s it.
++    template <typename Key, typename Hash = std::hash<Key>>
++    class LeaseTracker
++    {
++      public:
++        explicit LeaseTracker(std::int64_t sweep_interval_s = 15) : _interval{sweep_interval_s} {}
++
++        void admitted(const Key& k, std::int64_t exp)
++        {
++            std::lock_guard lock{_m};
++            _exp[k] = exp;
++        }
++        void forget(const Key& k)
++        {
++            std::lock_guard lock{_m};
++            _exp.erase(k);
++        }
++        std::optional<std::int64_t> exp_of(const Key& k) const
++        {
++            std::lock_guard lock{_m};
++            if (auto it = _exp.find(k); it != _exp.end())
++                return it->second;
++            return std::nullopt;
++        }
++        size_t size() const
++        {
++            std::lock_guard lock{_m};
++            return _exp.size();
++        }
++
++        std::vector<Key> due(std::int64_t now)
++        {
++            std::lock_guard lock{_m};
++            std::vector<Key> out;
++            const bool sweep = now >= _next_sweep;
++            if (sweep)
++                _next_sweep = now + _interval;
++            for (const auto& [k, e] : _exp)
++                if (sweep || e <= now)
++                    out.push_back(k);
++            return out;
++        }
++
++      private:
++        mutable std::mutex _m;
++        std::unordered_map<Key, std::int64_t, Hash> _exp;
++        std::int64_t _interval;
++        std::int64_t _next_sweep{0};
++    };
++
++    /// Order matches SessionEndpoint::validate:
++    ///   1. explicit open (auth-type none AND no static lists)  2. static token
++    ///   3. whitelist  4. signed lease admission for this seller + remote.
++    inline ExitLeaseAuthResult exit_lease_auth_allows(
++        bool open_none_empty_lists,
++        bool static_token_hit,
++        bool whitelist_hit,
++        std::string_view admissions_path,
++        std::string_view issuer_pubkey_hex,
++        std::string_view this_seller,
++        std::string_view remote_client,
++        std::int64_t now_unix)
++    {
++        if (open_none_empty_lists)
++            return {true, "open_none"};
++        if (static_token_hit)
++            return {true, "static_token"};
++        if (whitelist_hit)
++            return {true, "whitelist"};
++        if (admissions_path.empty())
++            return {false, "no_store"};
++        if (issuer_pubkey_hex.empty())
++            return {false, "no_issuer"};
++
++        auto text = StoreCache::instance().read(admissions_path);
++        if (!text)
++            return {false, "bad_file"};
++        return admission_in_text(*text, issuer_pubkey_hex, this_seller, remote_client, now_unix);
++    }
++}  // namespace srouter::auth
+diff --git a/src/handlers/session.cpp b/src/handlers/session.cpp
+index 333ad3f..b1debf9 100644
+--- a/src/handlers/session.cpp
++++ b/src/handlers/session.cpp
+@@ -1,5 +1,10 @@
+ #include "session.hpp"
+ 
++#include "auth/exit_lease_admission.hpp"
++
++#include <cstdlib>
++#include <cstdint>
++
+ #include "constants/path.hpp"
+ #include "contact/contactdb.hpp"
+ #include "contact/relay_contact.hpp"
+@@ -162,6 +167,7 @@ namespace srouter::handlers
+     void SessionEndpoint::tick(sys_ms now)
+     {
+         log::trace(logcat, "SessionEndpoint ticking sessions...");
++        enforce_lease_expiry(now);
+         for (const auto& [addr, session] : _sessions)
+             session->tick(now);
+ 
+@@ -1025,27 +1031,117 @@ namespace srouter::handlers
+         }
+     }
+ 
+-    bool SessionEndpoint::validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth)
++    auth::ExitLeaseAuthResult SessionEndpoint::auth_decision(
++        const NetworkAddress& remote, const std::optional<std::string>& maybe_auth) const
+     {
+         auto& netconf = router.config().network;
++        const auto auth_type = netconf.auth_type;
+         auto& tokens = netconf.auth_static_tokens;
+         auto& whitelist = netconf.auth_whitelist;
+-        if (tokens.empty() && whitelist.empty())
+-            return true;  // No auth required
+ 
+-        if (maybe_auth && tokens.contains(*maybe_auth))
+-            return true;  // valid auth token
++        // Open endpoint only when auth is explicitly disabled and no static lists are configured.
++        // Unchanged from upstream; this does not switch the endpoint to open auth.
++        const bool open_none_empty_lists =
++            auth_type == auth::AuthType::NONE && tokens.empty() && whitelist.empty();
++
++        const bool static_token_hit = maybe_auth && tokens.contains(*maybe_auth);
++
++        // Whitelist hit is checked before lease admission.
++        const bool whitelist_hit = whitelist.contains(remote);
++
++        // Lease admission: signed record from the seller's issuer (SR_EXIT_LEASE_ISSUER_PUBKEY) in the
++        // store file SR_EXIT_LEASE_ADMISSIONS. Either unset = nobody admitted by this path (fail closed).
++        // Seller is this exit's own client .sesh, never an env override.
++        const char* store_env = std::getenv("SR_EXIT_LEASE_ADMISSIONS");
++        const std::string_view store = (store_env && store_env[0]) ? std::string_view{store_env} : std::string_view{};
++        const char* issuer_env = std::getenv("SR_EXIT_LEASE_ISSUER_PUBKEY");
++        const std::string_view issuer =
++            (issuer_env && issuer_env[0]) ? std::string_view{issuer_env} : std::string_view{};
++        std::string this_seller;
++        try
++        {
++            if (!router.is_service_node)
++                this_seller = NetworkAddress{router.key_manager.router_id(), true}.to_string();
++        }
++        catch (...)
++        {
++            this_seller.clear();
++        }
+ 
+-        if (whitelist.contains(remote))
+-            return true;  // valid address
++        const auto now_unix = std::chrono::duration_cast<std::chrono::seconds>(
++                                  std::chrono::system_clock::now().time_since_epoch())
++                                  .count();
+ 
+-        return false;
++        const auto decided = srouter::auth::exit_lease_auth_allows(
++            open_none_empty_lists,
++            static_token_hit,
++            whitelist_hit,
++            store,
++            issuer,
++            this_seller,
++            remote.to_string(),
++            static_cast<std::int64_t>(now_unix));
++
++        if (!decided.allow && !store.empty())
++            log::debug(logcat, "exit_lease admission did not admit {} ({}): {}", remote, decided.reason, this_seller);
++
++        return decided;
++    }
++
++    bool SessionEndpoint::validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth)
++    {
++        const auto decided = auth_decision(remote, maybe_auth);
++        if (decided.allow && std::string_view{decided.reason} == "admission")
++        {
++            // Remember the lease end so tick() drops the session when it lapses.
++            if (_lease_sessions.exp_of(remote) != decided.exp)
++                log::info(
++                    logcat,
++                    "Inbound session admitted by signed exit_lease admission (not whitelist): {} until {}",
++                    remote,
++                    decided.exp);
++            _lease_sessions.admitted(remote, decided.exp);
++        }
++        else if (decided.allow)
++            _lease_sessions.forget(remote);  // allowed by open/token/whitelist; no lease clock
++        return decided.allow;
++    }
++
++    void SessionEndpoint::enforce_lease_expiry(sys_ms now)
++    {
++        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
++        for (const auto& remote : _lease_sessions.due(static_cast<std::int64_t>(now_s)))
++        {
++            const auto decided = auth_decision(remote, std::nullopt);
++            const bool have_session = _sessions.contains(remote);
++            if (decided.allow)
++            {
++                if (std::string_view{decided.reason} == "admission")
++                    _lease_sessions.admitted(remote, decided.exp);  // renewed or unchanged
++                else
++                    _lease_sessions.forget(remote);
++                continue;
++            }
++            _lease_sessions.forget(remote);
++            if (have_session)
++            {
++                log::warning(
++                    logcat, "Dropping exit session for {}: lease no longer valid ({})", remote, decided.reason);
++                close_session(remote, /*send_close=*/true);
++            }
++        }
+     }
+ 
+     std::optional<ipv4> SessionEndpoint::map_session_v4(const session::Session& s)
+     {
+         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+ 
++        if (!validate(s.remote()))
++        {
++            log::warning(logcat, "Refusing ipv4 map for non-authorized remote {}", s.remote());
++            return std::nullopt;
++        }
++
+         if (const auto& tun = router.tun_endpoint())
+         {
+             log::debug(logcat, "Mapping local tun ipv4 for inbound session from {}", s.remote());
+@@ -1066,6 +1162,12 @@ namespace srouter::handlers
+     {
+         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+ 
++        if (!validate(s.remote()))
++        {
++            log::warning(logcat, "Refusing ipv6 map for non-authorized remote {}", s.remote());
++            return std::nullopt;
++        }
++
+         if (const auto& tun = router.tun_endpoint())
+         {
+             log::debug(logcat, "Successfully mapped inbound session; mapping session to local TUN IPv6");
+@@ -1117,6 +1219,18 @@ namespace srouter::handlers
+ 
+     void SessionEndpoint::session_post_init(std::shared_ptr<session::InboundSession> new_session)
+     {
++        // Enforce [network] auth-type / auth-whitelist / auth-static before any map or accept.
++        // Without this gate, auth-type=whitelist was parsed into config but never applied on the
++        // inbound path (unlisted clients were mapped and could forward).
++        if (!validate(new_session->remote()))
++        {
++            log::warning(
++                logcat,
++                "Inbound session rejected by auth policy (not whitelisted / no valid auth): {}",
++                new_session->remote());
++            return;
++        }
++
+         // FIXME: for now only tun clients can have inbound sessions, but eventually that will
+         //        not be the case and we'll need to "if tun" this.
+         if (!map_session_v6(*new_session))
+diff --git a/src/handlers/session.hpp b/src/handlers/session.hpp
+index ab09285..7aca2d5 100644
+--- a/src/handlers/session.hpp
++++ b/src/handlers/session.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "address/address.hpp"
++#include "auth/exit_lease_admission.hpp"
+ #include "config/config.hpp"
+ #include "contact/client_contact.hpp"
+ #include "path/path_handler.hpp"
+@@ -60,6 +61,11 @@ namespace srouter
+ 
+             void close_session(const std::shared_ptr<session::Session>& s, bool send_close);
+ 
++            // Inbound sessions admitted by a signed exit lease; dropped by tick() when the lease
++            // expires or is revoked (re-checked every 15 s and immediately at exp).
++            auth::LeaseTracker<NetworkAddress> _lease_sessions{15};
++            void enforce_lease_expiry(sys_ms now);
++
+             void on_path_build_failure(int64_t build_id, path::Path* path, bool timeout) override;
+             void on_path_build_success(int64_t build_id, path::Path& p) override;
+             void no_established_paths_left() override;
+@@ -255,6 +261,10 @@ namespace srouter
+             // incoming requests to initiate a session
+             bool validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth = std::nullopt);
+ 
++            /// Full auth decision (reason + lease exp) without side effects.
++            auth::ExitLeaseAuthResult auth_decision(
++                const NetworkAddress& remote, const std::optional<std::string>& maybe_auth) const;
++
+             // Live MapExit/SwapExits token: apply into the in-memory map used by session init.
+             void set_auth_token(const NetworkAddress& remote, std::string token);
+ 
+diff --git a/src/handlers/tun.cpp b/src/handlers/tun.cpp
+index 5544004..0efe6cd 100644
+--- a/src/handlers/tun.cpp
++++ b/src/handlers/tun.cpp
+@@ -5,6 +5,8 @@
+ #include <oxenc/endian.h>
+ 
+ #include <chrono>
++#include <mutex>
++#include <shared_mutex>
+ #include <span>
+ #include <variant>
+ #ifndef _WIN32
+@@ -140,7 +142,7 @@ namespace srouter::handlers
+         // Bring default route up once we have edge connectivity and reserved-range exit mappings.
+         _router.on_connected(
+             [this] {
+-                if (_route_poker and _route_poker->enabled() and not _router.config().exit.ranges.empty())
++                if (_route_poker and _route_poker->enabled() and _router.has_exit_ranges())
+                     _route_poker->put_up();
+             },
+             /*with_paths=*/false,
+@@ -370,6 +372,7 @@ namespace srouter::handlers
+     {
+         // Only remotes listed in exit.ranges are exit brokers for inbound return traffic.
+         // Do not treat an arbitrary exit-policy ClientContact peer as a broker.
++        std::shared_lock lock{_router.exit_ranges_mutex()};
+         return _router.config().exit.ranges.contains(remote);
+     }
+ 
+@@ -378,6 +381,7 @@ namespace srouter::handlers
+         // Longest-prefix match when ranges overlap (deterministic).
+         std::optional<NetworkAddress> best;
+         int best_mask = -1;
++        std::shared_lock lock{_router.exit_ranges_mutex()};
+         for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
+         {
+             for (const auto& r : range_list)
+@@ -405,6 +409,7 @@ namespace srouter::handlers
+     {
+         std::optional<NetworkAddress> best;
+         int best_mask = -1;
++        std::shared_lock lock{_router.exit_ranges_mutex()};
+         for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
+         {
+             for (const auto& r : range_list)
+diff --git a/src/net/policy.cpp b/src/net/policy.cpp
+index 753dfd5..42a4b4b 100644
+--- a/src/net/policy.cpp
++++ b/src/net/policy.cpp
+@@ -37,16 +37,33 @@ namespace srouter
+             throw std::invalid_argument{"Cannot determine protocol name for IP Protocol: {}"_format(proto)};
+         }
+ 
+-        bool ProtocolInfo::matches_packet_proto(const IPPacket& pkt) const { return pkt.protocol() == protocol; }
++        bool ProtocolInfo::matches_packet_proto(const IPPacket& pkt) const
++        {
++            if (pkt.protocol() != protocol)
++                return false;
++            // When a port is configured (e.g. policy=tcp/443 or udp/53), require a dest-port match so
++            // tcp/443 does not silently allow all TCP, and omitting tcp/53 / udp/53 really denies DNS.
++            if (port)
++            {
++                auto dp = pkt.dest_port();
++                if (not dp or *dp != *port)
++                    return false;
++            }
++            return true;
++        }
+ 
+         bool ExitPolicy::allow_ip_traffic(const IPPacket& pkt) const
+         {
+             // ranges are always the allow list (if empty, we route nothing).  Add a 0.0.0.0/0 or
+             // ::/0 if you want to allow everything.
+             auto accept_range = pkt.is_ipv4()
+-                ? std::ranges::any_of(ranges, [dest = *pkt.dest_ipv4()](const auto& r) { return r.contains(dest); })
++                // mask==0 means "all addresses" (routed-range=public); to_base(0) shifts by the full
++                // width (UB) so contains() can wrongly reject. Treat mask 0 as match-all.
++                ? std::ranges::any_of(
++                      ranges, [dest = *pkt.dest_ipv4()](const auto& r) { return r.mask == 0 or r.contains(dest); })
+                 : pkt.is_ipv6()
+-                ? std::ranges::any_of(ranges_v6, [dest = *pkt.dest_ipv6()](const auto& r) { return r.contains(dest); })
++                ? std::ranges::any_of(
++                      ranges_v6, [dest = *pkt.dest_ipv6()](const auto& r) { return r.mask == 0 or r.contains(dest); })
+                 : false;
+ 
+             if (!accept_range)
+diff --git a/src/net/policy.hpp b/src/net/policy.hpp
+index ee17fb0..148e458 100644
+--- a/src/net/policy.hpp
++++ b/src/net/policy.hpp
+@@ -130,7 +130,7 @@ namespace srouter
+             /// protocols that are explicity allowed.  If empty, allow all.
+             std::set<ProtocolInfo> protocols;
+ 
+-            bool empty() const { return ranges.empty() and protocols.empty(); }
++            bool empty() const { return ranges.empty() and ranges_v6.empty() and protocols.empty(); }
+ 
+             void bt_encode(oxenc::bt_dict_producer&& btdp) const;
+ 
+diff --git a/src/router/router.cpp b/src/router/router.cpp
+index a202505..281868b 100644
+--- a/src/router/router.cpp
++++ b/src/router/router.cpp
+@@ -438,6 +438,20 @@ namespace srouter
+                 if (srv.target == "localhost.{}"_format(CLIENT_TLD) || srv.target == "localhost.loki")
+                     srv.target = "{}.{}"_format(id(), CLIENT_TLD);
+             }
++
++            // Exit nodes advertise their traffic policy in the published ClientContact; clients only
++            // mark a remote exit-capable (and route through it) when the CC carries a non-empty
++            // policy. Copy [exit] policy into NetworkConfig so SessionEndpoint/TunEndpoint see it.
++            if (_config.exit.exit_enabled and not _config.exit.exit_policy.empty())
++            {
++                netconf.traffic_policy = _config.exit.exit_policy;
++                log::info(
++                    logcat,
++                    "Exit enabled: advertising traffic policy ({} v4 ranges, {} v6 ranges, {} protocols)",
++                    _config.exit.exit_policy.ranges.size(),
++                    _config.exit.exit_policy.ranges_v6.size(),
++                    _config.exit.exit_policy.protocols.size());
++            }
+         }
+     }
+ 
+diff --git a/src/router/router.hpp b/src/router/router.hpp
+index 2c0b821..7e1facb 100644
+--- a/src/router/router.hpp
++++ b/src/router/router.hpp
+@@ -21,6 +21,7 @@
+ #include <chrono>
+ #include <functional>
+ #include <memory>
++#include <shared_mutex>
+ #include <type_traits>
+ 
+ namespace oxenmq
+@@ -113,6 +114,8 @@ namespace srouter
+ 
+         Config _config;
+ 
++        mutable std::shared_mutex _exit_ranges_mtx;
++
+       public:
+         const std::shared_ptr<quic::Loop> _loop;
+ 
+@@ -270,8 +273,17 @@ namespace srouter
+         const Config& config() const { return _config; }
+ 
+         // Runtime MapExit / unmap_exit mutate reserved-range mappings.
++        // RPC (OMQ thread) writes and the packet path (TUN/loop thread) reads these
++        // ranges. Writers hold exit_ranges_mutex() exclusively; readers hold it shared.
++        // Never call into routing/session code while holding the exclusive lock.
+         auto& mutable_exit_ranges() { return _config.exit.ranges; }
+         const auto& exit_ranges() const { return _config.exit.ranges; }
++        std::shared_mutex& exit_ranges_mutex() const { return _exit_ranges_mtx; }
++        bool has_exit_ranges() const
++        {
++            std::shared_lock lock{_exit_ranges_mtx};
++            return not _config.exit.ranges.empty();
++        }
+ 
+         ContactDB& contact_db()
+         {
+diff --git a/src/rpc/rpc_server.cpp b/src/rpc/rpc_server.cpp
+index 1915461..7f27126 100644
+--- a/src/rpc/rpc_server.cpp
++++ b/src/rpc/rpc_server.cpp
+@@ -1,3 +1,5 @@
++#include <mutex>
++#include <shared_mutex>
+ #include "rpc_server.hpp"
+ 
+ #include "config/config.hpp"
+@@ -626,7 +628,7 @@ namespace srouter::rpc
+             auto* poker = router.route_poker();
+             if (not poker or not poker->enabled())
+                 return;
+-            if (router.exit_ranges().empty())
++            if (not router.has_exit_ranges())
+                 return;
+             if (poker->is_up())
+                 return;
+@@ -638,7 +640,7 @@ namespace srouter::rpc
+             auto* poker = router.route_poker();
+             if (not poker)
+                 return;
+-            if (not router.exit_ranges().empty())
++            if (router.has_exit_ranges())
+                 return;
+             if (poker->is_up())
+                 poker->put_down();
+@@ -683,9 +685,13 @@ namespace srouter::rpc
+ 
+             // Parse into temp, then atomic replace the slot.
+             auto built = build_exit_ranges(mapexit.request.ip_ranges, mapexit.request.full_tunnel);
+-            auto& ranges = _router.mutable_exit_ranges();
+-            ranges[exit_addr] = std::move(built);
+-            const auto slot_size = ranges[exit_addr].size();
++            size_t slot_size = 0;
++            {
++                std::unique_lock lock{_router.exit_ranges_mutex()};
++                auto& ranges = _router.mutable_exit_ranges();
++                ranges[exit_addr] = std::move(built);
++                slot_size = ranges[exit_addr].size();
++            }
+ 
+             // Kick session setup so CC/exit-capable can populate
+             try
+@@ -719,7 +725,12 @@ namespace srouter::rpc
+         log_print_rpc(listexits);
+ 
+         nlohmann::json exits = nlohmann::json::array();
+-        for (const auto& [addr, range_list] : _router.exit_ranges())
++        // Copy under the shared lock; session lookups below run without it.
++        auto snapshot = [this] {
++            std::shared_lock lock{_router.exit_ranges_mutex()};
++            return _router.exit_ranges();
++        }();
++        for (const auto& [addr, range_list] : snapshot)
+         {
+             nlohmann::json entry;
+             entry["address"] = addr.to_string();
+@@ -761,8 +772,12 @@ namespace srouter::rpc
+                 return;
+             }
+             NetworkAddress exit_addr{unmapexit.request.address};
+-            auto& ranges = _router.mutable_exit_ranges();
+-            if (ranges.erase(exit_addr) == 0)
++            size_t erased = 0;
++            {
++                std::unique_lock lock{_router.exit_ranges_mutex()};
++                erased = _router.mutable_exit_ranges().erase(exit_addr);
++            }
++            if (erased == 0)
+             {
+                 SetJSONError("no mapping for that address", unmapexit.response);
+                 return;
+@@ -830,22 +845,27 @@ namespace srouter::rpc
+             // Parse new ranges first (fail before erase on bad input).
+             auto built = build_exit_ranges(swapexits.request.ip_ranges, swapexits.request.full_tunnel);
+ 
+-            auto& ranges = _router.mutable_exit_ranges();
+-
+-            if (ranges.erase(old_addr) == 0)
++            size_t slot_size = 0;
++            bool now_empty = false;
+             {
+-                SetJSONError("no mapping for old address (exit_addresses[0])", swapexits.response);
+-                return;
++                std::unique_lock lock{_router.exit_ranges_mutex()};
++                auto& ranges = _router.mutable_exit_ranges();
++                if (ranges.erase(old_addr) == 0)
++                {
++                    lock.unlock();
++                    SetJSONError("no mapping for old address (exit_addresses[0])", swapexits.response);
++                    return;
++                }
++                ranges[new_addr] = std::move(built);
++                slot_size = ranges[new_addr].size();
++                now_empty = ranges.empty();
+             }
+             log::info(
+                 logcat,
+                 "EXIT_UNMAPPED address={} (SwapExits old; remount follows)",
+                 old_s);
+ 
+-            ranges[new_addr] = std::move(built);
+-            const auto slot_size = ranges[new_addr].size();
+-
+-            if (ranges.empty())
++            if (now_empty)
+                 maybe_put_down_if_no_ranges(_router);
+             else
+                 maybe_put_up_routes(_router);
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index bd5b0d3..613fb53 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -64,3 +64,19 @@ if(WIN32)
+ endif()
+ 
+ add_custom_target(check COMMAND testAll)
++
++# Exit-side lease admission test target. Standalone: does not need the full router libs.
++add_executable(test_exit_lease_admission
++  auth/test_exit_lease_admission.cpp
++  Catch2/extras/catch_amalgamated.cpp)
++target_include_directories(test_exit_lease_admission PRIVATE
++  ${PROJECT_SOURCE_DIR}/src
++  ${CMAKE_CURRENT_SOURCE_DIR}/Catch2/extras)
++target_link_libraries(test_exit_lease_admission PRIVATE nlohmann_json::nlohmann_json sodium)
++target_compile_features(test_exit_lease_admission PRIVATE cxx_std_20)
++add_custom_target(check_exit_lease COMMAND test_exit_lease_admission DEPENDS test_exit_lease_admission)
++
++add_executable(exit-lease-verify ${PROJECT_SOURCE_DIR}/contrib/exit-lease/verify_main.cpp)
++target_include_directories(exit-lease-verify PRIVATE ${PROJECT_SOURCE_DIR}/src)
++target_link_libraries(exit-lease-verify PRIVATE nlohmann_json::nlohmann_json sodium)
++target_compile_features(exit-lease-verify PRIVATE cxx_std_20)
+diff --git a/test/auth/test_exit_lease_admission.cpp b/test/auth/test_exit_lease_admission.cpp
+new file mode 100644
+index 0000000..4664c7c
+--- /dev/null
++++ b/test/auth/test_exit_lease_admission.cpp
+@@ -0,0 +1,297 @@
++// Unit tests for exit-side lease admission (src/auth/exit_lease_admission.hpp).
++// Standalone: needs only nlohmann, libsodium and Catch2 (amalgamated).
++#include "auth/exit_lease_admission.hpp"
++
++#include <catch_amalgamated.hpp>
++#include <sodium.h>
++
++#include <cstdio>
++#include <fstream>
++#include <set>
++#include <string>
++
++using namespace srouter::auth;
++using nlohmann::json;
++
++namespace
++{
++    const std::string SELLER = "testseller100000000000000000000000000000000000000000.sesh";
++    const std::string OTHER_SELLER = "testseller200000000000000000000000000000000000000000.sesh";
++    const std::string STRANGER = "testclient000000000000000000000000000000000000000.sesh";
++    const std::string OTHER_CLIENT = "testclient100000000000000000000000000000000000000000.sesh";
++    constexpr std::int64_t NOW = 1'760'000'000;
++
++    std::string hex(const unsigned char* p, size_t n)
++    {
++        static const char* d = "0123456789abcdef";
++        std::string s;
++        for (size_t i = 0; i < n; ++i)
++        {
++            s.push_back(d[p[i] >> 4]);
++            s.push_back(d[p[i] & 15]);
++        }
++        return s;
++    }
++
++    struct Issuer
++    {
++        unsigned char pk[crypto_sign_PUBLICKEYBYTES];
++        unsigned char sk[crypto_sign_SECRETKEYBYTES];
++        Issuer() { crypto_sign_keypair(pk, sk); }
++        std::string pk_hex() const { return hex(pk, sizeof pk); }
++
++        json record(
++            const std::string& seller, const std::string& client, std::int64_t exp, const std::string& tid = "t1") const
++        {
++            const auto m = admission_message(seller, client, exp, tid);
++            unsigned char sig[crypto_sign_BYTES];
++            crypto_sign_detached(sig, nullptr, reinterpret_cast<const unsigned char*>(m.data()), m.size(), sk);
++            return json{
++                {"kind", "exit_lease_admission"},
++                {"scope", "exit_lease"},
++                {"v", 2},
++                {"tid", tid},
++                {"lock_seller_id", seller},
++                {"client_sesh", client},
++                {"exp", exp},
++                {"sig", hex(sig, sizeof sig)}};
++        }
++    };
++
++    json store(std::initializer_list<json> recs)
++    {
++        json a = json::object();
++        int i = 0;
++        for (const auto& r : recs)
++            a["tid" + std::to_string(i++)] = r;
++        return json{{"admissions", a}};
++    }
++
++    std::string reason(const ExitLeaseAuthResult& r) { return r.reason; }
++}  // namespace
++
++TEST_CASE("paid stranger not on any whitelist is admitted")
++{
++    REQUIRE(sodium_init() >= 0);
++    Issuer is;
++    auto s = store({is.record(SELLER, STRANGER, NOW + 3600)}).dump();
++    auto r = admission_in_text(s, is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK(r.allow);
++    CHECK(reason(r) == "admission");
++}
++
++TEST_CASE("unpaid client (no record) is refused")
++{
++    Issuer is;
++    auto s = store({is.record(SELLER, OTHER_CLIENT, NOW + 3600)}).dump();
++    auto r = admission_in_text(s, is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK_FALSE(r.allow);
++    CHECK(reason(r) == "wrong_client");
++    CHECK(reason(admission_in_text(R"({"admissions":{}})", is.pk_hex(), SELLER, STRANGER, NOW)) == "no_match");
++}
++
++TEST_CASE("expired lease is refused, boundary exp == now refused")
++{
++    Issuer is;
++    CHECK(reason(admission_in_text(store({is.record(SELLER, STRANGER, NOW - 1)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW))
++          == "expired");
++    CHECK_FALSE(admission_in_text(store({is.record(SELLER, STRANGER, NOW)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    CHECK(admission_in_text(store({is.record(SELLER, STRANGER, NOW + 1)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++}
++
++TEST_CASE("lease for another seller does not open this exit")
++{
++    Issuer is;
++    auto r = admission_in_text(store({is.record(OTHER_SELLER, STRANGER, NOW + 3600)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK_FALSE(r.allow);
++    CHECK(reason(r) == "wrong_seller");
++}
++
++TEST_CASE("forged or tampered records are refused")
++{
++    Issuer is, mallory;
++    // Signed by someone else's key.
++    CHECK(reason(admission_in_text(store({mallory.record(SELLER, STRANGER, NOW + 3600)}).dump(), is.pk_hex(), SELLER, STRANGER, NOW))
++          == "bad_sig");
++    // Extended exp after signing.
++    auto rec = is.record(SELLER, STRANGER, NOW + 60);
++    rec["exp"] = NOW + 999999;
++    CHECK(reason(admission_in_text(store({rec}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++    // Re-targeted to a different client after signing.
++    auto rec2 = is.record(SELLER, OTHER_CLIENT, NOW + 3600);
++    rec2["client_sesh"] = STRANGER;
++    CHECK(reason(admission_in_text(store({rec2}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++    // Changed tid after signing.
++    auto rec3 = is.record(SELLER, STRANGER, NOW + 3600, "a");
++    rec3["tid"] = "b";
++    CHECK(reason(admission_in_text(store({rec3}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++    // Garbage signature.
++    auto rec4 = is.record(SELLER, STRANGER, NOW + 3600);
++    rec4["sig"] = "zz";
++    CHECK(reason(admission_in_text(store({rec4}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_sig");
++}
++
++TEST_CASE("unsigned v1 admission records are rejected")
++{
++    Issuer is;
++    json v1{{"kind", "exit_lease_admission"},
++            {"scope", "exit_lease"},
++            {"v", 1},
++            {"lock_seller_id", SELLER},
++            {"client_sesh", STRANGER},
++            {"exp", NOW + 3600}};
++    auto r = admission_in_text(store({v1}).dump(), is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK_FALSE(r.allow);
++    CHECK(reason(r) == "bad_record");
++}
++
++TEST_CASE("fail closed on missing issuer, bad issuer, bad file")
++{
++    Issuer is;
++    auto s = store({is.record(SELLER, STRANGER, NOW + 3600)}).dump();
++    CHECK(reason(admission_in_text(s, "", SELLER, STRANGER, NOW)) == "no_issuer");
++    CHECK(reason(admission_in_text(s, "abcd", SELLER, STRANGER, NOW)) == "bad_issuer");
++    CHECK(reason(admission_in_text("{not json", is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_file");
++    CHECK(reason(admission_in_text(s, is.pk_hex(), "", STRANGER, NOW)) == "no_match");
++    // Newline injection in a field is rejected as a bad record.
++    auto rec = is.record(SELLER, STRANGER, NOW + 3600);
++    rec["tid"] = "x\nexit";
++    CHECK(reason(admission_in_text(store({rec}).dump(), is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_record");
++}
++
++TEST_CASE("record shapes: array, present-body, mixed store")
++{
++    Issuer is;
++    json arr = json::array({is.record(SELLER, OTHER_CLIENT, NOW + 3600), is.record(SELLER, STRANGER, NOW + 3600)});
++    CHECK(admission_in_text(arr.dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    json body{{"body", {{"admission", is.record(SELLER, STRANGER, NOW + 3600)}}}};
++    CHECK(admission_in_text(body.dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    // An expired record and a valid one for the same client: valid wins.
++    auto s = store({is.record(SELLER, STRANGER, NOW - 10, "old"), is.record(SELLER, STRANGER, NOW + 10, "new")});
++    CHECK(admission_in_text(s.dump(), is.pk_hex(), SELLER, STRANGER, NOW).allow);
++}
++
++TEST_CASE("validate ordering: open/token/whitelist first, then store file")
++{
++    Issuer is;
++    CHECK(reason(exit_lease_auth_allows(true, false, false, "", "", SELLER, STRANGER, NOW)) == "open_none");
++    CHECK(reason(exit_lease_auth_allows(false, true, false, "", "", SELLER, STRANGER, NOW)) == "static_token");
++    CHECK(reason(exit_lease_auth_allows(false, false, true, "", "", SELLER, STRANGER, NOW)) == "whitelist");
++    CHECK(reason(exit_lease_auth_allows(false, false, false, "", is.pk_hex(), SELLER, STRANGER, NOW)) == "no_store");
++
++    const std::string path = "exit_lease_admission_test_store.json";
++    {
++        std::ofstream f{path};
++        f << store({is.record(SELLER, STRANGER, NOW + 3600)}).dump();
++    }
++    CHECK(reason(exit_lease_auth_allows(false, false, false, path, "", SELLER, STRANGER, NOW)) == "no_issuer");
++    auto r = exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK(r.allow);
++    CHECK(reason(r) == "admission");
++    CHECK_FALSE(exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, OTHER_CLIENT, NOW).allow);
++    CHECK(reason(exit_lease_auth_allows(false, false, false, "/nonexistent/x.json", is.pk_hex(), SELLER, STRANGER, NOW))
++          == "bad_file");
++    std::remove(path.c_str());
++}
++
++TEST_CASE("admission result carries the latest valid exp (renewal)")
++{
++    Issuer is;
++    auto s = store({is.record(SELLER, STRANGER, NOW + 60, "a"), is.record(SELLER, STRANGER, NOW + 600, "b")});
++    auto r = admission_in_text(s.dump(), is.pk_hex(), SELLER, STRANGER, NOW);
++    CHECK(r.allow);
++    CHECK(r.exp == NOW + 600);
++}
++
++TEST_CASE("lease tracker: expired leases come due, renewal extends, sweep catches revocation")
++{
++    LeaseTracker<std::string> t{1000};
++    t.admitted("buyer", NOW + 100);
++    t.admitted("other", NOW + 10'000);
++
++    // First call is a sweep: everything is re-checked once.
++    CHECK(t.due(NOW).size() == 2);
++    // Inside the sweep interval and before exp: nothing due.
++    CHECK(t.due(NOW + 5).empty());
++    // At exp the buyer is due even between sweeps; the long lease is not.
++    auto d = t.due(NOW + 100);
++    REQUIRE(d.size() == 1);
++    CHECK(d[0] == "buyer");
++    // Caller found a renewed record: tracker moves the clock.
++    t.admitted("buyer", NOW + 500);
++    CHECK(t.due(NOW + 101).empty());
++    // Next sweep (interval after the last sweep at NOW) re-checks all, catching revocation.
++    CHECK(t.due(NOW + 1000).size() == 2);
++    t.forget("buyer");
++    CHECK(t.size() == 1);
++    CHECK_FALSE(t.exp_of("buyer").has_value());
++}
++
++TEST_CASE("lease expiry end to end: re-validate at exp drops the session")
++{
++    // Mirrors SessionEndpoint::enforce_lease_expiry with a fake session table.
++    Issuer is;
++    const std::string path = "exit_lease_expiry_store.json";
++    {
++        std::ofstream f{path};
++        f << store({is.record(SELLER, STRANGER, NOW + 30)}).dump();
++    }
++    std::set<std::string> sessions{STRANGER};
++    LeaseTracker<std::string> t{15};
++
++    auto validate = [&](const std::string& remote, std::int64_t now) {
++        auto r = exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, remote, now);
++        if (r.allow)
++            t.admitted(remote, r.exp);
++        return r;
++    };
++    auto enforce = [&](std::int64_t now) {
++        for (const auto& k : t.due(now))
++        {
++            auto r = exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, k, now);
++            if (r.allow)
++                t.admitted(k, r.exp);
++            else
++            {
++                t.forget(k);
++                sessions.erase(k);  // close_session
++            }
++        }
++    };
++
++    REQUIRE(validate(STRANGER, NOW).allow);
++    enforce(NOW + 1);
++    CHECK(sessions.count(STRANGER) == 1);
++    enforce(NOW + 29);
++    CHECK(sessions.count(STRANGER) == 1);
++    enforce(NOW + 30);  // exp reached
++    CHECK(sessions.count(STRANGER) == 0);
++    CHECK(t.size() == 0);
++    std::remove(path.c_str());
++}
++
++TEST_CASE("store cache reloads only when the file changes")
++{
++    Issuer is;
++    const std::string path = "exit_lease_cache_store.json";
++    auto write = [&](const json& j) {
++        // Atomic rename like admission.py (new inode).
++        const std::string tmp = path + ".tmp";
++        {
++            std::ofstream f{tmp};
++            f << j.dump();
++        }
++        std::rename(tmp.c_str(), path.c_str());
++    };
++    write(store({is.record(SELLER, OTHER_CLIENT, NOW + 3600)}));
++    auto& c = StoreCache::instance();
++    const auto loads0 = c.loads();
++    CHECK_FALSE(exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    CHECK_FALSE(exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    CHECK(c.loads() == loads0 + 1);
++    write(store({is.record(SELLER, OTHER_CLIENT, NOW + 3600), is.record(SELLER, STRANGER, NOW + 3600)}));
++    CHECK(exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, STRANGER, NOW).allow);
++    CHECK(c.loads() == loads0 + 2);
++    std::remove(path.c_str());
++    CHECK(reason(exit_lease_auth_allows(false, false, false, path, is.pk_hex(), SELLER, STRANGER, NOW)) == "bad_file");
++}

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SRNet <121732083+SRNet-lab@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH 4/5] Exit: advertise [exit] policy in ClientContact
+ (traffic_policy wiring)
+
+Without this the exit's published ClientContact carried no exit policy, so
+clients admitted by a lease never marked the exit exit-capable and no traffic
+was routed (found in live testing).
+---
+ src/router/router.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/router/router.cpp b/src/router/router.cpp
+index a202505..281868b 100644
+--- a/src/router/router.cpp
++++ b/src/router/router.cpp
+@@ -438,6 +438,20 @@ namespace srouter
+                 if (srv.target == "localhost.{}"_format(CLIENT_TLD) || srv.target == "localhost.loki")
+                     srv.target = "{}.{}"_format(id(), CLIENT_TLD);
+             }
++
++            // Exit nodes advertise their traffic policy in the published ClientContact; clients only
++            // mark a remote exit-capable (and route through it) when the CC carries a non-empty
++            // policy. Copy [exit] policy into NetworkConfig so SessionEndpoint/TunEndpoint see it.
++            if (_config.exit.exit_enabled and not _config.exit.exit_policy.empty())
++            {
++                netconf.traffic_policy = _config.exit.exit_policy;
++                log::info(
++                    logcat,
++                    "Exit enabled: advertising traffic policy ({} v4 ranges, {} v6 ranges, {} protocols)",
++                    _config.exit.exit_policy.ranges.size(),
++                    _config.exit.exit_policy.ranges_v6.size(),
++                    _config.exit.exit_policy.protocols.size());
++            }
+         }
+     }
+ 

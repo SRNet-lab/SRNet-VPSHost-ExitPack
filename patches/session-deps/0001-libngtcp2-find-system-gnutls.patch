@@ -1,0 +1,20 @@
+Applies inside cmake/session-deps (public pin 65a7618f72367e659bae0620be350e420d04f0e6).
+Backport of public session-deps commit d74f5b1376cd2c106461d9a334a5c635d50bed87
+("libngtcp2: let a static build find a system gnutls"): Ubuntu 24.04's ngtcp2 is too old for
+libquic, so libquic builds a static ngtcp2, whose configure must find the system gnutls.
+
+diff --git a/deps/libngtcp2.cmake b/deps/libngtcp2.cmake
+index db24faf..2d207fe 100644
+--- a/deps/libngtcp2.cmake
++++ b/deps/libngtcp2.cmake
+@@ -12,7 +12,9 @@ sessiondep_build_external(libngtcp2
+     --enable-lib-only --disable-shared --enable-static
+     --with-gnutls --without-openssl --without-boringssl --without-picotls --without-wolfssl
+     --without-libbrotlienc --without-libbrotlidec --without-libev --without-libnghttp3
+-    "PKG_CONFIG_LIBDIR=${SESSIONDEPS_DESTDIR}/lib/pkgconfig" "PKG_CONFIG=pkg-config"
++    # Native build of a static ngtcp2 on top of the system gnutls (backport of upstream
++    # session-deps d74f5b1376): let configure see the system .pc files after ours.
++    "PKG_CONFIG_LIBDIR=${SESSIONDEPS_DESTDIR}/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" "PKG_CONFIG=pkg-config"
+     "CPPFLAGS=-I${SESSIONDEPS_DESTDIR}/include" "LDFLAGS=-L${SESSIONDEPS_DESTDIR}/lib${sessiondeps_apple_ldflags_arch}"
+     "CC=${sessiondeps_cc}" "CXX=${sessiondeps_cxx}"
+     "CFLAGS=${sessiondeps_CFLAGS}" "CXXFLAGS=${sessiondeps_CXXFLAGS}"
