@@ -8,6 +8,9 @@ holds real USDC and has not been audited, so start with small amounts. Other cha
 refused. Buyers connect with the SRNet client,
 [SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop).
 
+SRNet is an independent project. It is not affiliated with or endorsed by the Session Foundation
+or the Session Technology Foundation.
+
 Install from a clone (below). Release builds (a prebuilt router tarball, the seller pack and a
 pinned `bootstrap.sh`, made with `scripts/make-release.sh`) go on
 [GitHub Releases](https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack/releases) when published.
