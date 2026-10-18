@@ -106,7 +106,7 @@ Run `seller/install.sh --help` for the full list. The common ones:
 
 ```
 --source | --prebuilt [URL] | --binary PATH
---contract 0xADDR        default: live Arbitrum One contract
+--contract 0xADDR        default: the SRNetBalance contract on Arbitrum One
 --chainid N              42161 (Arbitrum One, the only supported chain)
 --rpc URL                default https://arb1.arbitrum.io/rpc on 42161
 --country XX             ISO 3166-1 alpha-2; default: detected from the public IPv4
@@ -117,5 +117,5 @@ Run `seller/install.sh --help` for the full list. The common ones:
 --listen-port N          default 1193
 --board-submit-url URL   default on 42161: the SRNet board; none = local only
 --no-firewall
---dry-run --root DIR
+--dry-run --root DIR     write files under DIR and log system commands instead of running them
 ```

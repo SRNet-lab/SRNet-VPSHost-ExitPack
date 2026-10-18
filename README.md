@@ -3,8 +3,9 @@
 Patches, build scripts and a seller installer for running a paid, lease-gated
 Session Router exit on Ubuntu 24.04.
 
-The default is Arbitrum One (42161) and the live SRNetBalance contract, with
-real USDC. It is unaudited, so keep amounts small. Other chain ids are refused. The buyer client is
+This is beta software. It works with the SRNetBalance contract on Arbitrum One (42161), which
+holds real USDC and has not been audited, so start with small amounts. Other chain ids are
+refused. Buyers connect with the SRNet client,
 [SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop).
 
 Install from a clone (below). Release builds (a prebuilt router tarball, the seller pack and a
@@ -14,10 +15,10 @@ Building the router from source takes 20 to 60 minutes.
 
 ## Contract
 
-SRNetBalance is live on Arbitrum One (42161) at `0x7E0d01B7dd916BdAB96B0971ab92D160E1664431`.
-The previous deployment (`0x07bbe156083EbBcc9435C721393Edd36a383E648`) remains on-chain; new listings must use the live address above.
-(tx `0xfb514a4f94049d1679b0c10ed3983be07b21151774b8a14257efa1432584637c`, block 514036941; source verified on Sourcify). The installer uses it by
-default; no `--contract` is needed. Unaudited; keep amounts small.
+SRNetBalance is deployed on Arbitrum One (42161) at `0x7E0d01B7dd916BdAB96B0971ab92D160E1664431`
+(tx `0xfb514a4f94049d1679b0c10ed3983be07b21151774b8a14257efa1432584637c`, block 514036941; source
+verified on Sourcify). The installer uses it by default, so no `--contract` is needed. The
+contract is unaudited; keep amounts small.
 
 ## Install
 
@@ -122,15 +123,6 @@ pinned container and packs `session-router`, `exit-lease-verify` and
 inside it, downloads the tarball from GitHub Releases, checks both hashes and
 builds from source if anything is missing or does not match.
 
-## Tests
-
-```sh
-(cd seller && python3 -m unittest discover -s tests && bash tests/test_install.sh && bash tests/test_bootstrap.sh)
-(cd contrib/exit-lease && python3 -m unittest discover -s tests)
-(cd board && python3 -m unittest discover -s tests)
-seller/tests/test_container.sh dist/session-router   # needs podman or docker
-```
-
 ## Lease claims
 
 Buyers send their signed lease claim to the seller's claim endpoint
@@ -138,7 +130,7 @@ Buyers send their signed lease claim to the seller's claim endpoint
 seller also uses to reach the board, listens only on that router's tun
 address, and accepts small, well-formed, signed claims at a limited rate. The
 watcher checks each claim against the chain before it admits anyone. Claims
-dropped into `/opt/srnet-seller/spool` by hand still work.
+dropped into `/opt/srnet-seller/spool` by hand also work.
 
 ## Operating an exit
 
@@ -151,6 +143,13 @@ to any public resolver), validates DNSSEC, uses QNAME minimisation, keeps no que
 logs and is rate limited per buyer. The listing advertises it as `"dns"`. Turn it
 off with `--no-dns` (buyers' clients then refuse to connect unless they opt out of
 tunnel DNS).
+
+## Related repositories
+
+- [SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop): the SRNet client buyers use to
+  find, pay for and connect to exits.
+- [Session-Router-SRNet](https://github.com/SRNet-lab/Session-Router-SRNet): the Session Router
+  build the client runs, with exit mapping added.
 
 ## License
 

@@ -26,10 +26,10 @@ expired board, a lower seq than they've seen, or the same seq with different con
 
 ## Listings
 
-- No approval step. A listing with a valid seller signature, the Arbitrum One chain id and live
-  contract, sane fields and a non-zero payout goes live at the next `tick`. Changes to any
-  field (payout, vendor_id, country, price, ...) go live the same way; they are logged in
-  `audit.jsonl`.
+- No approval step. A listing with a valid seller signature, the Arbitrum One chain id and the
+  SRNetBalance contract address, sane fields and a non-zero payout goes live at the next `tick`.
+  Changes to any field (payout, vendor_id, country, price, ...) go live the same way; they are
+  logged in `audit.jsonl`.
 - `ban <seller> --reason TEXT` is the only manual control: banned sellers are dropped and their
   submissions refused. `unban` lifts it.
 - `country` is ISO 3166-1 alpha-2 (`unknown` if absent); `region` is optional detail.
