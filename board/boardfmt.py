@@ -51,9 +51,6 @@ ECONOMIC_FIELDS = ("payout", "vendor_id", "chainid", "contract")
 AUDIT_FIELDS = ECONOMIC_FIELDS + ("country",)
 # SRNetBalance deployments a listing may point at (chain id -> contract). Arbitrum One only.
 DEPLOYMENTS = {42161: "0x7e0d01b7dd916bdab96b0971ab92d160e1664431"}  # fundWithPermit, 2026-10-14
-# Previous live deployment (no fundWithPermit). Sellers on this address stay on-chain but
-# new listings must use DEPLOYMENTS above.
-PREVIOUS_DEPLOYMENTS = {42161: ["0x07bbe156083ebbcc9435c721393edd36a383e648"]}
 
 
 class BoardError(Exception):

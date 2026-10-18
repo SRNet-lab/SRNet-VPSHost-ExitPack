@@ -226,7 +226,6 @@ if [ "$ACTION" = health ]; then health; exit $?; fi
 # ----------------------------------------------------------------- validate
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "bad --listen-port"
 SRNET_ARB_ONE_CONTRACT=0x7E0d01B7dd916BdAB96B0971ab92D160E1664431  # SRNetBalance on Arbitrum One (fundWithPermit, 2026-10-14)
-SRNET_ARB_ONE_PREVIOUS_CONTRACT=0x07bbe156083EbBcc9435C721393Edd36a383E648  # previous live deployment
 if [ "$CHAINID" = 42161 ]; then
   [ -n "$CONTRACT" ] || CONTRACT=$SRNET_ARB_ONE_CONTRACT
   [ "${CONTRACT,,}" = "${SRNET_ARB_ONE_CONTRACT,,}" ] || warn "--contract $CONTRACT is not the Arbitrum One deployment ($SRNET_ARB_ONE_CONTRACT)"
