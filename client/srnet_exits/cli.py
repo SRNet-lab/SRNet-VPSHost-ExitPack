@@ -24,7 +24,7 @@ from pathlib import Path
 
 import chains as C  # noqa: E402
 
-from . import board as boardmod, config, inbound, listings, killswitch, pay, reminder, routercfg, tunneldns, warning
+from . import board as boardmod, config, inbound, listings, killswitch, pay, priv, reminder, routercfg, tunneldns, warning
 from .backend import LiveBackend
 
 
@@ -389,6 +389,31 @@ def dns_down(st, quiet: bool = False) -> bool:
     return ok
 
 
+def cmd_setup_router(args, st) -> int:
+    """Set keyfile= and blackhole-routes=false in Session Router's client.ini (one sudo call;
+    everything else in the file stays), make the key, restart the router. Safe to run again."""
+    cfg = config.load(st.root)
+    ini = args.ini or cfg.get("router_ini") or routercfg.DEFAULT_INI
+    if not Path(ini).exists():
+        print(f"{ini} not found: install Session Router first (README, Install, step 1), "
+              "then run: srnet setup-router", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, "-m", "srnet_exits.routercfg", "apply", "--ini", ini]
+    if args.no_restart:
+        cmd.append("--no-restart")
+    try:
+        r = priv.run(cmd, check=False, what="setting up Session Router for exits")
+    except priv.PrivError as e:
+        print(f"could not set up Session Router: {e}", file=sys.stderr)
+        return 1
+    out = (r.stdout or "").strip()
+    if out:
+        print(out)
+    if r.returncode != 0:
+        print((r.stderr or "").strip() or "setup-router failed", file=sys.stderr)
+    return r.returncode
+
+
 def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes"), privileged: bool = True) -> bool:
     """Refuse (with the one-time fix) when Session Router's client.ini would break exits."""
     path = cfg.get("router_ini") or routercfg.DEFAULT_INI
@@ -396,14 +421,15 @@ def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes"), privilege
     if found is None:
         if Path(path).exists():
             print(f"note: could not read {path} to check Session Router's settings for exits "
-                  "(README, Install, step 5)", file=sys.stderr)
+                  "(to check and fix it: srnet setup-router)", file=sys.stderr)
         return True
     probs = [p for p in found if any(n in p for n in need)]
     if not probs:
         return True
     for p in probs:
         print(p + ".", file=sys.stderr)
-    print("Fix it once (README, Install, step 5), then try again:\n" + routercfg.FIX, file=sys.stderr)
+    print(f"Fix it once, then try again: {routercfg.FIX}  (asks sudo; keeps the rest of client.ini)",
+          file=sys.stderr)
     return False
 
 
@@ -569,8 +595,13 @@ def register(sub) -> dict:
     d.add_argument("--rpc-endpoint")
     d.add_argument("--keep-killswitch", action="store_true")
 
+    r = sub.add_parser("setup-router", help="exits: give Session Router a persistent key and turn off its "
+                       "blackhole routes (asks sudo once; install.sh --with-exits runs it)")
+    r.add_argument("--ini", default=None, help=f"client.ini (default {routercfg.DEFAULT_INI})")
+    r.add_argument("--no-restart", action="store_true", help="don't restart session-router-client")
+
     return {"exits": cmd_exits, "buy": cmd_buy, "paid": cmd_paid, "connect": cmd_connect,
-            "status": cmd_status, "disconnect": cmd_disconnect}
+            "status": cmd_status, "disconnect": cmd_disconnect, "setup-router": cmd_setup_router}
 
 
 def main(argv=None) -> int:

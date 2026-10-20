@@ -3,6 +3,7 @@ the kill switch rules, and buying from an exit without its own resolver."""
 import io as _io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -138,10 +139,124 @@ class RouterCfg(unittest.TestCase):
             self.assertEqual(routercfg.problems(p, privileged=True), [])
         self.assertEqual(calls, [["cat", str(p)]])
 
-    def test_fix_command_is_what_the_readme_says(self):
+    def test_fix_command_is_setup_router(self):
         from srnet_exits import routercfg
-        self.assertIn("blackhole-routes=false", routercfg.FIX)
-        self.assertIn("session-router-config -k", routercfg.FIX)
+        self.assertEqual(routercfg.FIX, "srnet setup-router")
+
+
+STOCK_INI = """# Session Router client config
+[router]
+netid=srnet
+
+[network]
+# keyfile=
+exit-node=
+blackhole-routes=true   # default
+
+[logging]
+level=info
+"""
+
+
+class SetupRouter(unittest.TestCase):
+    def test_stock_ini_gets_both_and_keeps_the_rest(self):
+        from srnet_exits import routercfg
+        new, key, changed = routercfg.edit_text(STOCK_INI)
+        self.assertTrue(changed)
+        self.assertEqual(key, routercfg.KEY)
+        self.assertIn("[network]\nkeyfile=" + routercfg.KEY + "\n# keyfile=\nexit-node=\nblackhole-routes=false\n", new)
+        for keep in ("# Session Router client config", "netid=srnet", "[logging]\nlevel=info"):
+            self.assertIn(keep, new)
+        self.assertEqual(new.count("blackhole-routes"), 1)
+        self.assertEqual(new.count("[network]"), 1)
+
+    def test_idempotent(self):
+        from srnet_exits import routercfg
+        once, _, _ = routercfg.edit_text(STOCK_INI)
+        twice, _, changed = routercfg.edit_text(once)
+        self.assertFalse(changed)
+        self.assertEqual(once, twice)
+
+    def test_existing_keyfile_is_kept(self):
+        from srnet_exits import routercfg
+        new, key, changed = routercfg.edit_text("[network]\nkeyfile=/srv/my.key\nblackhole-routes=false\n")
+        self.assertEqual((key, changed), ("/srv/my.key", False))
+        new, key, changed = routercfg.edit_text("[network]\nkeyfile=/srv/my.key\n")
+        self.assertEqual(key, "/srv/my.key")
+        self.assertTrue(changed)
+        self.assertEqual(new.count("keyfile="), 1)
+
+    def test_empty_keyfile_line_is_filled_and_no_network_section_is_added(self):
+        from srnet_exits import routercfg
+        new, _, _ = routercfg.edit_text("[network]\nkeyfile=\n")
+        self.assertEqual(new.count("keyfile="), 1)
+        self.assertIn("keyfile=" + routercfg.KEY, new)
+        new, _, changed = routercfg.edit_text("[router]\nnetid=srnet")
+        self.assertTrue(changed)
+        self.assertTrue(new.startswith("[router]\nnetid=srnet\n"))
+        self.assertEqual(routercfg.read.__name__, "read")
+        import configparser
+        cp = configparser.ConfigParser(); cp.read_string(new)
+        self.assertEqual(cp["network"]["blackhole-routes"], "false")
+
+    def test_result_passes_the_check(self):
+        import tempfile
+        from srnet_exits import routercfg
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "client.ini"
+            p.write_text(routercfg.edit_text(STOCK_INI)[0])
+            self.assertEqual(routercfg.problems(p), [])
+
+    def test_apply_makes_key_edits_restarts_and_second_run_does_nothing(self):
+        import os, stat, tempfile
+        from srnet_exits import routercfg
+        with tempfile.TemporaryDirectory() as d:
+            ini = Path(d) / "client.ini"; ini.write_text(STOCK_INI); os.chmod(ini, 0o640)
+            key = Path(d) / "client" / "client.key"
+            calls = []
+
+            def run(cmd, **kw):
+                calls.append(cmd)
+                if cmd[0] == "session-router-config":
+                    Path(cmd[2]).write_bytes(b"k" * 64)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            log = []
+            self.assertEqual(routercfg.apply(ini, str(key), run=run, log=log.append), 0)
+            self.assertEqual(calls, [["session-router-config", "-k", str(key)],
+                                     ["systemctl", "restart", "session-router-client"]])
+            self.assertEqual(stat.S_IMODE(ini.stat().st_mode), 0o640)
+            self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+            self.assertEqual((Path(d) / "client.ini.srnet-orig").read_text(), STOCK_INI)
+            self.assertEqual(routercfg.problems(ini), [])
+            calls.clear(); log.clear()
+            self.assertEqual(routercfg.apply(ini, str(key), run=run, log=log.append), 0)
+            self.assertEqual(calls, [])
+            self.assertIn("already set up", log[0])
+
+    def test_apply_without_session_router_config_says_so(self):
+        import tempfile
+        from srnet_exits import routercfg
+        with tempfile.TemporaryDirectory() as d:
+            ini = Path(d) / "client.ini"; ini.write_text(STOCK_INI)
+
+            def run(cmd, **kw):
+                raise FileNotFoundError(2, "No such file or directory", cmd[0])
+            log = []
+            self.assertEqual(routercfg.apply(ini, str(Path(d) / "k" / "client.key"), run=run, log=log.append), 1)
+            self.assertIn("session-router-client package", log[0])
+            self.assertEqual(ini.read_text(), STOCK_INI, "client.ini untouched when the key can't be made")
+
+    def test_apply_without_ini_says_install_session_router(self):
+        from srnet_exits import routercfg
+        log = []
+        self.assertEqual(routercfg.apply("/nonexistent/client.ini", log=log.append), 1)
+        self.assertIn("install Session Router", log[0])
+
+    def test_root_helper_refuses_without_root(self):
+        from srnet_exits import routercfg
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        self.assertEqual(routercfg.main(["apply", "--ini", "/nonexistent"]), 2)
 
 
 class Inbound(unittest.TestCase):

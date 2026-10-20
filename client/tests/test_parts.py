@@ -107,7 +107,7 @@ class Addon(unittest.TestCase):
         self.assertEqual((ADDON.name, ADDON.title), ("exits", "Exits"))
         ap = argparse.ArgumentParser()
         cmds = ADDON.register(ap.add_subparsers(dest="cmd"))
-        self.assertEqual(sorted(cmds), ["buy", "connect", "disconnect", "exits", "paid", "status", "verify"])
+        self.assertEqual(sorted(cmds), ["buy", "connect", "disconnect", "exits", "paid", "setup-router", "status", "verify"])
         a = ap.parse_args(["buy", "--seller", F.CLIENT, "--hours", "3", "--chain", "base"])
         self.assertEqual((a.hours, a.chain), (3, "base"))
         m = ADDON.ui_manifest()

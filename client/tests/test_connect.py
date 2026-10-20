@@ -182,7 +182,7 @@ class InboundSessions(_Base):
         err = _io.StringIO()
         with mock.patch("sys.stderr", err), mock.patch("sys.stdout", _io.StringIO()):
             self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch", "--system-dns"), 1)
-        self.assertIn("blackhole-routes=false", err.getvalue())
+        self.assertIn("srnet setup-router", err.getvalue())
         self.assertEqual(FakeRpc.calls, [])
         self.assertEqual(self.inbound_calls, [], "nothing touched before the check")
 
@@ -192,7 +192,31 @@ class InboundSessions(_Base):
         err = _io.StringIO()
         with mock.patch("sys.stderr", err), mock.patch("sys.stdout", _io.StringIO()):
             self.assertEqual(self.run_cli(home, "buy", SELLER, "--hours", "1", "--client-sesh", ME), 1)
-        self.assertIn("session-router-config -k", err.getvalue())
+        self.assertIn("srnet setup-router", err.getvalue())
+
+    def test_setup_router_runs_the_root_helper_once_through_priv(self):
+        import subprocess as sp
+        import tempfile
+        home = self.home()
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            ini = Path(d) / "client.ini"
+            ini.write_text("[network]\n")
+
+            def run(cmd, **kw):
+                calls.append(cmd)
+                return sp.CompletedProcess(cmd, 0, "restarted session-router-client\n", "")
+            out = _io.StringIO()
+            with mock.patch.object(self.cli.priv, "run", run), mock.patch("sys.stdout", out):
+                self.assertEqual(self.run_cli(home, "setup-router", "--ini", str(ini)), 0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][1:], ["-m", "srnet_exits.routercfg", "apply", "--ini", str(ini)])
+            self.assertIn("restarted", out.getvalue())
+            err = _io.StringIO()
+            with mock.patch.object(self.cli.priv, "run", run), mock.patch("sys.stderr", err):
+                self.assertEqual(self.run_cli(home, "setup-router", "--ini", str(Path(d) / "none.ini")), 1)
+            self.assertIn("install Session Router first", err.getvalue())
+            self.assertEqual(len(calls), 1)
 
     def test_guess_wan_skips_the_tunnel(self):
         outs = {"show": "default dev sr-tun0 scope link\ndefault via 10.0.0.1 dev ens3 proto dhcp\n",

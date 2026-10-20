@@ -8,6 +8,7 @@ srnet buy --seller <id> --hours N    get a quote, pay it from any wallet, wait f
 srnet paid [--quote ID] [--tx 0x..]  carry on after paying (or give the transaction hash)
 srnet connect <seller>               route traffic and DNS through the exit (Linux, asks for sudo)
 srnet status | disconnect
+srnet setup-router                   once: persistent router key, no blackhole routes (asks for sudo)
 srnet verify --chain base --tx 0x.. --to 0x.. --amount 3.50   check a shop payment on chain
 ```
 
@@ -97,11 +98,13 @@ interface (an `ip rule` on a fwmark to a small table with your normal routes). E
 machine starts itself, DNS included, still goes only through the tunnel. `disconnect` removes
 this again, and none of it (kill switch, routes, rules) survives a reboot.
 
-Session Router needs two client settings for exits, set once (SRNet-Desktop README, Install,
-step 5): a persistent key (`keyfile=`; paid time belongs to your `.sesh` address, which otherwise
-changes at every restart) and `blackhole-routes=false` (otherwise the router blackholes all traffic
-while an exit is mapped). `srnet buy` / `srnet connect` refuse until they are set; `srnet doctor`
-shows them.
+Session Router needs two client settings for exits: a persistent key (`keyfile=`; paid time
+belongs to your `.sesh` address, which otherwise changes at every restart) and
+`blackhole-routes=false` (otherwise the router blackholes all traffic while an exit is mapped).
+`srnet setup-router` sets both (one sudo prompt; keeps the rest of `client.ini`, keeps a copy of the
+original as `client.ini.srnet-orig`, restarts the router, changes nothing when already set), and
+the desktop's `install.sh --with-exits` runs it. `srnet buy` / `srnet connect` refuse until they
+are set; `srnet doctor` points at `srnet setup-router`.
 
 ## Tests
 
