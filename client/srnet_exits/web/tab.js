@@ -109,7 +109,7 @@
     row("Network", r.chain + " (chain id " + r.chainid + ")"); row("USDC contract", r.token_address); row("Good until", hhmm(r.expires));
     p.appendChild(t);
     if (r.qr) {
-      const res = await fetch("/api/addon/" + NAME + "/qr.svg?q=" + encodeURIComponent(r.id), {headers: {"X-Core": "1"}});
+      const res = await fetch("/api/addon/" + NAME + "/qr.svg?q=" + encodeURIComponent(r.id), {headers: sh.headers ? sh.headers() : {"X-Core": "1"}});
       if (res.ok) { const img = el("img"); img.alt = "payment QR"; img.width = 220; img.height = 220; img.className = "qr"; img.src = URL.createObjectURL(await res.blob()); p.appendChild(img); }
     }
     const link = el("p", r.uri, "muted"); p.appendChild(link);

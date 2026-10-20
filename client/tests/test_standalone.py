@@ -262,13 +262,16 @@ class Page(unittest.TestCase):
         self.addCleanup(self.srv.server_close)
         self.addCleanup(self.srv.shutdown)
         self.port = self.srv.server_address[1]
+        self.tok = {"X-Token": self.srv.token}
 
-    def req(self, method, path, body=None, headers=None):
+    def req(self, method, path, body=None, headers=None, raw=None, token=True):
         import http.client
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         h = {"Host": f"127.0.0.1:{self.port}"}
+        if token:
+            h.update(self.tok)
         h.update(headers or {})
-        data = json.dumps(body).encode() if body is not None else None
+        data = json.dumps(body).encode() if body is not None else raw
         if data is not None:
             h.setdefault("Content-Type", "application/json")
         c.request(method, path, body=data, headers=h)
@@ -304,6 +307,47 @@ class Page(unittest.TestCase):
         self.assertFalse(j["acked"])
         self.assertEqual(self.req("POST", "/api/addon/exits/nope", {}, x)[0], 404)
 
+    def test_every_api_call_needs_this_runs_token(self):
+        x = {"X-Core": "1"}
+        before = json.loads(self.req("POST", "/api/addon/exits/settings", {}, x)[1])
+        for t in (None, "", "x" * 43, "é", self.srv.token + "x"):
+            h = dict(x) if t is None else dict(x, **{"X-Token": t})
+            code = self.req("POST", "/api/addon/exits/settings", {"max_payment_usdc": "999.00"}, h, token=False)[0]
+            self.assertEqual(code, 403, t)
+            self.assertEqual(self.req("POST", "/api/addon/exits/hello", {}, h, token=False)[0], 403, t)
+        after = json.loads(self.req("POST", "/api/addon/exits/settings", {}, x)[1])
+        self.assertEqual(before, after)
+        self.assertEqual(self.req("POST", "/api/addon/exits/hello", {}, x)[0], 200)
+
+    def test_qr_needs_the_token(self):
+        from srnet_exits import ui
+        with mock.patch.object(ui.Backend, "qr", lambda self, q: b"<svg/>"):
+            path = "/api/addon/exits/qr.svg?q=0011223344556677"
+            self.assertNotEqual(self.req("GET", path, None, {"X-Core": "1"}, token=False)[0], 200)
+            self.assertNotEqual(self.req("GET", path, None, {"X-Core": "1", "X-Token": "nope"}, token=False)[0], 200)
+            code, body, hdr = self.req("GET", path, None, {"X-Core": "1"})
+            self.assertEqual((code, body), (200, b"<svg/>"))
+            self.assertEqual(hdr["Content-Type"], "image/svg+xml")
+
+    def test_bad_content_length_is_400(self):
+        for v in ("abc", "1e3", "0x10"):
+            code, body, _ = self.req("POST", "/api/addon/exits/status", None,
+                                     {"X-Core": "1", "Content-Type": "application/json", "Content-Length": v}, raw=b"{}")
+            self.assertEqual(code, 400, v)
+        self.assertEqual(self.req("POST", "/api/addon/exits/status", None,
+                                  {"X-Core": "1", "Content-Type": "application/json", "Content-Length": "-1"},
+                                  raw=b"{}")[0], 413)
+
+    def test_page_js_takes_the_token_from_the_hash(self):
+        js = self.req("GET", "/page.js")[1].decode()
+        self.assertIn("location.hash", js)
+        self.assertIn("sessionStorage", js)
+        self.assertIn("history.replaceState", js)
+        self.assertIn('"X-Token"', js)
+        tab = self.req("GET", "/tab.js")[1].decode()
+        self.assertIn("sh.headers ? sh.headers()", tab)
+
+
     def test_quote_needs_the_warning_first(self):
         code, body, _ = self.req("POST", "/api/addon/exits/quote",
                                  {"seller": helpers.SELLER, "hours": 1, "client_sesh": helpers.ME}, {"X-Core": "1"})
@@ -323,6 +367,102 @@ class Page(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(seen["env"]["SRNET_EXITS_PROG"], "srnet-exits")
         self.assertFalse(json.loads(body)["ok"])
+
+
+class PageRun(unittest.TestCase):
+    """ui.json, the verified "already running" and the random port."""
+
+    def setUp(self):
+        from srnet_exits.state import State
+        self.st = State(Path(tempfile.mkdtemp()))
+
+    def start(self):
+        import threading
+        from srnet_exits import page
+        made = []
+        real = page.serve
+
+        def keep(*a, **k):
+            made.append(real(*a, **k))
+            return made[-1]
+        out = io.StringIO()
+        with mock.patch.object(page, "serve", keep), mock.patch("sys.stdout", out):
+            t = threading.Thread(target=page.run, args=(self.st, 0, False), daemon=True)
+            t.start()
+            for _ in range(200):
+                if made and (self.st.root / "ui.json").exists():
+                    break
+                import time
+                time.sleep(0.02)
+        self.addCleanup(lambda: (made[0].shutdown(), t.join(5)))
+        return made[0], t, out
+
+    def test_writes_ui_json_private_and_removes_it_on_stop(self):
+        from srnet_exits import page
+        srv, t, out = self.start()
+        p = self.st.root / "ui.json"
+        info = json.loads(p.read_text())
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(info, {"port": srv.server_address[1], "token": srv.token, "pid": os.getpid()})
+        self.assertNotEqual(info["port"], 48921)
+        self.assertGreaterEqual(len(info["token"]), 43)
+        self.assertIn(f"http://127.0.0.1:{info['port']}/#t={info['token']}", out.getvalue())
+        self.assertEqual(page.running(self.st), (info["port"], info["token"]))
+        srv.shutdown()
+        t.join(5)
+        self.assertFalse(p.exists())
+
+    def test_second_run_reuses_the_verified_page(self):
+        from srnet_exits import page
+        srv, _, _ = self.start()
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch.object(page, "serve", side_effect=AssertionError("new page")):
+            self.assertEqual(page.run(self.st, 0, False), 0)
+        self.assertIn(f"/#t={srv.token} (already running)", out.getvalue())
+
+    def test_a_squatter_on_the_recorded_port_is_not_trusted(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from srnet_exits import page
+
+        class Fake(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                b = json.dumps({"ok": True, "app": "srnet-exits", "proof": "0" * 64}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+            do_GET = do_POST
+        fake = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+        threading.Thread(target=fake.serve_forever, daemon=True).start()
+        self.addCleanup(fake.server_close)
+        self.addCleanup(fake.shutdown)
+        fport = fake.server_address[1]
+        (self.st.root / "ui.json").write_text(json.dumps({"port": fport, "token": "t" * 43, "pid": 1}))
+        self.assertIsNone(page.running(self.st))
+        srv, _, out = self.start()
+        self.assertNotEqual(srv.server_address[1], fport)
+        self.assertNotIn("already running", out.getvalue())
+
+    def test_ui_json_of_another_user_or_a_symlink_is_ignored(self):
+        from srnet_exits import page
+        srv, _, _ = self.start()
+        with mock.patch.object(page.os, "getuid", return_value=os.getuid() + 1):
+            self.assertIsNone(page.running(self.st))
+        p = self.st.root / "ui.json"
+        real = self.st.root / "elsewhere.json"
+        p.replace(real)
+        p.symlink_to(real)
+        self.assertIsNone(page.running(self.st))
+
+    def test_nothing_recorded_means_a_new_page(self):
+        from srnet_exits import page
+        self.assertIsNone(page.running(self.st))
+        (self.st.root / "ui.json").write_text("not json")
+        self.assertIsNone(page.running(self.st))
 
 
 if __name__ == "__main__":

@@ -167,7 +167,7 @@ def parser():
     cmds = {"doctor": cmd_doctor}
     cmds.update(ADDON.register(sub))
     u = sub.add_parser("ui", help="the exits page in your browser (127.0.0.1 only)")
-    u.add_argument("--port", type=int, default=48921)
+    u.add_argument("--port", type=int, default=0, help="listen on this port (default: a free one)")
     u.add_argument("--no-browser", action="store_true", help="print the address only")
     cmds["ui"] = cmd_ui
     return ap, cmds

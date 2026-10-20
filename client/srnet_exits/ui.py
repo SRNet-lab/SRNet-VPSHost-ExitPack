@@ -320,7 +320,10 @@ def make_handler(be: Backend, token: str, port_ref: list):
                 return self._json(403, {"ok": False, "err": "forbidden"})
             if (self.headers.get("Content-Type") or "").split(";")[0] != "application/json":
                 return self._json(415, {"ok": False, "err": "json only"})
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._json(400, {"ok": False, "err": "bad Content-Length"})
             if n < 0 or n > MAX_BODY:
                 return self._json(413, {"ok": False, "err": "too large"})
             try:

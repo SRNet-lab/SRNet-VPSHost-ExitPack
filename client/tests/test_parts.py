@@ -165,6 +165,14 @@ class TabBackend(unittest.TestCase):
         self.assertEqual(j["max_payment_usdc"], "20.00")
         self.assertFalse(j["acked"])
 
+    def test_bad_content_length_is_400(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("POST", "/api/status", body=b"{}", headers={"X-CSRF-Token": self.tok, "Content-Type": "application/json",
+                                                             "Content-Length": "abc"})
+        r = c.getresponse()
+        self.assertEqual(r.status, 400)
+        c.close()
+
     def test_settings_limit_and_chain(self):
         h = {"X-CSRF-Token": self.tok}
         out = json.loads(self.req("POST", "/api/settings", {"max_payment_usdc": "7.5", "chain": "base"}, h)[1])

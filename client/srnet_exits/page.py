@@ -1,13 +1,22 @@
 """`srnet-exits ui`: the Exits tab on its own small page, for use without the SRNet client.
 
 Serves page.html, a small shell (page.js) and the same tab.js the SRNet app uses, on 127.0.0.1 only.
-API calls go to /api/addon/exits/<call> like in the app and need the X-Core header (which plain
-links, forms and other sites can't add), a loopback Host with this port, and no foreign Origin.
+API calls go to /api/addon/exits/<call> like in the app. Each one needs the X-Core header (which plain
+links, forms and other sites can't add), a loopback Host with this port, no foreign Origin, and the
+X-Token of this run.
+
+Each run makes a new token, writes {"port", "token", "pid"} to ~/.srnet/ui.json (mode 0600) and opens
+http://127.0.0.1:PORT/#t=TOKEN. page.js moves the token from the address into sessionStorage. A second
+`srnet-exits ui` reuses the running page only if ui.json is this user's and the page there answers
+`hello` with that token (and proves it knows it); otherwise it starts a new page on a free port.
 """
 from __future__ import annotations
 
+import hmac
+import http.client
 import json
-import socket
+import os
+import secrets
 import sys
 import threading
 import time
@@ -15,6 +24,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import state as S
 from . import ui
 
 PREFIX = "/api/addon/exits/"
@@ -25,7 +35,7 @@ CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src blob:; 
        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
 
-def make_handler(be: ui.Backend, port_ref: list):
+def make_handler(be: ui.Backend, port_ref: list, token: str):
     class H(BaseHTTPRequestHandler):
         server_version = "srnet-exits-page"
         sys_version = ""
@@ -55,7 +65,9 @@ def make_handler(be: ui.Backend, port_ref: list):
             return origin is None or origin in {"http://" + h for h in ok}
 
         def _api_ok(self) -> bool:
-            return self._host_ok() and self.headers.get("X-Core") == "1"
+            given = self.headers.get("X-Token") or ""
+            return (self._host_ok() and self.headers.get("X-Core") == "1"
+                    and hmac.compare_digest(given.encode("utf-8", "replace"), token.encode()))
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
@@ -77,7 +89,10 @@ def make_handler(be: ui.Backend, port_ref: list):
                 return self._json(403, {"ok": False, "err": "forbidden"})
             if (self.headers.get("Content-Type") or "").split(";")[0] != "application/json":
                 return self._json(415, {"ok": False, "err": "json only"})
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._json(400, {"ok": False, "err": "bad Content-Length"})
             if n < 0 or n > ui.MAX_BODY:
                 return self._json(413, {"ok": False, "err": "too large"})
             try:
@@ -86,6 +101,9 @@ def make_handler(be: ui.Backend, port_ref: list):
                     raise ValueError
             except ValueError:
                 return self._json(400, {"ok": False, "err": "bad json"})
+            if self.path == PREFIX + "hello":
+                return self._json(200, {"ok": True, "app": "srnet-exits", "pid": os.getpid(),
+                                        "proof": _proof(token, str(req.get("nonce", "")))})
             fn = ui.CALLS.get(self.path[len(PREFIX):]) if self.path.startswith(PREFIX) else None
             if not fn:
                 return self._json(404, {"ok": False, "err": "not found"})
@@ -98,24 +116,80 @@ def make_handler(be: ui.Backend, port_ref: list):
     return H
 
 
-def serve(st, port: int = 0, backend: ui.Backend | None = None) -> ThreadingHTTPServer:
+def serve(st, port: int = 0, backend: ui.Backend | None = None, token: str | None = None) -> ThreadingHTTPServer:
+    """The page on 127.0.0.1:port (0 = a free one). srv.token is the token its API calls need."""
     port_ref = [port]
-    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(backend or ui.Backend(st), port_ref))
+    token = token or secrets.token_urlsafe(32)
+    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(backend or ui.Backend(st), port_ref, token))
     port_ref[0] = srv.server_address[1]
+    srv.token = token
     return srv
 
 
-def _answers(port: int) -> bool:
+def _info_path(st):
+    return st.root / "ui.json"
+
+
+def _url(port: int, token: str) -> str:
+    return f"http://127.0.0.1:{port}/#t={token}"
+
+
+def _proof(token: str, nonce: str) -> str:
+    return hmac.new(token.encode(), b"srnet-exits hello " + nonce.encode("utf-8", "replace"), "sha256").hexdigest()
+
+
+def _hello(port: int, token: str) -> bool:
+    """True only if the page on port knows token: it must send back an HMAC of a fresh nonce, so
+    another program that took over the port after our page stopped can't pass as it."""
+    nonce = secrets.token_hex(16)
     try:
-        socket.create_connection(("127.0.0.1", port), timeout=1).close()
-        return True
-    except OSError:
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c.request("POST", PREFIX + "hello", body=json.dumps({"nonce": nonce}).encode(),
+                  headers={"Host": f"127.0.0.1:{port}", "X-Core": "1", "X-Token": token,
+                           "Content-Type": "application/json"})
+        r = c.getresponse()
+        j = json.loads(r.read(4096) or b"{}") if r.status == 200 else {}
+        ok = isinstance(j, dict) and hmac.compare_digest(str(j.get("proof", "")).encode("utf-8", "replace"),
+                                                       _proof(token, nonce).encode())
+        c.close()
+        return ok
+    except (OSError, ValueError, http.client.HTTPException):
         return False
 
 
-def run(st, port: int = 48921, browser: bool = True) -> int:
-    url = f"http://127.0.0.1:{port}/"
-    if _answers(port):
+def running(st):
+    """(port, token) of a page this user already runs, checked with a hello; else None."""
+    p = _info_path(st)
+    try:
+        if p.is_symlink() or p.stat().st_uid != os.getuid():
+            return None
+        info = json.loads(p.read_text())
+        port, token = int(info["port"]), str(info["token"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not 0 < port < 65536 or not token:
+        return None
+    return (port, token) if _hello(port, token) else None
+
+
+def _write_info(st, port: int, token: str) -> None:
+    S.write(_info_path(st), {"port": port, "token": token, "pid": os.getpid()})
+
+
+def _drop_info(st, token: str) -> None:
+    p = _info_path(st)
+    try:
+        if json.loads(p.read_text()).get("token") == token:
+            p.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def run(st, port: int = 0, browser: bool = True) -> int:
+    """Port 0 (the default) means a free port picked at start."""
+    have = running(st)
+    if have:
+        url = _url(*have)
         print(f"srnet-exits ui: {url} (already running)", flush=True)
         if browser:
             webbrowser.open(url)
@@ -123,9 +197,13 @@ def run(st, port: int = 48921, browser: bool = True) -> int:
     try:
         srv = serve(st, port)
     except OSError as e:
-        print(f"srnet-exits ui: can't listen on 127.0.0.1:{port} ({e}); try --port", file=sys.stderr)
+        print(f"srnet-exits ui: can't listen on 127.0.0.1:{port} ({e}); try another --port or leave it out",
+              file=sys.stderr)
         return 1
-    print(f"srnet-exits ui: {url}\n(local only; Ctrl-C to stop)", flush=True)
+    port = srv.server_address[1]
+    _write_info(st, port, srv.token)
+    url = _url(port, srv.token)
+    print(f"srnet-exits ui: {url}\n(local only; this address works only for this run; Ctrl-C to stop)", flush=True)
     if browser:
         threading.Thread(target=lambda: (time.sleep(0.5), webbrowser.open(url)), daemon=True).start()
     try:
@@ -135,4 +213,5 @@ def run(st, port: int = 48921, browser: bool = True) -> int:
         return 130
     finally:
         srv.server_close()
+        _drop_info(st, srv.token)
     return 0
