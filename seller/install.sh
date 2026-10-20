@@ -66,7 +66,7 @@ TUN=sr-tun-seller; TUN_NET4=10.193.0.0/16
 # clearnet reply; buyers reach it only through the tunnel. Advertised in the listing as "dns".
 DNS_IP=10.195.0.53; DNS=1
 DNS_CONF=/etc/unbound/srnet-seller-dns.conf; DNS_KEY=/var/lib/unbound/srnet-seller-root.key
-EXIT_USER=srnet-exit; WATCH_USER=srnet-watch; GROUP=srnet
+EXIT_USER=srnet-exit; WATCH_USER=srnet-watch; CLAIM_USER=srnet-claim; GROUP=srnet; CLAIMS_GROUP=srnet-claims
 die() { echo "install.sh: $*" >&2; exit 1; }
 warn() { echo "install.sh: WARNING: $*" >&2; }
 say() { echo "==> $*"; }
@@ -154,8 +154,8 @@ if [ "$ACTION" = uninstall ]; then
   if [ "$PURGE" = 1 ]; then
     warn "--purge: deleting $PREFIX including the exit identity key, issuer key and listing"
     run rm -rf "$P"
-    for u in "$WATCH_USER" "$EXIT_USER"; do id "$u" >/dev/null 2>&1 && run userdel "$u" || true; done
-    getent group "$GROUP" >/dev/null 2>&1 && run groupdel "$GROUP" || true
+    for u in "$CLAIM_USER" "$WATCH_USER" "$EXIT_USER"; do id "$u" >/dev/null 2>&1 && run userdel "$u" || true; done
+    for g in "$CLAIMS_GROUP" "$GROUP"; do getent group "$g" >/dev/null 2>&1 && run groupdel "$g" || true; done
   else
     run rm -rf "$P/bin" "$P/pack" "$P/run" "$P/spool"
     say "kept $PREFIX/config (keys), $PREFIX/listing, $PREFIX/claims (used payments) and $PREFIX/data; use --uninstall --purge to delete them"
@@ -216,6 +216,7 @@ health() {
     [ -n "${PAYOUT:-}" ] && chk "ufw allows claims on sr-tun-submit" "ufw status | grep -q 'on sr-tun-submit'"
   fi
   [ -n "${PAYOUT:-}" ] && chk "quote key 0600" "[ \"\$(stat -c %a '$P/config/quote.key')\" = 600 ]"
+  [ -n "${PAYOUT:-}" ] && chk "keys split: issuer key $WATCH_USER, quote key $CLAIM_USER" "[ \"\$(stat -c %U '$P/config/issuer.key')\" = $WATCH_USER ] && [ \"\$(stat -c %U '$P/config/quote.key')\" = $CLAIM_USER ]"
   [ -n "${PAYOUT:-}" ] && chk "listing quote_key matches quote.key" "python3 -c 'import json,sys;sys.path.insert(0,sys.argv[1]);import quote as Q;sys.exit(json.load(open(sys.argv[2]))[\"listing\"].get(\"quote_key\")!=Q.pub_hex(Q.load_key(sys.argv[3])))' '$P/pack' '$P/listing/listing.json' '$P/config/quote.key'"
   [ "$fails" = 0 ] && echo "health: OK" || echo "health: $fails check(s) failed"
   return "$fails"
@@ -241,7 +242,7 @@ MAINNET=0; for c in $CHAIN_IDS; do case $c in 42161|8453) MAINNET=1;; esac; done
 [[ "$MAX_HOURS" =~ ^[1-9][0-9]{0,2}$ ]] || die "bad --max-hours (whole hours, 1..999)"
 [[ "$PRICE" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --price-per-hour-usdc"
 MIN_RATE=$(python3 -c "from decimal import Decimal as D;import sys;print(int(D(sys.argv[1])*1000000))" "$PRICE")
-[ "$MIN_RATE" -gt 0 ] || die "--price-per-hour-usdc must be > 0"
+[ "$MIN_RATE" -ge 10000 ] || die "--price-per-hour-usdc must be at least 0.01"
 [[ "$CAP_USDC" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --cap-usdc"
 RPC_ARGS=""
 for r in "${RPCS[@]}"; do
@@ -295,7 +296,7 @@ fi
 [ "$MODE" = binary ] && { [ -f "$BINARY" ] || die "--binary $BINARY not found"; }
 
 [ "$DRY" = 1 ] && { mkdir -p "$R"; : > "$R/commands.log"; }
-mkdir -p "$P/bin" "$P/config" "$P/run" "$P/data" "$P/claims" "$P/logs" "$P/pack" "$P/listing" "$R/etc/systemd/system" \
+mkdir -p "$P/bin" "$P/config" "$P/run" "$P/watch" "$P/data" "$P/claims" "$P/logs" "$P/pack" "$P/listing" "$R/etc/systemd/system" \
   "$R/etc/sysctl.d" "$R/usr/local/sbin"
 
 # ----------------------------------------------------------------- packages
@@ -322,15 +323,23 @@ else
 fi
 
 # ----------------------------------------------------------------- users
-say "service users: $EXIT_USER (router), $WATCH_USER (watcher), group $GROUP"
+# The claim desk (network-facing) runs as its own user: it holds the quote key but can't read the
+# admission issuer key or the watcher's record of used payments. It shares only the claims dir
+# with the watcher, through the $CLAIMS_GROUP group.
+say "service users: $EXIT_USER (router), $WATCH_USER (watcher), $CLAIM_USER (claim desk), group $GROUP"
 if [ "$DRY" = 1 ]; then
   run groupadd --system "$GROUP"
+  run groupadd --system "$CLAIMS_GROUP"
   run useradd --system --no-create-home --home-dir "$PREFIX/data" --shell /usr/sbin/nologin -G "$GROUP" "$EXIT_USER"
-  run useradd --system --no-create-home --home-dir "$PREFIX/run" --shell /usr/sbin/nologin -G "$GROUP" "$WATCH_USER"
+  run useradd --system --no-create-home --home-dir "$PREFIX/run" --shell /usr/sbin/nologin -G "$GROUP,$CLAIMS_GROUP" "$WATCH_USER"
+  run useradd --system --no-create-home --home-dir "$PREFIX/claims" --shell /usr/sbin/nologin -G "$GROUP,$CLAIMS_GROUP" "$CLAIM_USER"
 else
   getent group "$GROUP" >/dev/null || groupadd --system "$GROUP"
+  getent group "$CLAIMS_GROUP" >/dev/null || groupadd --system "$CLAIMS_GROUP"
   id "$EXIT_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$PREFIX/data" --shell /usr/sbin/nologin -G "$GROUP" "$EXIT_USER"
-  id "$WATCH_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$PREFIX/run" --shell /usr/sbin/nologin -G "$GROUP" "$WATCH_USER"
+  id "$WATCH_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$PREFIX/run" --shell /usr/sbin/nologin -G "$GROUP,$CLAIMS_GROUP" "$WATCH_USER"
+  id -nG "$WATCH_USER" | grep -qw "$CLAIMS_GROUP" || usermod -aG "$CLAIMS_GROUP" "$WATCH_USER"   # upgrades
+  id "$CLAIM_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir "$PREFIX/claims" --shell /usr/sbin/nologin -G "$GROUP,$CLAIMS_GROUP" "$CLAIM_USER"
 fi
 
 # ----------------------------------------------------------------- binary
@@ -544,11 +553,21 @@ run chmod 750 "$PREFIX" "$PREFIX/config"
 run chown "$EXIT_USER":"$EXIT_USER" "$PREFIX/config/exit.key" "$PREFIX/config/claim.key"
 mkdir -p "$P/data/submit"; run chown -R "$EXIT_USER":"$EXIT_USER" "$PREFIX/data"  # -R: re-runs keep router state writable
 run chmod 700 "$PREFIX/data"
-run chown "$WATCH_USER":"$WATCH_USER" "$PREFIX/config/issuer.key" "$PREFIX/config/quote.key"
-run chown -R "$WATCH_USER":"$GROUP" "$PREFIX/run" "$PREFIX/claims" "$PREFIX/logs"
+run chown "$WATCH_USER":"$WATCH_USER" "$PREFIX/config/issuer.key"
+run chown "$CLAIM_USER":"$CLAIM_USER" "$PREFIX/config/quote.key"
+# used payments: the watcher's alone (moved out of the shared claims dir on upgrade)
+if [ -f "$P/claims/watcher-state.json" ] && [ ! -f "$P/watch/watcher-state.json" ]; then
+  run mv "$PREFIX/claims/watcher-state.json" "$PREFIX/watch/watcher-state.json"
+fi
+run chown -R "$WATCH_USER":"$WATCH_USER" "$PREFIX/watch"
+run chmod 700 "$PREFIX/watch"
+run chown -R "$WATCH_USER":"$GROUP" "$PREFIX/run" "$PREFIX/logs"
+run chown -R "$CLAIM_USER":"$CLAIMS_GROUP" "$PREFIX/claims"
+run chmod -R u=rwX,g=rwX,o= "$PREFIX/claims"
+run find "$PREFIX/claims" -type d -exec chmod g+s {} +
 run chown -R "$EXIT_USER":"$GROUP" "$PREFIX/listing"
 run chmod 755 "$PREFIX/listing"
-run chmod 750 "$PREFIX/run" "$PREFIX/claims" "$PREFIX/logs"
+run chmod 750 "$PREFIX/run" "$PREFIX/logs"
 run chmod 640 "$PREFIX/config/exit.ini" "$PREFIX/config/seller-policy.json"
 
 # ----------------------------------------------------------------- listing
@@ -729,20 +748,22 @@ Wants=network-online.target
 Type=simple
 User=$WATCH_USER
 Group=$GROUP
+SupplementaryGroups=$CLAIMS_GROUP
 EnvironmentFile=$PREFIX/config/watcher.env
 Environment=PATH=$PREFIX/bin:/usr/bin:/bin
 Environment=HOME=$PREFIX/run
 ExecStart=/usr/bin/python3 $PREFIX/pack/watcher.py --dir $PREFIX/claims --seller \${SELLER_SESH} \\
-  --issuer-key $PREFIX/config/issuer.key --store $PREFIX/run/admissions.json \$CHAIN_FLAGS
+  --issuer-key $PREFIX/config/issuer.key --store $PREFIX/run/admissions.json \\
+  --state $PREFIX/watch/watcher-state.json \$CHAIN_FLAGS
 Restart=on-failure
 RestartSec=10
-UMask=0027
+UMask=0007
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateDevices=yes
 ProtectSystem=strict
-ReadWritePaths=$PREFIX/run $PREFIX/claims $PREFIX/logs
+ReadWritePaths=$PREFIX/run $PREFIX/watch $PREFIX/claims $PREFIX/logs
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
@@ -800,20 +821,22 @@ Requires=srnet-seller-submit.service
 
 [Service]
 Type=simple
-User=$WATCH_USER
-Group=$GROUP
+User=$CLAIM_USER
+Group=$CLAIMS_GROUP
+SupplementaryGroups=$GROUP
 EnvironmentFile=$PREFIX/config/watcher.env
 ExecStart=/usr/bin/python3 $PREFIX/pack/claimd.py --host $CLAIM_ADDR --port 80 --dir $PREFIX/claims \
   --quote-key $PREFIX/config/quote.key --listing $PREFIX/listing/listing.json --cap-usdc \${CAP_USDC} $TESTNET_FLAG
 Restart=always
 RestartSec=5
-UMask=0027
+UMask=0007
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ReadWritePaths=$PREFIX/claims
+InaccessiblePaths=$PREFIX/config/issuer.key $PREFIX/run $PREFIX/watch
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

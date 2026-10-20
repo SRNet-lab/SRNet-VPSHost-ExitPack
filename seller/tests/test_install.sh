@@ -25,6 +25,9 @@ done
 grep -rqi "0x7E0d01B7dd916BdAB96B0971ab92D160E1664431" "$T/r1d" && fail "old contract still referenced"; ok
 # 3. payout must be an address, never a key
 "$I" --binary "$T/fakebin" --payout 0x$(printf 'ab%.0s' {1..32}) --dry-run --root "$T/r1c" >/dev/null 2>&1 && fail "64-hex payout accepted"; ok
+# 3b. prices under one cent an hour are refused
+out=$("$I" --binary "$T/fakebin" --payout $PAY --price-per-hour-usdc 0.009 --dry-run --root "$T/r1p" 2>&1) && fail "0.009 accepted"
+echo "$out" | grep -q "at least 0.01" || fail "min price message"; ok
 # 4. default: exit OFF, empty whitelist, keys+policy+listing, no DNS, no NAT
 "$I" --binary "$T/fakebin" --dry-run --root "$T/r2" --price-per-hour-usdc 1.50 --payout $PAY >/dev/null 2>&1
 INI="$T/r2/$U/config/exit.ini"
@@ -99,7 +102,13 @@ CS=$(python3 -c "import sys;sys.path.insert(0,'$HERE');import listing as L;print
 python3 -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['listing']['claim_url']=='http://$CS/claim'" "$T/r2/$U/listing/listing.json" || fail "listing claim_url"
 python3 "$T/r2/$U/pack/listing.py" verify "$T/r2/$U/listing/listing.json" >/dev/null || fail "listing with claim_url verifies"
 grep -q -- '--host fd2e:7365:736a::1 --port 80' "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd bind"
-grep -qx 'User=srnet-watch' "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd user"
+grep -qx 'User=srnet-claim' "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd user"
+grep -qx "InaccessiblePaths=/$U/config/issuer.key /$U/run /$U/watch" "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd can't see the issuer key"
+grep -qx 'SupplementaryGroups=srnet-claims' "$T/r2/etc/systemd/system/srnet-seller-watcher.service" || fail "watcher shares claims group"
+grep -q -- "--state /$U/watch/watcher-state.json" "$T/r2/etc/systemd/system/srnet-seller-watcher.service" || fail "watcher state outside claims"
+grep -q 'useradd .*srnet-claim$' "$T/r2/commands.log" || fail "claim user created"
+grep -q "chown srnet-claim:srnet-claim /$U/config/quote.key" "$T/r2/commands.log" || fail "quote key owner"
+grep -q "chown srnet-watch:srnet-watch /$U/config/issuer.key" "$T/r2/commands.log" || fail "issuer key owner"
 grep -q 'ufw allow in on sr-tun-submit to fd2e:7365:736a::1 port 80 proto tcp' "$T/r2/commands.log" || fail "claim ufw rule"
 [ -x "$T/r2/$U/pack/claimd.py" ] || fail "claimd installed"
 grep -q 'chown -R srnet-exit:srnet-exit /opt/srnet-seller/data$' "$T/r2/commands.log" || fail "router data not chowned recursively"
