@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import shutil
 import sys
-from pathlib import Path
 
 
 class ExitsAddon:
@@ -27,7 +26,7 @@ class ExitsAddon:
         return cmds
 
     def doctor(self, st, line) -> None:
-        from . import config, killswitch, pay, tunneldns, watch
+        from . import config, killswitch, pay, tunneldns
         import chains as C
         import evm
         cfg = config.load(st.root)

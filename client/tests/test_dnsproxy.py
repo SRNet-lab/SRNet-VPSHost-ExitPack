@@ -1,10 +1,8 @@
 import socket
 import struct
-import sys
 import threading
 import time
 import unittest
-from pathlib import Path
 
 import helpers  # noqa: E402,F401
 from srnet_exits import dnsproxy as P  # noqa: E402

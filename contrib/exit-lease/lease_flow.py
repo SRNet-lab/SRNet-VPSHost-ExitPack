@@ -23,7 +23,7 @@ class Backend(Protocol):
     def wait_capable(self, seller: str, timeout_s: float) -> bool: ...
     def unmap_exit(self, seller: str) -> None: ...
     def commit(self, hold_id: str) -> None: ...          # spend/settle
-    def release(self, hold_id: str) -> None: ...         # stop renewing (no refund exists)
+    def release(self, hold_id: str) -> None: ...         # release the hold (no refund exists)
 
 
 @dataclass
@@ -72,6 +72,6 @@ def connect(b: Backend, seller: str, capable_timeout_s: float = 60.0) -> Connect
         b.commit(hold)
         steps.append("commit")
     except Exception as e:
-        # Mapped but commit failed: tear down and stop renewing.
+        # Mapped but commit failed: tear down and release the hold.
         return fail(f"commit_failed:{e}")
     return ConnectResult(True, hold, "connected", steps)

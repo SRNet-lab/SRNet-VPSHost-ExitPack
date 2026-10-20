@@ -5,7 +5,8 @@ config.json (shared with the SRNet client) may hold, all optional:
             "chain": "base",                     preferred chain when a seller takes several
             "rpc": {"8453": "https://..."},      your own RPC per chain (default: public RPCs)
             "testnets": false}                   allow test chains (testing only)
-  board_urls, board_pin, sesh_dns, omq, tun, wan_if, overlay_udp_port, bootstrap_ips, listings_path
+  board_urls, board_pin, sesh_dns, omq, tun, wan_if, overlay_udp_port, bootstrap_ips, listings_path,
+  client_sesh (your own .sesh address, if Session Router can't be asked for it)
 """
 from __future__ import annotations
 
