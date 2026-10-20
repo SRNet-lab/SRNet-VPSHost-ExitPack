@@ -9,8 +9,9 @@ description = "SRNet Exits: buy time on SRNet exits with a direct USDC payment, 
 readme = "client/README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+# No "srnet-client" here: that name isn't on PyPI, so pip could pull someone else's package.
+# The add-on goes into the SRNet client's own environment (SRNet-Desktop install.sh --with-exits).
 dependencies = [
-    "srnet-client",
     "cryptography>=41",
     "pyzmq>=25",
     "qrcode>=7",

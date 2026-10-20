@@ -5,7 +5,6 @@ import http.client
 import io
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -220,6 +219,24 @@ class BuyCli(unittest.TestCase):
                            "--listings", "x.json"])
         self.assertEqual(rc, 1)
         self.assertIn("over your limit of 20.00", err.getvalue())
+
+
+class Packaging(unittest.TestCase):
+    def test_no_dependency_on_unregistered_names(self):
+        """pip must never fetch "srnet-client" (not ours on PyPI) for the add-on."""
+        import tomllib
+        root = Path(__file__).resolve().parents[2]
+        deps = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
+        names = [d.split(">")[0].split("=")[0].split("@")[0].split("[")[0].strip().lower() for d in deps]
+        self.assertNotIn("srnet-client", names)
+        self.assertNotIn("srnet-exits", names)
+
+    def test_srnet_exits_without_the_core_says_so(self):
+        from srnet_exits import cli
+        err = io.StringIO()
+        with mock.patch.dict("sys.modules", {"srnet": None, "srnet.state": None}), mock.patch("sys.stderr", err):
+            self.assertEqual(cli.main(["exits"]), 2)
+        self.assertIn("needs the SRNet client", err.getvalue())
 
 
 if __name__ == "__main__":
