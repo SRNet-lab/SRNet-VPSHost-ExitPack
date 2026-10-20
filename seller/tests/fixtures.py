@@ -90,7 +90,7 @@ class Seller:
         self.listing = doc["listing"]
         self.sesh = self.listing["seller"]
         self.listing_path = self.d / "listing.json"
-        self.listing_path.write_text(json.dumps(doc))
+        L.write(self.listing_path, doc)
         self._extra = dict(max_hours=max_hours, chains=sorted(chains), **extra)
 
     def relist(self, price: str) -> None:
@@ -101,7 +101,7 @@ class Seller:
                      quote_key=Q.pub_hex(Q.load_key(self.quote_key)), claim_url=CLAIM, country="US",
                      policy=["tcp/443"], **e)
         self.listing_doc, self.listing = doc, doc["listing"]
-        self.listing_path.write_text(json.dumps(doc))
+        L.write(self.listing_path, doc)
 
 
 def buyer_key():

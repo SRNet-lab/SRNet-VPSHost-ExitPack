@@ -246,9 +246,13 @@ class Desk:
         return hashlib.sha256(f"{self.salt}|{src}".encode()).hexdigest()[:24]
 
     def listing(self) -> dict:
-        m = self.listing_path.stat().st_mtime
-        if not self._listing or self._listing[0] != m:
-            doc = json.loads(self.listing_path.read_text())
+        """The verified listing body. The file is small, so it is read every time and the check is
+        cached on its sha256, like the watcher does: a same-size rewrite within one mtime tick (which
+        the kernel's coarse file clock makes common) is still seen at once."""
+        raw = self.listing_path.read_bytes()
+        h = hashlib.sha256(raw).digest()
+        if not self._listing or self._listing[0] != h:
+            doc = json.loads(raw)
             if not L.verify(doc):
                 raise RuntimeError("listing signature is invalid")
             body = doc["listing"]
@@ -257,7 +261,7 @@ class Desk:
                 raise RuntimeError(f"listing can't take payments: {why}")
             if body["quote_key"] != Q.pub_hex(self.key):
                 raise RuntimeError("listing quote_key does not match --quote-key")
-            self._listing = (m, body)
+            self._listing = (h, body)
         return self._listing[1]
 
     def load_quote(self, qid: str) -> dict | None:

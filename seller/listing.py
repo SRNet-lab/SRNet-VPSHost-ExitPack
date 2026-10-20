@@ -281,6 +281,26 @@ REFRESH_INTERVAL_S = 3600
 SUBMIT_TIMEOUT_S = 30
 
 
+def write(path: str | Path, doc: dict) -> None:
+    """Write a listing file atomically (temp file in the same dir, then os.replace), mode 0644, so
+    claimd and the watcher never read a half-written one."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".listing-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(doc, indent=1) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def refresh(key: Ed25519PrivateKey, path: str | Path) -> dict:
     """Re-sign the listing at `path` with a fresh 'issued' time; the offer itself is unchanged."""
     path = Path(path)
@@ -298,11 +318,7 @@ def refresh(key: Ed25519PrivateKey, path: str | Path) -> dict:
     doc = make(key, **fields)
     if not verify(doc):
         raise ValueError("refreshed listing failed to verify")
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".listing-")
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(doc, indent=1) + "\n")
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    write(path, doc)
     return doc
 
 
@@ -443,11 +459,7 @@ def main(argv=None) -> int:
             dest = Path(a.replace)
             if dest.exists():
                 retire(dest)
-            fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".listing-")
-            with os.fdopen(fd, "w") as f:
-                f.write(json.dumps(doc, indent=1) + "\n")
-            os.chmod(tmp, 0o644)
-            os.replace(tmp, dest)
+            write(dest, doc)
             print(f"wrote {dest}")
             return 0
         print(json.dumps(doc, indent=1))

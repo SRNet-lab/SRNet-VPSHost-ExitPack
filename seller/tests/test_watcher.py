@@ -322,6 +322,18 @@ class WatcherTest(unittest.TestCase):
         self.pay(q, 1)
         self.assertIn("not signed", self.report(q, 1)[0][2])
 
+    def test_desk_sees_a_same_size_rewrite_in_the_same_mtime_tick(self):
+        q_old = self.quote(hours=1)             # at 1.00; the desk has cached this listing
+        st = self.s.listing_path.stat()
+        self.s.relist("2.00")
+        new = self.s.listing_path.read_bytes()
+        L.write(self.s.listing_path, self.s.listing_doc)
+        os.utime(self.s.listing_path, ns=(st.st_atime_ns, st.st_mtime_ns))   # what a coarse clock gives
+        self.assertEqual(self.s.listing_path.read_bytes(), new)
+        self.assertGreater(self.quote(hours=1)["amount"], 2_000_000)
+        self.assertLess(q_old["amount"], 2_000_000)
+        self.assertEqual([p.name for p in self.s.listing_path.parent.glob(".listing-*")], [])
+
     def test_listing_change_keeps_earlier_quotes_payable(self):
         q_old = self.quote(hours=1)             # at 1.00
         self.clock.t += 60
