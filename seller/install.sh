@@ -301,7 +301,7 @@ fi
 [ "$MODE" = binary ] && { [ -f "$BINARY" ] || die "--binary $BINARY not found"; }
 
 [ "$DRY" = 1 ] && { mkdir -p "$R"; : > "$R/commands.log"; }
-mkdir -p "$P/bin" "$P/config" "$P/run" "$P/watch" "$P/data" "$P/claims" "$P/logs" "$P/pack" "$P/listing" "$R/etc/systemd/system" \
+mkdir -p "$P/bin" "$P/config" "$P/run" "$P/watch" "$P/watch/admit" "$P/data" "$P/claims" "$P/logs" "$P/pack" "$P/listing" "$R/etc/systemd/system" \
   "$R/etc/sysctl.d" "$R/usr/local/sbin"
 
 # ----------------------------------------------------------------- packages
@@ -567,8 +567,8 @@ run chown "$CLAIM_USER":"$CLAIM_USER" "$PREFIX/config/quote.key"
 if [ -f "$P/claims/watcher-state.json" ] && [ ! -f "$P/watch/watcher-state.json" ]; then
   run mv "$PREFIX/claims/watcher-state.json" "$PREFIX/watch/watcher-state.json"
 fi
-run chown -R "$WATCH_USER":"$WATCH_USER" "$PREFIX/watch"
-run chmod 700 "$PREFIX/watch"
+run chown -R "$WATCH_USER":"$WATCH_USER" "$PREFIX/watch"   # watch/admit too: `srnet-seller admit` writes there
+run chmod 700 "$PREFIX/watch" "$PREFIX/watch/admit"
 run chown -R "$WATCH_USER":"$GROUP" "$PREFIX/run" "$PREFIX/logs"
 run chown -R "$CLAIM_USER":"$CLAIMS_GROUP" "$PREFIX/claims"
 run chmod -R u=rwX,g=rwX,o= "$PREFIX/claims"

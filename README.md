@@ -28,9 +28,9 @@ Building the router from source takes 20 to 60 minutes.
    contract, and an exact amount (the hourly price times N plus a few millionths of a USDC as a
    payment ID, so no two quotes in 7 days share an amount). The payment ID is usually under one
    cent. When many quotes are out it can grow, but never past 0.05 USDC or 5% of the price,
-   whichever is larger, and never past half the price. The payment screen shows it. The quote is bound to the buyer's
-   `.sesh` address and expires after about 15 minutes. One payment is capped at
-   20 USDC by default, and the price is at least 0.10 USDC an hour.
+   whichever is larger, and never past half the price. The payment screen shows it. The
+   quote is bound to the buyer's `.sesh` address and expires after about 15 minutes. One
+   payment is capped at 20 USDC by default, and the price is at least 0.10 USDC an hour.
 3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
 4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
    The seller's watcher checks that transaction on chain itself (read-only) and admits the
@@ -184,10 +184,13 @@ keeps the last few listings, with the time each was replaced, in `listing/previo
 quotes made just before the change still count. If a paid quote matches no listing the
 watcher knows (say the price was changed some other way), the buyer is not refused: the
 payment is checked on chain, the buyer sees "the seller has to confirm it", and the
-watcher's log names the quote. `srnet-seller held` lists those quotes and
-`srnet-seller admit <quote id>` admits one after the watcher checks the payment again. A
-quote that pays another address, uses another token or isn't signed by the quote key is
-still refused.
+watcher's log names the quote. `srnet-seller held` lists those quotes with the amount,
+hours, price per hour, chain and age, and `srnet-seller admit <quote id>` admits one after
+the watcher checks the payment again. Answer held quotes within 8 days of the quote: after
+that the watcher refuses them as too old. Only quotes our own listings could have made are
+held (at least the 0.10 minimum price, no more hours than the largest max hours). A quote
+that pays another address, uses another token or isn't signed by the quote key is still
+refused.
 
 Limits per connection and overall (requests a minute, quotes an hour, open quotes, 3
 transaction hashes per quote, 10 second socket timeouts) keep one requester from wearing the

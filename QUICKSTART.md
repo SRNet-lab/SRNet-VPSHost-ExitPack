@@ -98,7 +98,7 @@ To change the price, re-run the installer with the new `--price-per-hour-usdc` (
 other flags you used). Don't edit `listing.json` by hand: the installer keeps the old
 listing in `listing/previous.json` so quotes made just before the change still count. If a
 paid quote ever matches no listing, the watcher holds it, logs the quote id, and waits for
-`srnet-seller admit <quote id>`.
+`srnet-seller admit <quote id>`. Answer within 8 days; after that it is refused as too old.
 
 ## Uninstall
 

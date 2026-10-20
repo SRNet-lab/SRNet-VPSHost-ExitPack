@@ -222,7 +222,7 @@ class Desk:
 
     def _backfill(self) -> None:
         """New index (first start, or after a damaged one): rebuild it from the quote files and the
-        paid notices in the spool (pending, done and rejected), so reported quotes stay reported
+        paid notices in the spool (pending, held for the seller, done and rejected), so reported quotes stay reported
         and keep their tx count."""
         for f in (self.dir / "quotes").glob("*.json"):
             try:
@@ -231,7 +231,7 @@ class Desk:
                                 (q["id"], q["chainid"], int(q["amount"]), q["issued"], q["expires"], q["buyer_key"], ""))
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
                 continue
-        for sub in ("spool", "spool/done", "spool/rejected"):
+        for sub in ("spool", "spool/held", "spool/done", "spool/rejected"):
             for f in (self.dir / sub).glob("*.json"):
                 try:
                     n = json.loads(f.read_text())
@@ -290,7 +290,7 @@ class Desk:
             self.db.executemany("DELETE FROM notices WHERE qid = ?", [(q,) for q in old])
             self.db.execute("COMMIT")
         cut = time.time() - KEEP_QUOTES_S  # file times are wall-clock times
-        for sub in ("spool/done", "spool/rejected"):
+        for sub in ("spool/done", "spool/rejected", "spool/held"):   # the watcher expires held ones first
             d = self.dir / sub
             if d.is_dir():
                 for f in d.iterdir():

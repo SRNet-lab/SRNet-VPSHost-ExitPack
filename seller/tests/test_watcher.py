@@ -426,10 +426,79 @@ class WatcherTest(unittest.TestCase):
 
     def test_desk_with_the_quote_key_still_cant_admit_alone(self):
         q = self.quote(hours=1)
-        cheap = self.tamper(q, price_per_hour=1, hours=999, amount=1_000)
-        self.pay(cheap, 1)
-        self.assertEqual(self.report(cheap, 1)[0][1], "hold")
+        odd = self.tamper(q, price_per_hour=L.MIN_PRICE_UNITS, hours=168, amount=168 * L.MIN_PRICE_UNITS + 7)
+        self.pay(odd, 1)
+        with mock.patch.object(W.sys, "stderr", io.StringIO()):
+            self.assertEqual(self.report(odd, 1)[0][1], "hold")      # the seller decides
         self.assertEqual(self.admitted(), [])
+
+    def test_held_only_within_the_minimum_price_and_largest_max_hours(self):
+        self.s.relist("2.00")                                       # history: 1.00 and 2.00, both 168 h
+        for n, kw in enumerate([dict(price_per_hour=1, hours=999, amount=1_000),          # 0.000001/h
+                                dict(price_per_hour=L.MIN_PRICE_UNITS - 1, hours=1, amount=L.MIN_PRICE_UNITS),
+                                dict(price_per_hour=L.MIN_PRICE_UNITS, hours=169, amount=169 * L.MIN_PRICE_UNITS + 1)],
+                               start=1):
+            key = buyer_key()
+            q = self.tamper(self.quote(hours=1, key=key), **kw)
+            self.pay(q, n)
+            out = self.report(q, n, key=key[0])
+            self.assertEqual(out[0][1], "reject", kw)
+            self.assertIn("quote_does_not_match_listing", out[0][2])
+            self.clock.t += Q.QUOTE_TTL_S + 1
+        self.assertEqual(self.w.state["needs_seller"], {})
+
+    def hold_one(self):
+        q = self.quote(hours=2)
+        self.s.relist("2.00")
+        self.fresh_watcher()
+        self.pay(q, 1)
+        with mock.patch.object(W.sys, "stderr", io.StringIO()):
+            self.assertEqual(self.report(q, 1)[0][1], "hold")
+        return q
+
+    def test_held_list_shows_amount_hours_price_chain_and_age(self):
+        q = self.hold_one()
+        buf = io.StringIO()
+        with mock.patch.object(W.sys, "stdout", buf), mock.patch.object(W.time, "time", return_value=T0 + 2 * 86400):
+            W.main(["held", "--state", str(self.w.state_path)])
+        out = buf.getvalue()
+        for want in (q["id"], f"paid {C.fmt_usdc(q['amount'])} USDC", "for 2 h", "at 1.00 USDC/h", "Arbitrum One",
+                     "2.0 days old", "days left to admit", tx(1)):
+            self.assertIn(want, out)
+
+    def test_unanswered_held_quote_expires_after_quote_retention(self):
+        q = self.hold_one()
+        self.clock.t = q["issued"] + Q.KEEP_QUOTES_S - 60
+        self.w.tidy()
+        self.assertIn(q["id"], self.w.state["needs_seller"])
+        self.clock.t = q["issued"] + Q.KEEP_QUOTES_S + 1
+        with mock.patch.object(W.sys, "stderr", io.StringIO()):
+            self.w.tidy()
+        self.assertEqual(self.w.state["needs_seller"], {})
+        self.assertEqual(list((self.s.state / "spool" / "held").glob("*.json")), [])
+        self.assertEqual(len(list((self.s.state / "spool" / "rejected").glob("*.json"))), 1)
+        self.assertEqual(self.status(q)["status"], "rejected")
+        self.assertEqual(Q.KEEP_QUOTES_S // 86400, 8)                # the README says 8 days
+
+    def test_admit_refuses_another_user_and_survives_a_stuck_request(self):
+        q = self.hold_one()
+        with mock.patch.object(W.os, "geteuid", return_value=0), self.assertRaises(SystemExit) as e:
+            W.main(["admit", "--state", str(self.w.state_path), "--quote", q["id"]])
+        self.assertIn("watcher's user", str(e.exception))
+        self.assertFalse((self.w.admit_dir / q["id"]).exists())
+        with mock.patch.object(W.sys, "stdout", io.StringIO()):
+            W.main(["admit", "--state", str(self.w.state_path), "--quote", q["id"]])
+        err = io.StringIO()
+        real = W.Path.unlink
+        def stuck(p, *a, **kw):
+            if p.parent == self.w.admit_dir:
+                raise PermissionError(13, "denied")
+            return real(p, *a, **kw)
+        with mock.patch.object(W.Path, "unlink", stuck), mock.patch.object(W.sys, "stderr", err):
+            out = self.w.poll_spool()
+            self.assertEqual(out[0][1], "admit")                   # handled once, the watcher keeps running
+            self.assertEqual(self.w.poll_spool(), [])
+        self.assertEqual(err.getvalue().count("can't remove admit request"), 1)
 
     def test_listing_history_is_short(self):
         for i in range(W.LISTING_HISTORY + 4):

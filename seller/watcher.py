@@ -118,6 +118,7 @@ class Watcher:
         self._listing_seen: tuple | None = None
         self._listing_log: tuple[str, float] | None = None
         self.admit_dir = self.state_path.parent / "admit"
+        self._admit_seen: set[str] = set()
         self._note_listing()
 
     def _note_listing(self) -> None:
@@ -239,7 +240,11 @@ class Watcher:
             why = Q.terms_error(doc, h["terms"], self.testnets)
             if not why:
                 return None, False
-        soft = any(Q.terms_error(doc, h["terms"], self.testnets, price=False) is None for h in hist)
+        # Held for the seller only within what any of our listings could have offered: at least
+        # the minimum price, and no more hours than the largest max_hours we know of.
+        top = max((h["terms"]["max_hours"] for h in hist), default=0)
+        soft = any(Q.terms_error(doc, dict(h["terms"], max_hours=top), self.testnets, price=False,
+                                 min_price=L.MIN_PRICE_UNITS) is None for h in hist)
         return why, soft
 
     def _save(self) -> None:
@@ -386,7 +391,9 @@ class Watcher:
         held = self.dir / "spool" / "held"
         held.mkdir(exist_ok=True)
         f.replace(held / f.name)
-        self.state.setdefault("needs_seller", {})[qid] = {"tx": notice["tx"], "why": why, "at": now, "spool": f.name}
+        self.state.setdefault("needs_seller", {})[qid] = {
+            "tx": notice["tx"], "why": why, "at": now, "spool": f.name, "amount": q["amount"], "hours": q["hours"],
+            "price_per_hour": q["price_per_hour"], "chainid": q["chainid"], "issued": q["issued"]}
         self._save()
         self._status(qid, status="waiting", note="needs_seller", tx=notice["tx"])
         print(f"watcher: quote {qid} was paid ({C.fmt_usdc(q['amount'])} USDC for {q['hours']} h at "
@@ -402,11 +409,18 @@ class Watcher:
         """Pick up `watcher.py admit` requests (files in admit/) for held quotes."""
         try:
             reqs = sorted(p for p in self.admit_dir.iterdir() if p.is_file())
-        except FileNotFoundError:
+        except OSError:
             return
         for p in reqs:
             qid = p.name
-            p.unlink(missing_ok=True)
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as e:   # say admit was run as root into a dir we can't clean up: act once
+                if qid in self._admit_seen:
+                    continue
+                self._admit_seen.add(qid)
+                print(f"watcher: can't remove admit request {qid} ({e.__class__.__name__}); "
+                      f"use `srnet-seller admit`, which runs as the watcher's user", file=sys.stderr, flush=True)
             h = self.state.setdefault("needs_seller", {}).get(qid) if Q.ID_RE.match(qid) else None
             if not h:
                 print(f"watcher: admit {qid}: no paid quote is waiting for you under that id", file=sys.stderr, flush=True)
@@ -428,10 +442,24 @@ class Watcher:
         gone = [s for s, c in self.state["clients"].items() if int(c["end"]) <= now]
         for s in gone:
             del self.state["clients"][s]
+        held = self.state.setdefault("needs_seller", {})
+        old = [q for q, h in held.items() if now - int(h.get("issued", h.get("at", now))) > Q.KEEP_QUOTES_S]
+        for qid in old:
+            h = held.pop(qid)
+            src, dest = self.dir / "spool" / "held" / h.get("spool", ""), self.dir / "spool" / "rejected"
+            try:
+                src.replace(dest / src.name)
+                (dest / (src.name + ".result")).write_text("quote_too_old: the seller didn't admit it in time\n")
+            except OSError:
+                pass
+            if qid not in self.state["done"]:
+                self._status(qid, status="rejected", reason="quote_too_old", tx=h.get("tx"))
+            print(f"watcher: held quote {qid} expired unanswered (older than {Q.KEEP_QUOTES_S // 86400} days)",
+                  file=sys.stderr, flush=True)
         stale = [k for k in self.state["retry"] if not (self.dir / "spool" / k).exists()]
         for k in stale:
             del self.state["retry"][k]
-        if gone or stale:
+        if gone or stale or old:
             self._save()
         return n
 
@@ -443,6 +471,20 @@ class Watcher:
         n = sum(1 for t in c["tids"] if st.revoke(t))
         self._save()
         return n
+
+
+def _held_line(qid: str, h: dict, now: int) -> str:
+    def usdc(v):
+        return f"{C.fmt_usdc(v)} USDC" if isinstance(v, int) and not isinstance(v, bool) else "?"
+    try:
+        chain = C.label(h["chainid"])
+    except Exception:  # noqa: BLE001  (old entry or unknown chain: show the id)
+        chain = str(h.get("chainid", "?"))
+    t = h.get("issued", h.get("at"))
+    age = f"{(now - int(t)) / 86400:.1f} days old" if isinstance(t, int) else "age unknown"
+    left = f", {max(0, (int(t) + Q.KEEP_QUOTES_S - now)) / 86400:.1f} days left to admit" if isinstance(t, int) else ""
+    return (f"{qid}  paid {usdc(h.get('amount'))} for {h.get('hours', '?')} h at {usdc(h.get('price_per_hour'))}/h"
+            f" on {chain}, quote {age}{left}\n    tx {h.get('tx')}  {h.get('why')}")
 
 
 def write_durable(path: Path, text: str) -> None:
@@ -488,15 +530,20 @@ def main(argv=None) -> int:
         except (OSError, ValueError):
             held = {}
         if argv[0] == "held":
+            now = int(time.time())
             for qid, h in sorted(held.items(), key=lambda kv: kv[1].get("at", 0)):
-                print(f"{qid}  tx {h.get('tx')}  {h.get('why')}")
+                print(_held_line(qid, h, now))
             if not held:
                 print("no paid quotes are waiting for you")
             return 0
         if not Q.ID_RE.match(a.quote):
             raise SystemExit("not a quote id")
         d = sp.parent / "admit"
-        d.mkdir(exist_ok=True)
+        owner = (d if d.exists() else sp.parent).stat().st_uid
+        if hasattr(os, "geteuid") and os.geteuid() != owner:
+            raise SystemExit("run this as the watcher's user (`srnet-seller admit <id>` does that), "
+                             "so the watcher can clear the request")
+        d.mkdir(mode=0o700, exist_ok=True)
         (d / a.quote).write_text("")
         note = "" if a.quote in held else " (it isn't in the held list yet; the watcher will say if it finds nothing)"
         print(f"asked the watcher to admit quote {a.quote}{note}. It re-checks the payment on chain first; "

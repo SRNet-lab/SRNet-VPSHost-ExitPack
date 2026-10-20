@@ -268,6 +268,8 @@ python3 -c "import json,sys,time;h=json.load(open(sys.argv[1]))['history'];asser
 "$I" --binary "$T/fakebin" --dry-run --root "$T/r5r" --payout $PAY --price-per-hour-usdc 3.00 >/dev/null 2>&1 || fail "re-install 2"
 python3 -c "import json,sys;h=json.load(open(sys.argv[1]))['history'];assert [x['doc']['listing']['price_per_hour_usdc'] for x in h]==['1.00','2.00']" "$T/r5r/$U/listing/previous.json" || fail "listing history"
 grep -q 'admit) \[ -n' "$T/r5r/usr/local/sbin/srnet-seller" || fail "no srnet-seller admit"
+[ -d "$T/r5r/$U/watch/admit" ] || fail "watch/admit not created"
+grep -q 'run chmod 700 "$PREFIX/watch" "$PREFIX/watch/admit"' "$I" || fail "watch/admit mode"
 grep -q 'runuser -u srnet-watch -- python3 /'"$U"'/pack/watcher.py admit --state /'"$U"'/watch/watcher-state.json' "$T/r5r/usr/local/sbin/srnet-seller" || fail "admit runs as the watcher user"
 python3 -c "import json,sys;assert json.load(open(sys.argv[1]))['listing']['price_per_hour_usdc']=='3.00'" "$T/r5r/$U/listing/listing.json" || fail "new listing"
 [ -e "$T/r5r/$U/listing/listing.json.new" ] && fail "temp listing left"

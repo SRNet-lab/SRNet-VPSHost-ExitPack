@@ -238,14 +238,16 @@ def listing_terms(body: dict) -> dict:
             "max_hours": int(body["max_hours"]), "quote_key": str(body["quote_key"])}
 
 
-def terms_error(doc, terms: dict, testnets: bool = False, price: bool = True) -> str | None:
+def terms_error(doc, terms: dict, testnets: bool = False, price: bool = True, min_price: int = 1) -> str | None:
     """None if a stored quote is one the listing with these terms could have issued: signed by
     its quote key, its payout, one of its chains, the official USDC, 1..max_hours, the listed
     price plus at most extra_cap(), and a sane lifetime. The watcher runs this on every quote
     it is asked to pay out, because quote files are written by the network-facing claim desk.
-    price=False skips the price and max_hours checks (the quote only has to add up on its own
-    price): the watcher uses that to tell a quote from an unknown older price, which the seller
-    can admit by hand, from one that pays someone else or uses the wrong key or token."""
+    price=False skips the listed-price check: the quote only has to add up on its own price,
+    which must be at least min_price, and stay within terms["max_hours"]. The watcher uses that
+    (with the minimum listing price and the largest max_hours it knows) to tell a quote from an
+    unknown older price, which the seller can admit by hand, from one that pays someone else
+    or uses the wrong key or token."""
     if not verify_quote(doc, terms["quote_key"]):
         return "not signed by the listing's quote key"
     q = doc["quote"]
@@ -260,11 +262,10 @@ def terms_error(doc, terms: dict, testnets: bool = False, price: bool = True) ->
         return "chain is not one the listing takes"
     if q["token"] != C.TOKEN or str(q["token_address"]).lower() != C.usdc(q["chainid"], testnets):
         return "token is not the official USDC on that chain"
-    top = terms["max_hours"] if price else 999
-    if not _is_int(q["hours"]) or not (1 <= q["hours"] <= top):
+    if not _is_int(q["hours"]) or not (1 <= q["hours"] <= terms["max_hours"]):
         return "hours outside the listing's 1..max_hours"
     pph = terms["price"] if price else q["price_per_hour"]
-    if not _is_int(pph) or pph < 1:
+    if not _is_int(pph) or pph < max(1, int(min_price)):
         return "amount does not match the listed price"
     base = pph * q["hours"]
     if not _is_int(q["amount"]) or q["price_per_hour"] != pph \

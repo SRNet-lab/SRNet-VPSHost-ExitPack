@@ -291,6 +291,26 @@ class DeskTest(unittest.TestCase):
         self.assertEqual(taken, {q["amount"] for q in ids})
         self.assertEqual(d2.quote(self.req(key=bk2))[0], 200)
 
+    def test_held_reports_survive_a_rebuild_and_expire_with_retention(self):
+        import os
+        _, doc = self.desk.quote(self.req())
+        q = doc["quote"]
+        held = self.s.state / "spool" / "held"
+        held.mkdir(parents=True, exist_ok=True)
+        for n in (1, 2):
+            (held / f"{q['id']}-{n}.json").write_text(json.dumps({"v": 1, "quote_id": q["id"], "tx": tx(n), "sig": "00"}))
+        self.desk.db.close()
+        for x in ("", "-wal", "-shm"):
+            (self.s.state / ("index.sqlite" + x)).unlink(missing_ok=True)
+        d2 = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)
+        self.assertEqual(d2._count("SELECT COUNT(*) FROM notices WHERE qid = ?", q["id"]), 2)   # tx count kept
+        old = held / f"{q['id']}-1.json"
+        t = old.stat().st_mtime - Q.KEEP_QUOTES_S - 60
+        os.utime(old, (t, t))
+        d2.prune()
+        self.assertFalse(old.exists())
+        self.assertTrue((held / f"{q['id']}-2.json").exists())
+
     def test_garbage_index_file_is_replaced(self):
         self.desk.db.close()
         (self.s.state / "index.sqlite").write_bytes(b"not a database at all" * 50)
