@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test in a throwaway Ubuntu 24.04 container (podman or docker; nothing on the host
 # changes). Usage:  tests/test_container.sh [PATH/TO/session-router]
-#   phase A (always): dry-run tests, dry-run install, cloud-init schema check (no network)
+#   phase A (always): dry-run tests, dry-run install, cloud-init schema check (no network), and the
+#            buyer client installed on its own by a normal user, with no SRNet client (no network)
 #   phase B (with a binary): real install under systemd with CAP_NET_ADMIN + /dev/net/tun in the
 #            container's own network namespace, health checks, listing refresh, uninstall --purge
 set -euo pipefail
@@ -48,6 +49,21 @@ if [ -f cloud-init/user-data.yaml ]; then
   cloud-init schema -c /tmp/ud.yaml
 fi
 echo "phase A: OK"'
+
+if [ -f "$ROOT/client/install.sh" ]; then
+echo "== phase A: buyer client on its own (client/install.sh, no SRNet client)"
+CIMG=localhost/srnet-exits-client-test:24.04
+cat > "$CTX/Containerfile.client" <<CF
+FROM $BASE
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends python3 python3-venv sudo \\
+      nftables iproute2 ca-certificates && rm -rf /var/lib/apt/lists/* \\
+ && python3 -m venv /opt/dl && /opt/dl/bin/pip download -q --dest /wheels pip "setuptools>=64" wheel \\
+      "cryptography>=41" "pyzmq>=25" "qrcode>=7" && rm -rf /opt/dl
+CF
+$C build --network host -q -t "$CIMG" -f "$CTX/Containerfile.client" "$CTX" >/dev/null
+$C run --rm --network none -v "$ROOT:/src:ro" "$CIMG" bash /src/client/tests/standalone_in_container.sh
+fi
 
 [ -n "$BIN" ] || { echo "no binary given: phase B skipped"; exit 0; }
 echo "== phase B: real install under systemd"
