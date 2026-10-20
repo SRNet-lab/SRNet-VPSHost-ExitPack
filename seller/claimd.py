@@ -412,7 +412,10 @@ def make_handler(desk: Desk, limiter: Limiter):
                 return self._send(404, {"error": "not found"})
             if not limiter.allow(self.client_address[0]):
                 return self._send(429, {"error": "slow down"})
-            self._send(*desk.status(m.group(1)))
+            try:
+                self._send(*desk.status(m.group(1)))
+            except sqlite3.DatabaseError as e:
+                self._db_failed(e)
 
         def do_POST(self):
             if self.path == "/claim":
@@ -438,6 +441,19 @@ def make_handler(desk: Desk, limiter: Limiter):
             except RuntimeError as e:
                 sys.stderr.write(f"claimd: {e}\n")
                 return self._send(503, {"error": "seller is not set up to take payments right now"})
+            except sqlite3.DatabaseError as e:
+                self._db_failed(e)
+
+        def _db_failed(self, e):
+            """The index broke while running (disk trouble). Exit nonzero so systemd restarts
+            the desk, which checks the index on start and rebuilds it from the files."""
+            sys.stderr.write(f"claimd: index error, exiting so the service restarts and rebuilds it: {e}\n")
+            sys.stderr.flush()
+            try:
+                self._send(503, {"error": "seller is restarting, try again in a minute"})
+            except OSError:
+                pass
+            os._exit(1)
     return H
 
 

@@ -336,6 +336,21 @@ class HttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
 
+    def test_index_error_while_running_exits_for_a_restart(self):
+        import io
+        import sqlite3
+        from unittest import mock
+        bk, _ = buyer_key()
+        exits, err = [], io.StringIO()
+        boom = mock.Mock(side_effect=sqlite3.DatabaseError("database disk image is malformed"))
+        with mock.patch.object(D.os, "_exit", side_effect=exits.append), mock.patch.object(D.sys, "stderr", err), \
+                mock.patch.object(self.desk, "quote", boom), mock.patch.object(self.desk, "status", boom):
+            code, doc = self.call("/claim/quote", Q.make_request(self.s.sesh, CLIENT, 1, 42161, bk))
+            self.assertEqual(code, 503)
+            self.assertEqual(self.call("/claim/status/" + "ab" * 8)[0], 503)
+        self.assertEqual(exits, [1, 1])
+        self.assertIn("index error, exiting", err.getvalue())
+
     def test_flow(self):
         bk, bpub = buyer_key()
         req = Q.make_request(self.s.sesh, CLIENT, 1, 42161, bk)
