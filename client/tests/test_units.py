@@ -124,6 +124,21 @@ class Inbound(unittest.TestCase):
         # old state is cleared first, so a second connect does not stack rules
         self.assertLess(c.index("-4 rule del priority 5352"), c.index("-4 rule add fwmark 0x5352 lookup 5352 priority 5352"))
 
+    def test_ip_batch_runs_one_batch_per_family_without_the_flag_in_the_lines(self):
+        from srnet_exits import inbound
+        from unittest import mock
+        calls = []
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+        with mock.patch.object(inbound.priv, "run", lambda cmd, input=None, **k: calls.append((cmd, input)) or R()):
+            inbound._ip_batch(inbound.route_cmds("eth0", [{"dst": "default", "gateway": "10.0.0.1"}],
+                                                 [{"dst": "default", "gateway": "fe80::1"}]))
+        self.assertEqual([c[0][:2] for c in calls], [["ip", "-4"], ["ip", "-6"]])
+        for _, text in calls:
+            self.assertFalse(any(l.startswith("-") for l in text.splitlines()), text)
+        self.assertIn("route replace default via 10.0.0.1 dev eth0 table 5352", calls[0][1])
+
     def test_up_refuses_without_a_wan_default_route(self):
         from srnet_exits import inbound
         from unittest import mock

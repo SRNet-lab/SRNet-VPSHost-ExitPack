@@ -63,7 +63,8 @@ def _routes(fam: str, wan: str) -> list[dict]:
 
 
 def route_cmds(wan: str, v4: list[dict], v6: list[dict]) -> list[str]:
-    """`ip -batch` lines: flush our table, copy the WAN routes into it, add the fwmark rules."""
+    """Lines for `ip -4|-6 -batch` (the family flag leads each line here; _ip_batch splits them):
+    flush our table, copy the WAN routes into it, add the fwmark rules."""
     if not _IFACE_RE.match(wan):
         raise ValueError(f"refusing wan_if={wan!r}: expected simple iface name")
     cmds = []
@@ -88,15 +89,20 @@ def route_cmds(wan: str, v4: list[dict], v6: list[dict]) -> list[str]:
 
 
 def _ip_batch(lines: list[str]) -> None:
-    # -force: keep going past "no such rule" from the cleanup lines
-    r = priv.run(["ip", "-force", "-batch", "-"], input="\n".join(lines) + "\n", check=False, what=WHAT)
-    errs = [l for l in (r.stderr or "").splitlines()
-            if l.strip() and "No such" not in l and "Command failed" not in l and "RTNETLINK answers: No such" not in l]
-    if r.returncode != 0 and errs:
-        try:
-            priv.fail(priv.argv(["ip"], True, WHAT), r, WHAT)
-        except priv.PrivError as e:
-            raise InboundError(str(e)) from None
+    """Run "-4 ..." / "-6 ..." lines, one `ip -4|-6 -force -batch -` per family (ip's batch mode
+    takes no per-line family flag). -force keeps going past "no such rule" from the cleanup lines."""
+    for fam in ("-4", "-6"):
+        batch = [l[len(fam) + 1:] for l in lines if l.startswith(fam + " ")]
+        if not batch:
+            continue
+        r = priv.run(["ip", fam, "-force", "-batch", "-"], input="\n".join(batch) + "\n", check=False, what=WHAT)
+        errs = [l for l in (r.stderr or "").splitlines()
+                if l.strip() and "No such" not in l and "Command failed" not in l and "Nothing to flush" not in l]
+        if r.returncode != 0 and errs:
+            try:
+                priv.fail(priv.argv(["ip"], True, WHAT), r, WHAT)
+            except priv.PrivError as e:
+                raise InboundError(str(e)) from None
 
 
 def up(wan: str) -> None:
@@ -111,9 +117,13 @@ def up(wan: str) -> None:
     priv.run([nft, "delete", "table", "inet", NFT_TABLE], check=False, what=WHAT)
     try:
         priv.run([nft, "-f", "-"], input=nft_script(wan), what=WHAT)
+        _ip_batch(route_cmds(wan, v4, v6))
     except priv.PrivError as e:
+        try:
+            down()
+        except priv.PrivError:
+            pass
         raise InboundError(str(e)) from None
-    _ip_batch(route_cmds(wan, v4, v6))
 
 
 def down() -> None:
