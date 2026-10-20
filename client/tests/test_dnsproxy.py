@@ -70,8 +70,19 @@ class RealUpstream(unittest.TestCase):
     """The exit side over real sockets: a fake resolver on 127.0.0.1, UDP and TCP."""
 
     def test_udp_then_tcp_to_upstream(self):
-        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 0)); port = u.getsockname()[1]
-        t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(("127.0.0.1", port)); t.listen(1)
+        # UDP and TCP need the same port: let the OS pick a free TCP one, then take it for UDP,
+        # and try again if something else holds the UDP side.
+        for _ in range(50):
+            t = socket.socket(); t.bind(("127.0.0.1", 0)); port = t.getsockname()[1]
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                u.bind(("127.0.0.1", port))
+                break
+            except OSError:
+                u.close(); t.close()
+        else:
+            self.fail("no free port pair")
+        t.listen(1)
         def udp_srv():
             m, peer = u.recvfrom(512)
             u.sendto(m[:2] + b"\x83\x80" + m[4:], peer)  # truncated: client must retry over TCP
