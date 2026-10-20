@@ -28,13 +28,18 @@ def argv(cmd: list[str], interactive: bool = True, what: str = "this") -> list[s
 
 
 def run(cmd: list[str], *, input: str | None = None, interactive: bool = True, check: bool = True,
-        what: str = "this") -> subprocess.CompletedProcess:
+        what: str = "this", cwd: str | None = None) -> subprocess.CompletedProcess:
     global _told
     a = argv(cmd, interactive, what)
     if a[0] == "sudo" and "-n" not in a and not _told:
         _told = True
+        sys.stdout.flush()
         print(f"{what} needs root; sudo may ask for your password", file=sys.stderr, flush=True)
-    r = subprocess.run(a, input=input, capture_output=True, text=True)
+    if a[0] == "sudo":
+        # a password prompt goes straight to the terminal: nothing of ours may be half-written then
+        sys.stdout.flush()
+        sys.stderr.flush()
+    r = subprocess.run(a, input=input, capture_output=True, text=True, cwd=cwd)
     if check and r.returncode != 0:
         fail(a, r, what)
     return r

@@ -29,6 +29,7 @@ from . import priv
 
 LISTEN = "127.3.2.2:5053"
 WHAT = "switching system DNS to the tunnel (systemd-resolved)"
+WHAT_RESTORE = "restoring your normal system DNS (systemd-resolved)"
 
 
 class TunnelDNSError(priv.PrivError):
@@ -84,9 +85,9 @@ def _resolvectl_script(tun: str, dns: list[str], domains: list[str], default_rou
     return " && ".join(parts)
 
 
-def _root_sh(script: str) -> None:
+def _root_sh(script: str, what: str = WHAT) -> None:
     try:
-        priv.run(["/bin/sh", "-c", script], what=WHAT)
+        priv.run(["/bin/sh", "-c", script], what=what)
     except priv.PrivError as e:
         raise TunnelDNSError(str(e)) from None
 
@@ -100,7 +101,8 @@ def apply(saved: dict, listen: str = LISTEN) -> None:
 
 
 def restore(saved: dict) -> None:
-    _root_sh(_resolvectl_script(saved["tun"], saved["dns"], saved["domains"], saved["default_route"]))
+    _root_sh(_resolvectl_script(saved["tun"], saved["dns"], saved["domains"], saved["default_route"]),
+             WHAT_RESTORE)
 
 
 def tun_networks(tun: str) -> list[str]:

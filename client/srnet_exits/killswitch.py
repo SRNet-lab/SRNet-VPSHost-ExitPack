@@ -1,8 +1,9 @@
 """nftables kill switch: block clearnet egress except the overlay UDP + tunnel.
 
 When armed, only traffic via the TUN (exit path), UDP on the WAN interface
-(needed by the overlay) and replies to connections that came in on the WAN (SSH/RDP to this
-machine, see inbound.py) are allowed out. That UDP allow is broad: QUIC/WebRTC
+(needed by the overlay), IPv6 neighbor discovery and replies to connections that came in on the
+WAN (SSH/RDP to this machine, see inbound.py) are allowed out. Only this machine's own traffic is
+covered (output hook): traffic forwarded for containers or VMs is not. That UDP allow is broad: QUIC/WebRTC
 traffic can still reach the internet directly. Explicitly drops DNS (udp/tcp 53) on every path
 except the TUN so a blanket UDP allow for the overlay cannot leak queries to
 the ISP resolver. Uses the inet family so IPv4 and IPv6
@@ -108,8 +109,12 @@ class KillSwitch:
             # replies on connections that were started from outside on the WAN (SSH/RDP to this
             # machine's own IP); inbound.py marks them and routes them back out the WAN. Connections
             # this machine starts itself never carry the mark, so they cannot use this rule.
-            f'add rule {self.table} {self.name} output oifname "{wan_if}" ct mark {inbound.MARK:#x} '
-            f"ct state established,related accept",
+            f'add rule {self.table} {self.name} output oifname "{wan_if}" ct mark and {inbound.MARK:#x} == '
+            f"{inbound.MARK:#x} ct state established,related accept",
+            # IPv6 neighbor discovery (link-local only: hop limit 255). Without it the router's
+            # neighbor entry for this machine expires and inbound IPv6 SSH and the v6 overlay die.
+            f"add rule {self.table} {self.name} output meta l4proto ipv6-icmp icmpv6 type "
+            "{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } ip6 hoplimit 255 accept",
             f'add rule {self.table} {self.name} output oifname "{self.tun}" accept',
             f"add rule {self.table} {self.name} output udp dport 53 drop",
             f"add rule {self.table} {self.name} output tcp dport 53 drop",

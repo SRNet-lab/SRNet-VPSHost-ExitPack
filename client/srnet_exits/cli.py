@@ -377,8 +377,12 @@ def dns_down(st, quiet: bool = False) -> bool:
             try:
                 tunneldns.restore(rec["saved"])
                 if not quiet:
-                    print("DNS restored: " + " ".join(rec["saved"]["dns"]) + " " + " ".join(rec["saved"]["domains"])
-                          + f" default-route={'yes' if rec['saved']['default_route'] else 'no'} on {rec['saved']['tun']}")
+                    sv = rec["saved"]
+                    dns = " ".join(sv["dns"]) or "(none)"
+                    doms = " ".join(sv["domains"]) or "(none)"
+                    sys.stderr.flush()
+                    print(f"DNS restored on {sv['tun']}: servers {dns}, domains {doms}, "
+                          f"default route {'yes' if sv['default_route'] else 'no'}", flush=True)
             except tunneldns.TunnelDNSError as e:
                 ok = False
                 print(f"DNS NOT restored: {e}", file=sys.stderr)
@@ -398,11 +402,12 @@ def cmd_setup_router(args, st) -> int:
         print(f"{ini} not found: install Session Router first (README, Install, step 1), "
               "then run: srnet setup-router", file=sys.stderr)
         return 1
-    cmd = [sys.executable, "-m", "srnet_exits.routercfg", "apply", "--ini", ini]
+    # -I: no current directory or PYTHON* variables on sys.path for this root process; cwd="/"
+    cmd = [sys.executable, "-I", "-m", "srnet_exits.routercfg", "apply", "--ini", ini]
     if args.no_restart:
         cmd.append("--no-restart")
     try:
-        r = priv.run(cmd, check=False, what="setting up Session Router for exits")
+        r = priv.run(cmd, check=False, what="setting up Session Router for exits", cwd="/")
     except priv.PrivError as e:
         print(f"could not set up Session Router: {e}", file=sys.stderr)
         return 1
@@ -419,7 +424,8 @@ def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes"), privilege
     path = cfg.get("router_ini") or routercfg.DEFAULT_INI
     found = routercfg.problems(path, privileged=privileged)
     if found is None:
-        if Path(path).exists():
+        # buy (no sudo) stays quiet here: connect checks again through sudo before anything changes
+        if privileged and Path(path).exists():
             print(f"note: could not read {path} to check Session Router's settings for exits "
                   "(to check and fix it: srnet setup-router)", file=sys.stderr)
         return True
@@ -519,10 +525,12 @@ def cmd_disconnect(args, st) -> int:
     conn = st.data.get("connected") or {}
     seller = args.seller or conn.get("seller")
     dns_ok = dns_down(st)  # first, so no lookup goes out the normal link while the tunnel is still up
+    unmapped = True
     if seller:
         try:
             _rpc(args.rpc_endpoint or cfg.get("omq") or config.OMQ).unmap_exit(seller)
         except Exception as e:
+            unmapped = False
             print(f"unmap: {e}", file=sys.stderr)
     ks = killswitch.KillSwitch(tun=cfg.get("tun", killswitch.DEFAULT_TUN))
     ks_ok = dns_ok
@@ -539,12 +547,20 @@ def cmd_disconnect(args, st) -> int:
                 print(f"kill switch NOT removed: {e}", file=sys.stderr)
             else:
                 print(f"note: could not check for a leftover kill switch: {e}", file=sys.stderr)
-    # after the tunnel routes are gone: the WAN reply routing is not needed any more
+    # after the tunnel routes are gone: the WAN reply routing is not needed any more. If the unmap
+    # failed the tunnel routes may still be there, and removing it now would cut SSH/RDP.
     if not args.keep_killswitch:
-        _inbound_down()
-    st.data["connected"] = None
+        if unmapped:
+            _inbound_down()
+        else:
+            print("kept the routing that keeps SSH/RDP sessions to this machine working, because Session "
+                  "Router did not confirm the exit is unmapped (its routes may still send traffic into the "
+                  "tunnel). Run srnet disconnect again once Session Router answers; a reboot also clears it.",
+                  file=sys.stderr)
+    if unmapped:
+        st.data["connected"] = None   # else kept, so the next disconnect tries the unmap again
     st.save()
-    out = {"ok": ks_ok, "unmapped": seller}
+    out = {"ok": ks_ok, "unmapped": seller if unmapped else None}
     lease = pay.active_lease(st, seller) if seller else None
     if lease:
         out["reconnect"] = f"srnet connect {seller}  (works until {_hhmm(lease['end'])}; no new purchase)"

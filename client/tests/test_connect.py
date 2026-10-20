@@ -162,6 +162,27 @@ class InboundSessions(_Base):
             self.assertEqual(self.run_cli(home, "disconnect"), 0)
         self.assertEqual(self.inbound_calls[-1], ("down",))
 
+    def test_failed_unmap_keeps_inbound_routing_and_the_record(self):
+        home = self.home()
+        with mock.patch("sys.stdout", _io.StringIO()):
+            self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch", "--system-dns"), 0)
+
+        def unmap_fails(rpc, seller):
+            raise ConnectionError("no answer from Session Router")
+        err, out = _io.StringIO(), _io.StringIO()
+        with mock.patch.object(FakeRpc, "unmap_exit", unmap_fails), mock.patch("sys.stdout", out), \
+                mock.patch("sys.stderr", err):
+            self.run_cli(home, "disconnect")
+        self.assertNotIn(("down",), self.inbound_calls)
+        self.assertIn("kept the routing that keeps SSH/RDP", err.getvalue())
+        self.assertEqual(self.st(home)["connected"]["seller"], SELLER)
+        # next time Session Router answers: unmapped, and the inbound routing goes
+        with mock.patch("sys.stdout", _io.StringIO()):
+            self.assertEqual(self.run_cli(home, "disconnect"), 0)
+        self.assertEqual(self.inbound_calls[-1], ("down",))
+        self.assertIn(("unmap", SELLER), FakeRpc.calls)
+        self.assertIsNone(self.st(home)["connected"])
+
     def test_connect_refuses_when_inbound_routing_fails(self):
         home = self.home()
         err = _io.StringIO()
@@ -205,12 +226,13 @@ class InboundSessions(_Base):
 
             def run(cmd, **kw):
                 calls.append(cmd)
+                self.assertEqual(kw.get("cwd"), "/")
                 return sp.CompletedProcess(cmd, 0, "restarted session-router-client\n", "")
             out = _io.StringIO()
             with mock.patch.object(self.cli.priv, "run", run), mock.patch("sys.stdout", out):
                 self.assertEqual(self.run_cli(home, "setup-router", "--ini", str(ini)), 0)
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][1:], ["-m", "srnet_exits.routercfg", "apply", "--ini", str(ini)])
+            self.assertEqual(calls[0][1:], ["-I", "-m", "srnet_exits.routercfg", "apply", "--ini", str(ini)])
             self.assertIn("restarted", out.getvalue())
             err = _io.StringIO()
             with mock.patch.object(self.cli.priv, "run", run), mock.patch("sys.stderr", err):
@@ -382,7 +404,7 @@ class Helpers(unittest.TestCase):
         from srnet_exits import tunneldns
         seen = []
         with mock.patch.object(tunneldns, "resolvectl", lambda: "/usr/bin/resolvectl"), \
-             mock.patch.object(tunneldns, "_root_sh", seen.append):
+             mock.patch.object(tunneldns, "_root_sh", lambda script, what=None: seen.append(script)):
             saved = {"tun": "sr-tun0", "dns": ["127.3.2.1"], "domains": ["~sesh", "~snode"], "default_route": False}
             tunneldns.apply(saved)
             tunneldns.restore(saved)

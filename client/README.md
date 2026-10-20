@@ -96,20 +96,34 @@ On a remote machine (a VPS you reach over SSH or RDP), connecting keeps those se
 connections that come in on your normal interface are marked, and their replies go back out that
 interface (an `ip rule` on a fwmark to a small table with your normal routes). Everything the
 machine starts itself, DNS included, still goes only through the tunnel. `disconnect` removes
-this again, and none of it (kill switch, routes, rules) survives a reboot.
+this again, and none of it (kill switch, routes, rules) survives a reboot. Only one bit of the
+packet/connection mark is used, and the rule priority and table are the first free pair from 5352,
+so wg-quick, Tailscale or your own policy routing keep working. With a strict `rp_filter` (RHEL and
+CIS images) inbound packets are checked against your normal routes (`src_valid_mark=1` while
+connected, the old value comes back at disconnect).
+
+- Containers: published ports (Docker and the like) keep answering on your normal interface while
+  connected, but the kill switch covers only this machine's own traffic, not traffic that
+  containers or VMs start themselves.
+- UDP servers bound to all addresses (0.0.0.0, e.g. mosh) answer from the tunnel address, so
+  their replies go into the tunnel and the client never gets them; TCP services such as SSH and
+  RDP are not affected. Bind such a server to your public IP, or disconnect while you need it.
 
 Session Router needs two client settings for exits: a persistent key (`keyfile=`; paid time
 belongs to your `.sesh` address, which otherwise changes at every restart) and
 `blackhole-routes=false` (otherwise the router blackholes all traffic while an exit is mapped).
 `srnet setup-router` sets both (one sudo prompt; keeps the rest of `client.ini`, keeps a copy of the
 original as `client.ini.srnet-orig`, restarts the router, changes nothing when already set), and
-the desktop's `install.sh --with-exits` runs it. `srnet buy` / `srnet connect` refuse until they
-are set; `srnet doctor` points at `srnet setup-router`.
+the desktop's `install.sh --with-exits` runs it. It also leaves `srnet-exits.ok` next to
+`client.ini` (world-readable: the settings plus client.ini's size, time and hash), so `srnet doctor`
+can show them without root. `srnet buy` / `srnet connect` refuse until they are set; `srnet doctor`
+points at `srnet setup-router`.
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -s client/tests -t client/tests
+client/tests/lab/run.sh     # the real nft/ip rules in network namespaces (needs nft + user namespaces)
 ```
 
 The tests find the SRNet client in the same environment, in `$SRNET_CLIENT_DIR`, or in a

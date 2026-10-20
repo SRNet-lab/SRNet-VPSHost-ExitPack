@@ -7,7 +7,7 @@
   let sh = null, root = null, polls = {}, statusTimer = null;
   const call = (c, body) => sh.api("addon/" + NAME + "/" + c, body || {});
   const el = (t, txt, cls) => { const e = sh.el(t, txt); if (cls) e.className = cls; return e; };
-  const hhmm = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  const hhmm = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", timeZoneName: "short"});
   const left = (s) => s >= 3600 ? Math.floor(s / 3600) + " h " + String(Math.floor((s % 3600) / 60)).padStart(2, "0") + " min" : Math.max(0, Math.floor(s / 60)) + " min";
   const ago = (s) => s < 3600 ? Math.floor(s / 60) + "m ago" : Math.floor(s / 3600) + "h" + String(Math.floor((s % 3600) / 60)).padStart(2, "0") + "m ago";
   const q = (id) => root.querySelector("[data-x='" + id + "']");

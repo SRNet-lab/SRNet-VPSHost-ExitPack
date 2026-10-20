@@ -92,7 +92,7 @@ class KillSwitch(unittest.TestCase):
         rules = [l for l in scripts[0].splitlines() if "established" in l]
         self.assertEqual(len(rules), 1, rules)
         self.assertIn('oifname "eth0"', rules[0])
-        self.assertIn(f"ct mark {inbound.MARK:#x}", rules[0])
+        self.assertIn(f"ct mark and {inbound.MARK:#x} == {inbound.MARK:#x}", rules[0])
         # it comes before the DNS drop, the overlay UDP allow and the policy drop does the rest
         lines = scripts[0].splitlines()
         self.assertLess(lines.index(rules[0]), next(i for i, l in enumerate(lines) if "dport 53 drop" in l))
@@ -212,7 +212,7 @@ class SetupRouter(unittest.TestCase):
         from srnet_exits import routercfg
         with tempfile.TemporaryDirectory() as d:
             ini = Path(d) / "client.ini"; ini.write_text(STOCK_INI); os.chmod(ini, 0o640)
-            key = Path(d) / "client" / "client.key"
+            key = Path(d) / "client" / "client.key"; key.parent.mkdir()
             calls = []
 
             def run(cmd, **kw):
@@ -222,8 +222,10 @@ class SetupRouter(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             log = []
             self.assertEqual(routercfg.apply(ini, str(key), run=run, log=log.append), 0)
-            self.assertEqual(calls, [["session-router-config", "-k", str(key)],
-                                     ["systemctl", "restart", "session-router-client"]])
+            self.assertEqual(calls[0][:2], ["session-router-config", "-k"])
+            self.assertNotEqual(calls[0][2], str(key), "generated in a private temp dir, not in place")
+            self.assertEqual(calls[1], ["systemctl", "restart", "session-router-client"])
+            self.assertEqual(len(calls), 2)
             self.assertEqual(stat.S_IMODE(ini.stat().st_mode), 0o640)
             self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
             self.assertEqual((Path(d) / "client.ini.srnet-orig").read_text(), STOCK_INI)
@@ -242,9 +244,103 @@ class SetupRouter(unittest.TestCase):
             def run(cmd, **kw):
                 raise FileNotFoundError(2, "No such file or directory", cmd[0])
             log = []
+            (Path(d) / "k").mkdir()
             self.assertEqual(routercfg.apply(ini, str(Path(d) / "k" / "client.key"), run=run, log=log.append), 1)
             self.assertIn("session-router-client package", log[0])
             self.assertEqual(ini.read_text(), STOCK_INI, "client.ini untouched when the key can't be made")
+
+    def _fake_run(self, calls):
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[0] == "session-router-config":
+                Path(cmd[2]).write_bytes(b"k" * 64)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return run
+
+    def test_apply_refuses_a_symlinked_key_and_never_writes_through_it(self):
+        import tempfile
+        from srnet_exits import routercfg
+        with tempfile.TemporaryDirectory() as d:
+            ini = Path(d) / "client.ini"; ini.write_text(STOCK_INI)
+            kd = Path(d) / "client"; kd.mkdir()
+            target = Path(d) / "profile.sh"
+            (kd / "client.key").symlink_to(target)          # dangling link planted by the router user
+            log, calls = [], []
+            self.assertEqual(routercfg.apply(ini, str(kd / "client.key"), run=self._fake_run(calls),
+                                             log=log.append), 1)
+            self.assertIn("symbolic link", log[0])
+            self.assertFalse(target.exists())
+            self.assertEqual(ini.read_text(), STOCK_INI)
+
+    def test_make_key_never_follows_a_link_that_appears_meanwhile(self):
+        import tempfile
+        from srnet_exits import routercfg
+        with tempfile.TemporaryDirectory() as d:
+            kd = Path(d) / "client"; kd.mkdir()
+            target = Path(d) / "evil"
+
+            def run(cmd, **kw):   # the race: the link shows up while the key is being generated
+                Path(cmd[2]).write_bytes(b"k")
+                (kd / "client.key").symlink_to(target)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            err = routercfg.make_key(kd / "client.key", run)
+            self.assertIn("not touching it", err)
+            self.assertFalse(target.exists())
+
+    def test_marker_lets_an_unprivileged_check_pass_until_client_ini_changes(self):
+        import tempfile, time as _t
+        from srnet_exits import routercfg
+        with tempfile.TemporaryDirectory() as d:
+            ini = Path(d) / "client.ini"; ini.write_text(STOCK_INI)
+            kd = Path(d) / "client"; kd.mkdir()
+            self.assertEqual(routercfg.apply(ini, str(kd / "client.key"), restart=False,
+                                             run=self._fake_run([]), log=lambda m: None), 0)
+            marker = Path(d) / routercfg.MARKER
+            self.assertEqual(oct(marker.stat().st_mode & 0o777), "0o644")
+            with mock.patch.object(Path, "read_text", self._deny_ini(Path.read_text, ini)):
+                r = routercfg.read(ini)
+                self.assertEqual(r["source"], "marker")
+                self.assertEqual(routercfg.problems(ini), [])
+            # client.ini edited by hand later: the marker no longer counts
+            ini.write_text(STOCK_INI + "\n# edited\n")
+            os.utime(ini, ns=(_t.time_ns(), _t.time_ns() + 10**9))
+            with mock.patch.object(Path, "read_text", self._deny_ini(Path.read_text, ini)):
+                self.assertIsNone(routercfg.read(ini))
+            # an older setup without a marker gets one from a re-run, with no restart
+            ini.write_text(routercfg.edit_text(STOCK_INI, str(kd / "client.key"))[0]); marker.unlink()
+            calls, log = [], []
+            self.assertEqual(routercfg.apply(ini, str(kd / "client.key"), run=self._fake_run(calls),
+                                             log=log.append), 0)
+            self.assertEqual(calls, [])
+            self.assertTrue(marker.exists())
+
+    @staticmethod
+    def _deny_ini(orig, ini):
+        def read_text(self, *a, **k):
+            if self == ini:
+                raise PermissionError(13, "Permission denied", str(self))
+            return orig(self, *a, **k)
+        return read_text
+
+    def test_check_and_edit_agree_on_odd_files(self):
+        import tempfile
+        from srnet_exits import routercfg
+        odd = ["[network]\nkeyfile=\n[logging]\nlevel=1\n[network]\nblackhole-routes=true\n",
+               "[ network ]\nBlackhole-Routes=true\n",
+               "[Network]\nKEYFILE = /k ; comment\nblackhole-routes : yes\n",
+               "[network]\nblackhole-routes=true\nblackhole-routes=on\n",
+               "netid=x\n"]
+        for text in odd:
+            new, key, changed = routercfg.edit_text(text, "/var/k")
+            self.assertTrue(changed, text)
+            v = routercfg.values(new)
+            self.assertFalse(v["blackhole_routes"], new)
+            self.assertEqual(v["keyfile"], key, new)
+            with tempfile.TemporaryDirectory() as d:
+                p = Path(d) / "client.ini"; p.write_text(new)
+                self.assertEqual(routercfg.problems(p), [], new)
+            self.assertEqual(routercfg.edit_text(new, "/var/k")[2], False, new)
+        self.assertEqual(routercfg.edit_text(odd[2], "/var/k")[1], "/k")
 
     def test_apply_without_ini_says_install_session_router(self):
         from srnet_exits import routercfg
@@ -263,28 +359,94 @@ class Inbound(unittest.TestCase):
     def test_nft_script_marks_inbound_and_fwmarks_only_replies(self):
         from srnet_exits import inbound
         s = inbound.nft_script("enp1s0")
-        self.assertIn('pre iifname "enp1s0" ct direction original ct mark set 0x5352', s)
+        m = f"{inbound.MARK:#x}"
+        self.assertIn(f'pre iifname "enp1s0" ct direction original ct mark set ct mark or {m}', s)
         self.assertIn("type route hook output", s)
-        self.assertIn("ct mark 0x5352 ct direction reply meta mark set 0x5352", s)
+        self.assertIn(f"ct mark and {m} == {m} ct direction reply meta mark set meta mark or {m}", s)
         self.assertNotIn("oifname", s)   # nothing that this machine starts gets the mark
         with self.assertRaises(ValueError):
             inbound.nft_script('eth0"; flush ruleset; "')
 
-    def test_route_cmds_copy_the_wan_routes_into_the_mark_table(self):
+    def test_only_one_mark_bit_is_ever_set(self):
         from srnet_exits import inbound
-        v4 = [{"dst": "default", "gateway": "45.77.216.1", "prefsrc": "45.77.217.74"},
+        self.assertEqual(bin(inbound.MARK).count("1"), 1)
+        s = inbound.nft_script("eth0", svm_was_0=True)
+        for line in s.splitlines():
+            if "mark set" in line:   # always "x mark set x mark or BIT", never a plain overwrite
+                self.assertRegex(line, r"(ct|meta) mark set \1 mark or 0x2000000$")
+        c = inbound.route_cmds("eth0", [{"dst": "default", "gateway": "10.0.0.1"}], [])
+        self.assertIn("-4 rule add fwmark 0x2000000/0x2000000 lookup 5352 priority 5352", c)
+
+    def test_inbound_packets_and_forwarded_replies_are_marked(self):
+        from srnet_exits import inbound
+        s = inbound.nft_script("eth0")
+        self.assertIn('pre iifname "eth0" ct mark and 0x2000000 == 0x2000000 fib daddr type local meta mark set', s)
+        self.assertIn('pre iifname != "eth0" ct direction reply ct mark and 0x2000000 == 0x2000000 meta mark set', s)
+        self.assertIn("prerouting priority -90", s)   # after DNAT
+        self.assertNotIn(inbound.SVM_CHAIN, s)
+        self.assertIn(f"add chain inet srnet_inbound {inbound.SVM_CHAIN}", inbound.nft_script("eth0", True))
+
+    def test_route_cmds_copy_the_wan_routes_with_metrics(self):
+        from srnet_exits import inbound
+        v4 = [{"dst": "default", "gateway": "45.77.216.1", "prefsrc": "45.77.217.74", "metric": 100},
+              {"dst": "default", "gateway": "45.77.216.254", "metric": 200},
               {"dst": "45.77.216.0/23", "prefsrc": "45.77.217.74"},
-              {"dst": "1.2.3.4; reboot", "gateway": "x"}]
-        v6 = [{"dst": "default", "gateway": "fe80::1"}]
-        c = inbound.route_cmds("enp1s0", v4, v6)
-        self.assertIn("-4 route replace default via 45.77.216.1 dev enp1s0 src 45.77.217.74 table 5352", c)
-        self.assertIn("-4 route replace 45.77.216.0/23 dev enp1s0 src 45.77.217.74 table 5352", c)
-        self.assertIn("-6 route replace default via fe80::1 dev enp1s0 table 5352", c)
-        self.assertIn("-4 rule add fwmark 0x5352 lookup 5352 priority 5352", c)
-        self.assertIn("-6 rule add fwmark 0x5352 lookup 5352 priority 5352", c)
+              {"dst": "1.2.3.4; reboot", "gateway": "x"},
+              {"dst": "default", "gateway": "172.31.1.1", "flags": ["onlink"]}]
+        v6 = [{"dst": "default", "gateway": "fe80::1", "metric": 1024}]
+        c = inbound.route_cmds("enp1s0", v4, v6, 5353)
+        self.assertIn("-4 route append default via 45.77.216.1 dev enp1s0 src 45.77.217.74 metric 100 table 5353", c)
+        self.assertIn("-4 route append default via 45.77.216.254 dev enp1s0 metric 200 table 5353", c)
+        self.assertIn("-4 route append 45.77.216.0/23 dev enp1s0 src 45.77.217.74 table 5353", c)
+        self.assertIn("-4 route append default via 172.31.1.1 dev enp1s0 onlink table 5353", c)
+        self.assertIn("-6 route append default via fe80::1 dev enp1s0 metric 1024 table 5353", c)
+        self.assertIn("-6 rule add fwmark 0x2000000/0x2000000 lookup 5353 priority 5353", c)
         self.assertFalse(any("reboot" in x for x in c))
-        # old state is cleared first, so a second connect does not stack rules
-        self.assertLess(c.index("-4 rule del priority 5352"), c.index("-4 rule add fwmark 0x5352 lookup 5352 priority 5352"))
+        self.assertFalse(any(" del " in x or "flush" in x for x in c), "never removes anything")
+
+    def test_pick_slot_skips_foreign_rules_and_tables(self):
+        from srnet_exits import inbound
+        free = lambda n: False
+        self.assertEqual(inbound.pick_slot([], [], free), 5352)
+        user = [{"priority": 5352, "fwmark": "0x1", "table": "5352"}]
+        self.assertEqual(inbound.pick_slot(user, [], free), 5353)
+        self.assertEqual(inbound.pick_slot([], [{"priority": 100, "table": "5352"}], free), 5353)
+        self.assertEqual(inbound.pick_slot([], [], lambda n: n in (5352, 5353)), 5354)
+        self.assertIsNone(inbound.pick_slot([], [], lambda n: True))
+
+    def test_our_rules_are_only_the_masked_mark(self):
+        from srnet_exits import inbound
+        rules = [{"priority": 5352, "fwmark": "0x1", "table": "5352"},
+                 {"priority": 5353, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "5353"},
+                 {"priority": 5354, "fwmark": "0x2000000", "table": "5354"},
+                 {"priority": 0, "table": "local"}]
+        self.assertEqual(inbound.our_rules(rules, []), [("-4", 5353, "5353")])
+
+    def test_down_removes_only_our_rule_and_restores_src_valid_mark(self):
+        from srnet_exits import inbound
+        from unittest import mock
+        calls = []
+
+        class R:
+            def __init__(self, rc=0):
+                self.returncode, self.stdout, self.stderr = rc, "", ""
+        rules = {"-4": [{"priority": 5352, "fwmark": "0x1", "table": "5352"},
+                        {"priority": 5353, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "5353"}],
+                 "-6": []}
+
+        def run(cmd, input=None, **k):
+            calls.append((cmd, input))
+            return R(0)
+        with mock.patch.object(inbound.priv, "run", run), \
+                mock.patch.object(inbound, "_ipj", lambda fam, *a: rules[fam] if a[0] == "rule" else []), \
+                mock.patch("srnet_exits.killswitch.find_nft", lambda: "/usr/sbin/nft"):
+            inbound.down()
+        flat = [" ".join(c[0]) + " | " + (c[1] or "") for c in calls]
+        self.assertTrue(any("src_valid_mark=0" in f for f in flat), flat)
+        batch = next(c[1] for c in calls if c[0][:2] == ["ip", "-4"])
+        self.assertIn("rule del priority 5353 fwmark 0x2000000/0x2000000 lookup 5353", batch)
+        self.assertIn("route flush table 5353", batch)
+        self.assertNotIn("5352", batch)
 
     def test_ip_batch_runs_one_batch_per_family_without_the_flag_in_the_lines(self):
         from srnet_exits import inbound
@@ -299,7 +461,7 @@ class Inbound(unittest.TestCase):
         self.assertEqual([c[0][:2] for c in calls], [["ip", "-4"], ["ip", "-6"]])
         for _, text in calls:
             self.assertFalse(any(l.startswith("-") for l in text.splitlines()), text)
-        self.assertIn("route replace default via 10.0.0.1 dev eth0 table 5352", calls[0][1])
+        self.assertIn("route append default via 10.0.0.1 dev eth0 table 5352", calls[0][1])
 
     def test_up_refuses_without_a_wan_default_route(self):
         from srnet_exits import inbound
@@ -337,3 +499,58 @@ class BuyNoExitDns(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Wording(unittest.TestCase):
+    def test_restore_says_restoring_not_switching(self):
+        from srnet_exits import tunneldns
+        seen = []
+        with mock.patch.object(tunneldns.priv, "run", lambda cmd, what="", **k: seen.append(what)):
+            tunneldns.restore({"tun": "sr-tun0", "dns": ["10.0.0.1"], "domains": [], "default_route": False})
+            tunneldns.apply({"tun": "sr-tun0", "dns": [], "domains": [], "default_route": False})
+        self.assertIn("restoring", seen[0])
+        self.assertNotIn("to the tunnel", seen[0])
+        self.assertIn("to the tunnel", seen[1])
+
+    def test_times_are_local_with_their_zone(self):
+        import time as _t
+        from srnet_exits import cli, reminder
+        old = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/Chicago"; _t.tzset()
+            t = 1792524780   # 2026-10-20 19:33 UTC
+            self.assertEqual(cli._hhmm(t), "14:33 CDT")
+            self.assertIn("(14:33 CDT)", reminder.message("x" * 52, t, t - 600))
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            _t.tzset()
+
+
+class RootHelperIsolation(unittest.TestCase):
+    def test_python_I_ignores_a_module_planted_in_the_current_directory(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d) / "srnet_exits"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("print('HIJACKED')\n")
+            (pkg / "routercfg.py").write_text("print('HIJACKED')\n")
+            plain = subprocess.run([sys.executable, "-m", "srnet_exits.routercfg"], cwd=d,
+                                   capture_output=True, text=True)
+            self.assertIn("HIJACKED", plain.stdout, "control: without -I the cwd module runs")
+            iso = subprocess.run([sys.executable, "-I", "-m", "srnet_exits.routercfg"], cwd=d,
+                                 capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=d))
+            self.assertNotIn("HIJACKED", iso.stdout + iso.stderr)
+
+
+class NetnsLab(unittest.TestCase):
+    """tests/lab/run.sh: the real nft/ip rules in network namespaces (skips without userns/nft)."""
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.environ.get("SRNET_SKIP_LAB") != "1", "Linux only")
+    def test_lab(self):
+        lab = Path(__file__).resolve().parent / "lab" / "run.sh"
+        r = subprocess.run(["bash", str(lab)], capture_output=True, text=True, timeout=600)
+        if r.stdout.startswith("SKIP"):
+            self.skipTest(r.stdout.strip())
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-1000:])

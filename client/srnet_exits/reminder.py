@@ -29,7 +29,7 @@ def _lease(home: Path, seller: str) -> dict | None:
 def message(seller: str, end: int, now: float) -> str:
     mins = max(0, int(end - now) // 60)
     return (f"Your SRNet exit time with {seller[:12]}... ends in about {mins} min "
-            f"({time.strftime('%H:%M', time.localtime(end))}). To keep going, buy more: "
+            f"({time.strftime('%H:%M %Z', time.localtime(end)).strip()}). To keep going, buy more: "
             f"srnet buy --seller {seller} --hours 1")
 
 

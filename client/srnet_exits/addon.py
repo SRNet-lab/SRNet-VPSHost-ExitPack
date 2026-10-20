@@ -47,12 +47,14 @@ class ExitsAddon:
         rc = routercfg.read(cfg.get("router_ini") or routercfg.DEFAULT_INI)
         if rc is None:
             line(None, "Session Router settings for exits",
-                 f"{routercfg.DEFAULT_INI} is readable by root only, so not checked here; to check and "
-                 "fix it: srnet setup-router (asks sudo; changes nothing if it is already set)")
+                 f"{routercfg.DEFAULT_INI} is readable by root only and srnet setup-router has not "
+                 "recorded the settings (or client.ini changed since); to check and fix it: "
+                 "srnet setup-router (asks sudo; changes nothing if it is already set)")
         else:
             probs = routercfg.problems(cfg.get("router_ini") or routercfg.DEFAULT_INI)
+            src = " (as recorded by srnet setup-router)" if rc.get("source") == "marker" else ""
             line(not probs or False, "Session Router settings for exits (persistent key, no blackhole routes)",
-                 "ok" if not probs else "; ".join(probs) + ". Fix: srnet setup-router")
+                 ("ok" + src) if not probs else "; ".join(probs) + ". Fix: srnet setup-router")
         rs = tunneldns.resolved_active()
         line(True if rs else False, "systemd-resolved (sends DNS to the exit's resolver while connected)",
              "active" if rs else "not running: srnet connect refuses, since DNS would leak outside the exit")
