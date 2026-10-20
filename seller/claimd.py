@@ -2,7 +2,7 @@
 """Claim endpoint. Buyers ask for payment quotes and report payments here, over Session Router.
 
   claimd.py --host ADDR --port 80 --dir STATE --quote-key quote.key --listing listing.json \
-            [--cap-usdc 20] [--testnets]
+            [--cap-usdc 20] [--testnets] [--debug-sources]
 
   POST /claim/quote        quote request (quote.py)          -> 200 signed quote
   POST /claim/paid         paid notice {"v":1,"quote_id","tx","sig"} -> 202, checked by the watcher
@@ -17,8 +17,10 @@ Limits, so one requester can't wear the desk down or lock other buyers out:
   - requests per source address and overall (per minute), and quotes per source and overall
     (per hour; the overall quote rate is set so the 7-day amount pool can't run out);
   - open quotes per buyer key and per source address. Neither is the .sesh address a request
-    names, so naming someone else's address can't use up their limit. The source address is
-    the Session Router session the request came in on;
+    names, so naming someone else's address can't use up their limit. Requests are signed by
+    the buyer key with the time, and a signature is taken once, so nobody can ask in another
+    buyer's name either (not even a seller who saw that buyer's earlier requests). The source
+    address is the Session Router session the request came in on;
   - at most 3 different tx hashes per quote, a bounded spool, and 10 s socket timeouts with a
     cap on connections per source and overall.
 
@@ -26,7 +28,11 @@ STATE layout (shared with watcher.py):
   quotes/<id>.json   issued quotes          spool/<id>-<tx>.json  paid notices for the watcher
   status/<id>.json   watcher results        index.sqlite          amounts, limits, notices
   Quote files and their notices and results are kept for quote.KEEP_QUOTES_S (8+ days); a paid
-  notice is taken any time until then.
+  notice is taken any time until then. The index can always be rebuilt from the files: if it is
+  missing or damaged, it is moved aside (index.sqlite.bad-<time>) and rebuilt on start.
+
+--debug-sources logs the salted source tag of each quote (never the address), to check that
+different buyers come in on different sessions. Off by default.
 
 --host must be loopback or a private address (the router's tun address); a public address is
 refused.
@@ -59,7 +65,7 @@ GLOBAL = (240, 60.0)             # requests per window overall
 MAX_SOURCES = 10000              # tracked sources in the request limiter
 QUOTES_PER_SOURCE = (10, 3600)   # new quotes per hour from one address
 QUOTES_GLOBAL = (400, 3600)      # new quotes per hour overall; 400 * 24 * 7 stays well under the amount pool
-MAX_OPEN_PER_BUYER = 3           # unexpired quotes per buyer key
+MAX_OPEN_PER_BUYER = 5           # unexpired quotes per buyer key
 MAX_OPEN_PER_SOURCE = 5          # unexpired quotes per source address
 MAX_OPEN = 2000                  # unexpired quotes overall
 MAX_TX_PER_QUOTE = 3             # different tx hashes one quote can report
@@ -72,7 +78,10 @@ SOCKET_TIMEOUT_S = 10
 MAX_CONN = 48                    # open connections overall (the unit allows 64 tasks)
 MAX_CONN_PER_SOURCE = 4
 DEFAULT_CAP_USDC = "20"
-assert QUOTES_GLOBAL[0] * (RESERVE_S + Q.MAX_QUOTE_TTL_S) / QUOTES_GLOBAL[1] < Q.POOL_BUSY * Q.PAY_ID_MAX
+REPLAY_KEEP_S = 2 * Q.REQUEST_SKEW_S + 60  # request signatures are remembered this long
+# Pool size: each (chain, purchase price) has at least quote.EXTRA_MIN amounts. At the global rate
+# that pool can fill inside the 7-day hold for one popular cheap purchase; the desk then answers
+# "busy" for that purchase until amounts free up. No payment is at risk (README, known limits).
 
 
 def bind_ok(host: str) -> bool:
@@ -150,6 +159,7 @@ CREATE INDEX IF NOT EXISTS q_buyer ON quotes (buyer_key, expires);
 CREATE INDEX IF NOT EXISTS q_src ON quotes (src, issued);
 CREATE TABLE IF NOT EXISTS notices (qid TEXT, tx TEXT, PRIMARY KEY (qid, tx));
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS requests (sig TEXT PRIMARY KEY, ts INTEGER);
 """
 
 
@@ -157,7 +167,7 @@ class Desk:
     """Issues quotes and takes paid notices. File state plus an sqlite index, so tests drive it without HTTP."""
 
     def __init__(self, state_dir: str | Path, quote_key: str | Path, listing_path: str | Path,
-                 cap: int | None = None, testnets: bool = False, clock=time.time):
+                 cap: int | None = None, testnets: bool = False, clock=time.time, debug_sources: bool = False):
         self.dir = Path(state_dir)
         for sub in ("quotes", "spool", "status"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
@@ -165,31 +175,66 @@ class Desk:
         self.listing_path = Path(listing_path)
         self.cap = C.parse_usdc(DEFAULT_CAP_USDC) if cap is None else int(cap)
         self.testnets, self.clock = testnets, clock
+        self.debug_sources = debug_sources
         self.rng = secrets.randbelow
         self._listing: tuple[float, dict] | None = None
         self.lock = threading.Lock()
-        self.db = sqlite3.connect(str(self.dir / "index.sqlite"), check_same_thread=False, isolation_level=None)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript(SCHEMA)
-        row = self.db.execute("SELECT v FROM meta WHERE k='salt'").fetchone()
-        if row:
-            self.salt = row[0]
-        else:
-            self.salt = secrets.token_hex(16)
-            self.db.execute("INSERT INTO meta VALUES ('salt', ?)", (self.salt,))
-            self._backfill()
+        try:
+            self._open_index()
+        except sqlite3.DatabaseError as e:
+            self._set_aside(e)
+            self._open_index()
         self.last_prune = 0.0
 
+    def _open_index(self) -> None:
+        self.db = sqlite3.connect(str(self.dir / "index.sqlite"), check_same_thread=False, isolation_level=None)
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
+            ok = self.db.execute("PRAGMA quick_check").fetchone()
+            if not ok or ok[0] != "ok":
+                raise sqlite3.DatabaseError(f"quick_check: {ok[0] if ok else 'no answer'}")
+            self.db.executescript(SCHEMA)
+            row = self.db.execute("SELECT v FROM meta WHERE k='salt'").fetchone()
+            if row:
+                self.salt = row[0]
+            else:
+                self.salt = secrets.token_hex(16)
+                self.db.execute("INSERT INTO meta VALUES ('salt', ?)", (self.salt,))
+                self._backfill()
+        except sqlite3.DatabaseError:
+            self.db.close()
+            raise
+
+    def _set_aside(self, err: Exception) -> None:
+        """Move a damaged index (and its WAL files) out of the way; it is rebuilt from the files."""
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        for suffix in ("", "-wal", "-shm"):
+            p = self.dir / f"index.sqlite{suffix}"
+            if p.exists():
+                os.replace(p, p.with_name(f"{p.name}.bad-{stamp}"))
+        sys.stderr.write(f"claimd: index.sqlite was damaged ({err}); moved aside and rebuilt from the files\n")
+
     def _backfill(self) -> None:
-        """First start with an index: take in quote files written before it existed."""
+        """New index (first start, or after a damaged one): rebuild it from the quote files and the
+        paid notices in the spool (pending, done and rejected), so reported quotes stay reported
+        and keep their tx count."""
         for f in (self.dir / "quotes").glob("*.json"):
             try:
                 q = json.loads(f.read_text())["doc"]["quote"]
                 self.db.execute("INSERT OR IGNORE INTO quotes VALUES (?,?,?,?,?,?,?)",
                                 (q["id"], q["chainid"], int(q["amount"]), q["issued"], q["expires"], q["buyer_key"], ""))
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
                 continue
+        for sub in ("spool", "spool/done", "spool/rejected"):
+            for f in (self.dir / sub).glob("*.json"):
+                try:
+                    n = json.loads(f.read_text())
+                    qid, tx = n["quote_id"], n["tx"]
+                    if Q.ID_RE.match(qid) and Q.TX_RE.match(tx):
+                        self.db.execute("INSERT OR IGNORE INTO notices VALUES (?, ?)", (qid, tx))
+                except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+                    continue
 
     def source_tag(self, src: str) -> str:
         """Source addresses are kept only as a salted hash."""
@@ -253,15 +298,20 @@ class Desk:
 
     def quote(self, req, src: str = "local") -> tuple[int, dict]:
         body = self.listing()
-        why = Q.request_error(req, body["seller"], body["chains"], body["max_hours"], self.testnets)
+        now = int(self.clock())
+        why = Q.request_error(req, body["seller"], body["chains"], body["max_hours"], self.testnets, now=now)
         if why:
             return 400, {"error": why}
-        now = int(self.clock())
         tag = self.source_tag(src)
         with self.lock:
             if now - self.last_prune >= PRUNE_EVERY_S:
                 self.prune(now)
                 self.last_prune = now
+            self.db.execute("DELETE FROM requests WHERE ts < ?", (now - REPLAY_KEEP_S,))
+            try:
+                self.db.execute("INSERT INTO requests VALUES (?, ?)", (req["sig"], now))
+            except sqlite3.IntegrityError:
+                return 409, {"error": "this request was already used; ask for a new quote"}
             if self._count("SELECT COUNT(*) FROM quotes WHERE buyer_key = ? AND expires > ?",
                            req["buyer_key"], now) >= MAX_OPEN_PER_BUYER:
                 return 429, {"error": "too many open quotes for this client; pay or wait for one to expire"}
@@ -277,7 +327,7 @@ class Desk:
             base = price * int(req["hours"])
             taken = {r[0] for r in self.db.execute(
                 "SELECT amount FROM quotes WHERE chainid = ? AND amount > ? AND amount <= ? AND expires >= ?",
-                (req["chainid"], base, base + Q.PAY_ID_MAX, now - RESERVE_S))}
+                (req["chainid"], base, base + Q.extra_cap(base), now - RESERVE_S))}
             try:
                 doc, pid = Q.make_quote(self.key, req, payout=body["payout"], price_per_hour=price, taken=taken,
                                         cap=self.cap, now=now, testnets=self.testnets, rng=self.rng)
@@ -288,6 +338,8 @@ class Desk:
             _write_json(self.dir / "quotes" / f"{q['id']}.json", {"doc": doc, "pay_id": pid})
             self.db.execute("INSERT INTO quotes VALUES (?,?,?,?,?,?,?)",
                             (q["id"], q["chainid"], q["amount"], q["issued"], q["expires"], q["buyer_key"], tag))
+        if self.debug_sources:
+            sys.stderr.write(f"claimd: quote {q['id']} source {tag}\n")
         return 200, doc
 
     def paid(self, notice) -> tuple[int, dict]:
@@ -442,8 +494,11 @@ def main(argv=None) -> int:
     ap.add_argument("--listing", required=True, help="this exit's signed listing.json")
     ap.add_argument("--cap-usdc", default=DEFAULT_CAP_USDC, help="largest single payment to quote (default 20)")
     ap.add_argument("--testnets", action="store_true")
+    ap.add_argument("--debug-sources", action="store_true",
+                    help="log each quote's salted source tag (not the address), to tell buyers' sessions apart")
     a = ap.parse_args(argv)
-    desk = Desk(a.dir, a.quote_key, a.listing, cap=C.parse_usdc(a.cap_usdc), testnets=a.testnets)
+    desk = Desk(a.dir, a.quote_key, a.listing, cap=C.parse_usdc(a.cap_usdc), testnets=a.testnets,
+                debug_sources=a.debug_sources or os.environ.get("SRNET_CLAIM_DEBUG_SOURCES") == "1")
     desk.listing()  # fail early on a bad setup
     srv = serve(a.host, a.port, desk)
     print(f"claims on http://[{a.host}]:{srv.server_address[1]}/claim/", flush=True)

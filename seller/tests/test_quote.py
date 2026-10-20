@@ -48,25 +48,25 @@ class Quotes(unittest.TestCase):
         self.s = Seller(price="1.00", max_hours=24)
         self.qkey = Q.load_key(self.s.quote_key)
         self.bk, self.bpub = buyer_key()
-        self.req = Q.make_request(self.s.sesh, CLIENT, 3, 42161, self.bpub)
+        self.req = Q.make_request(self.s.sesh, CLIENT, 3, 42161, self.bk, now=T0)
 
     def quote(self, req=None, taken=(), cap=20_000_000, now=T0):
         return Q.make_quote(self.qkey, req or self.req, payout=PAYOUT, price_per_hour=1_000_000,
                             taken=set(taken), cap=cap, now=now)
 
     def test_request_checks(self):
-        ok = lambda r: Q.request_error(r, self.s.sesh, [42161, 8453], 24)  # noqa: E731
+        ok = lambda r: Q.request_error(r, self.s.sesh, [42161, 8453], 24, now=T0)  # noqa: E731
         self.assertIsNone(ok(self.req))
-        self.assertEqual(ok({**self.req, "hours": 25}), "at most 24 hours per purchase")
-        self.assertEqual(ok({**self.req, "hours": 0}), "hours must be a whole number, at least 1")
-        self.assertEqual(ok({**self.req, "hours": 1.5}), "hours must be a whole number, at least 1")
-        self.assertEqual(ok({**self.req, "chainid": 1}), "this seller does not take payments on that chain")
-        self.assertEqual(Q.request_error(self.req, self.s.sesh, [8453], 24),
+        self.assertEqual(ok(Q.sign_request({**self.req, "hours": 25}, self.bk)), "at most 24 hours per purchase")
+        self.assertEqual(ok(Q.sign_request({**self.req, "hours": 0}, self.bk)), "hours must be a whole number, at least 1")
+        self.assertEqual(ok(Q.sign_request({**self.req, "hours": 1.5}, self.bk)), "hours must be a whole number, at least 1")
+        self.assertEqual(ok(Q.sign_request({**self.req, "chainid": 1}, self.bk)), "this seller does not take payments on that chain")
+        self.assertEqual(Q.request_error(self.req, self.s.sesh, [8453], 24, now=T0),
                          "this seller does not take payments on that chain")
-        self.assertEqual(ok({**self.req, "token": "USDT"}), "only USDC is accepted")
-        self.assertEqual(ok({**self.req, "seller": OTHER}), "wrong seller")
-        self.assertEqual(ok({**self.req, "client_sesh": "x.sesh"}), "bad client_sesh")
-        self.assertEqual(ok({**self.req, "extra": 1}), "bad request")
+        self.assertEqual(ok(Q.sign_request({**self.req, "token": "USDT"}, self.bk)), "only USDC is accepted")
+        self.assertEqual(ok(Q.sign_request({**self.req, "seller": OTHER}, self.bk)), "wrong seller")
+        self.assertEqual(ok(Q.sign_request({**self.req, "client_sesh": "x.sesh"}, self.bk)), "bad client_sesh")
+        self.assertEqual(ok(Q.sign_request({**self.req, "extra": 1}, self.bk)), "bad request")
 
     def test_multi_hour_amount_is_unique_and_signed(self):
         doc, pid = self.quote()
@@ -95,14 +95,76 @@ class Quotes(unittest.TestCase):
         self.assertNotIn(amt, taken)
 
     def test_unique_amount_stays_small_until_busy(self):
+        base = 10_000_000                                   # 10 USDC: 2% is over PAY_ID_MAX
         widths = []
-        Q.unique_amount(0, set(), rng=lambda n: widths.append(n) or 0)
+        Q.unique_amount(base, set(), rng=lambda n: widths.append(n) or 0)
         self.assertEqual(widths[-1], Q.PAY_ID_SMALL)        # < 1 cent normally
-        half = set(range(1, Q.PAY_ID_SMALL // 2 + 2))
-        Q.unique_amount(0, half, rng=lambda n: widths.append(n) or n - 1)
-        self.assertEqual(widths[-1], Q.PAY_ID_MAX)          # wider only when the small range fills
-        amt, pid = Q.unique_amount(0, half, rng=lambda n: n - 1)
-        self.assertTrue(Q.PAY_ID_SMALL < pid <= Q.PAY_ID_MAX and amt not in half)
+        half = {base + p for p in range(1, Q.PAY_ID_SMALL // 2 + 2)}
+        amt, pid = Q.unique_amount(base, half, rng=lambda n: widths.append(n) or n - 1)
+        self.assertEqual(widths[-1], 19_999)                # then grows in small steps
+        self.assertTrue(Q.PAY_ID_SMALL < pid <= 19_999 and amt not in half)
+        more = {base + p for p in range(1, 10_001)}
+        Q.unique_amount(base, more, rng=lambda n: widths.append(n) or n - 1)
+        self.assertEqual(widths[-1], 49_999)
+        most = {base + p for p in range(1, 25_001)}
+        Q.unique_amount(base, most, rng=lambda n: widths.append(n) or n - 1)
+        self.assertEqual(widths[-1], Q.PAY_ID_MAX)
+
+    def test_extra_is_capped_at_a_cent_or_two_percent(self):
+        self.assertEqual(Q.extra_cap(500_000), 10_000)      # 0.50: 0.01 USDC
+        self.assertEqual(Q.extra_cap(2_000_000), 40_000)    # 2.00: 2% = 0.04
+        self.assertEqual(Q.extra_cap(50_000_000), Q.PAY_ID_MAX)
+        base = 500_000
+        taken = {base + p for p in range(1, 5_001)}         # small range half used
+        seen = []
+        amt, pid = Q.unique_amount(base, taken, rng=lambda n: seen.append(n) or n - 1)
+        self.assertEqual(seen[-1], 10_000)                  # may not grow past the cap
+        self.assertLessEqual(pid, 10_000)
+        with self.assertRaises(Q.QuoteError) as e:
+            Q.unique_amount(base, {base + p for p in range(1, 9_001)})
+        self.assertIn("busy", str(e.exception))
+        # the buyer refuses an extra over the cap, even if signed by the seller
+        req = Q.make_request(self.s.sesh, CLIENT, 1, 42161, self.bk, now=T0)
+        doc, _ = Q.make_quote(self.qkey, req, payout=PAYOUT, price_per_hour=1_000_000, taken=set(), now=T0)
+        body = dict(doc["quote"], amount=1_000_000 + 20_001)
+        bad = {"quote": body, "sig": self.qkey.sign(Q._canon(Q.QUOTE_DOMAIN, body)).hex()}
+        self.assertIn("amount", Q.quote_error(bad, listing=self.s.listing, req=req, cap=20_000_000, now=T0))
+
+    def test_request_is_signed_and_timed(self):
+        ok = lambda r, now=T0: Q.request_error(r, self.s.sesh, [42161, 8453], 24, now=now)  # noqa: E731
+        self.assertIsNone(ok(self.req))
+        # someone else naming this buyer key can't sign for it
+        thief, _ = buyer_key()
+        forged = Q.sign_request({**self.req, "buyer_key": self.bpub}, thief)
+        self.assertIn("not signed", ok(forged))
+        # changing a signed field breaks the signature
+        self.assertIn("not signed", ok({**self.req, "hours": 4}))
+        self.assertEqual(ok({k: v for k, v in self.req.items() if k != "sig"}), "bad request")
+        # time window: 2 minutes either way
+        self.assertIsNone(ok(self.req, now=T0 + Q.REQUEST_SKEW_S))
+        self.assertIn("clock", ok(self.req, now=T0 + Q.REQUEST_SKEW_S + 1))
+        self.assertIn("clock", ok(self.req, now=T0 - Q.REQUEST_SKEW_S - 1))
+        # two requests made in the same second still differ (nonce)
+        self.assertNotEqual(Q.make_request(self.s.sesh, CLIENT, 3, 42161, self.bk, now=T0)["sig"], self.req["sig"])
+
+    def test_seller_rechecks_stored_quote_against_listing(self):
+        terms = Q.listing_terms(self.s.listing)
+        doc, _ = self.quote()
+        self.assertIsNone(Q.terms_error(doc, terms))
+
+        def resign(**kw):
+            body = dict(doc["quote"], **kw)
+            return {"quote": body, "sig": self.qkey.sign(Q._canon(Q.QUOTE_DOMAIN, body)).hex()}
+        cases = [({"payout": "0x" + "dd" * 20}, "payout"), ({"chainid": 10}, "chain"),
+                 ({"token_address": "0x" + "ee" * 20}, "USDC"), ({"hours": 25}, "hours"), ({"hours": 0}, "hours"),
+                 ({"amount": 3_000_000}, "amount"), ({"amount": 1}, "amount"), ({"price_per_hour": 1}, "amount"),
+                 ({"expires": doc["quote"]["issued"] + Q.MAX_QUOTE_TTL_S + 1}, "times"),
+                 ({"seller": OTHER}, "seller")]
+        for kw, msg in cases:
+            self.assertIn(msg, Q.terms_error(resign(**kw), terms), kw)
+        forged, _ = Q.make_quote(Q.load_key(Seller().quote_key), self.req, payout=PAYOUT,
+                                 price_per_hour=1_000_000, taken=set(), now=T0)
+        self.assertIn("not signed", Q.terms_error(forged, terms))
 
     def test_buyer_accepts_wide_ids(self):
         doc, _ = self.quote()
@@ -124,7 +186,7 @@ class Quotes(unittest.TestCase):
         # expiry
         self.assertIn("expired", chk(doc, now=T0 + Q.QUOTE_TTL_S + 1))
         # a quote bound to someone else's address or key
-        other = Q.make_request(self.s.sesh, OTHER, 3, 42161, self.bpub)
+        other = Q.make_request(self.s.sesh, OTHER, 3, 42161, self.bk, now=T0)
         d2, _ = self.quote(req=other)
         self.assertIn("client_sesh", chk(d2))
         # not signed by the listing's quote key

@@ -1,20 +1,25 @@
 """Exit quotes: how a buyer pays a seller directly, with no contract in between.
 
 1. The buyer asks the seller's claim endpoint for a quote (request below), over Session Router.
+   The request is signed by the buyer key it names and carries the time, so nobody else can ask
+   for quotes in that buyer's name (that would use up the buyer's open-quote limit).
 2. The seller answers with a signed quote: payout address, chain, the official USDC address, an
    exact amount and an expiry (about 15 minutes). The amount is the price for the hours asked
    plus a few millionths of a dollar that no other quote for this seller on that chain has used
    in the last 7 days, so the last digits work as a payment ID. Normally that is under one cent
-   (1..9999 base units); only when many quotes are out does it grow, up to 0.099999 USDC.
+   (1..9999 base units). When many quotes are out it grows in steps, but never past
+   extra_cap(): 0.01 USDC or 2% of the price, whichever is larger.
 3. The buyer pays exactly that amount from any wallet, then sends a "paid" notice with the tx
    hash, signed by the per-install buyer key named in the quote request.
-4. The seller's watcher checks the payment on chain and opens the lease for the quoted hours.
+4. The seller's watcher checks the quote against the signed listing, checks the payment on
+   chain and opens the lease for the quoted hours.
 
 The quote is bound to the buyer's .sesh address: the exit only ever admits that address for a
 paid quote, so a quote or a tx hash is useless to anyone else.
 
 Messages (all JSON):
-  request  {"v":1, "seller", "client_sesh", "hours", "chainid", "token":"USDC", "buyer_key":<hex32>}
+  request  {"v":1, "seller", "client_sesh", "hours", "chainid", "token":"USDC", "buyer_key":<hex32>,
+            "ts":<unix time>, "nonce":<hex16>, "sig": <hex, Ed25519 by buyer_key over request_message()>}
   quote    {"quote": {"v":1, "id", "seller", "client_sesh", "buyer_key", "hours", "chainid", "token",
                       "token_address", "payout", "amount", "price_per_hour", "issued", "expires"},
             "sig": <hex, Ed25519 by the listing's quote_key>}
@@ -37,22 +42,27 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey  # noqa: E402
 
 QUOTE_DOMAIN = "srnet-exit-quote/v1"
+REQUEST_DOMAIN = "srnet-exit-request/v1"
 PAID_DOMAIN = "srnet-exit-paid/v1"
 QUOTE_TTL_S = 900
 MAX_QUOTE_TTL_S = 1800
 PAY_ID_SMALL = 9999         # unique part of the amount, in USDC base units: normally < 1 cent
+PAY_ID_STEPS = (9_999, 19_999, 49_999, 99_999)  # ranges it grows through when many quotes are out
 PAY_ID_MAX = 99_999         # ... and never more than 0.099999 USDC
+EXTRA_MIN = 10_000          # the extra may always reach 0.01 USDC ...
+EXTRA_SHARE = 50            # ... or 1/50 (2%) of the price, whichever is larger
 POOL_BUSY = 0.9             # refuse new quotes when this share of the amounts for a price is taken
 RESERVE_S = 7 * 86400       # an amount is never quoted again within this long (paid or not)
 KEEP_QUOTES_S = RESERVE_S + 1800 + 86400  # quote files (and paid notices for them) are kept this long
-EARLY_SKEW_S = 30           # block time may sit this far before the quote was issued
+EARLY_SKEW_S = 300          # block time may sit this far before the quote was issued (seller clock fast)
 LATE_SKEW_S = 120           # ... and this far after it expired
 CLOCK_SKEW_S = 120          # buyer side: allowed difference between our clock and the seller's
+REQUEST_SKEW_S = 120        # seller side: a request's ts may be this far from the seller's clock
 SESH_RE = re.compile(r"^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}\.sesh$")
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 ID_RE = re.compile(r"^[0-9a-f]{16}$")
 TX_RE = re.compile(r"^0x[0-9a-f]{64}$")
-REQUEST_FIELDS = {"v", "seller", "client_sesh", "hours", "chainid", "token", "buyer_key"}
+REQUEST_FIELDS = {"v", "seller", "client_sesh", "hours", "chainid", "token", "buyer_key", "ts", "nonce", "sig"}
 QUOTE_FIELDS = {"v", "id", "seller", "client_sesh", "buyer_key", "hours", "chainid", "token", "token_address",
                 "payout", "amount", "price_per_hour", "issued", "expires"}
 
@@ -74,21 +84,48 @@ def _is_int(v) -> bool:
 
 
 # ---------------------------------------------------------------- buyer side: request
-def make_request(seller: str, client_sesh: str, hours: int, chainid: int, buyer_key_hex: str) -> dict:
-    return {"v": 1, "seller": seller, "client_sesh": client_sesh, "hours": int(hours), "chainid": int(chainid),
-            "token": C.TOKEN, "buyer_key": buyer_key_hex}
+def request_message(req: dict) -> bytes:
+    return _canon(REQUEST_DOMAIN, {k: v for k, v in req.items() if k != "sig"})
 
 
-def request_error(req, seller: str, accept: list[int], max_hours: int, testnets: bool = False) -> str | None:
-    """Seller side: None if the request is acceptable, else the reason."""
+def make_request(seller: str, client_sesh: str, hours: int, chainid: int, buyer_key: Ed25519PrivateKey,
+                 now: int | None = None) -> dict:
+    """A quote request signed by buyer_key (its public half is the request's buyer_key)."""
+    req = {"v": 1, "seller": seller, "client_sesh": client_sesh, "hours": int(hours), "chainid": int(chainid),
+           "token": C.TOKEN, "buyer_key": pub_hex(buyer_key), "ts": int(time.time()) if now is None else int(now),
+           "nonce": secrets.token_hex(8)}
+    return sign_request(req, buyer_key)
+
+
+def sign_request(req: dict, buyer_key: Ed25519PrivateKey) -> dict:
+    out = {k: v for k, v in req.items() if k != "sig"}
+    out["sig"] = buyer_key.sign(request_message(out)).hex()
+    return out
+
+
+def request_error(req, seller: str, accept: list[int], max_hours: int, testnets: bool = False,
+                  now: int | None = None) -> str | None:
+    """Seller side: None if the request is acceptable, else the reason. Replays of one signed
+    request inside the time window are the caller's to refuse (claimd keeps the signatures)."""
     if not isinstance(req, dict) or set(req) != REQUEST_FIELDS or req.get("v") != 1:
         return "bad request"
     if req["seller"] != seller:
         return "wrong seller"
-    if not isinstance(req["client_sesh"], str) or not SESH_RE.match(req["client_sesh"]):
-        return "bad client_sesh"
     if not isinstance(req["buyer_key"], str) or not HEX32_RE.match(req["buyer_key"]):
         return "bad buyer_key"
+    if not _is_int(req["ts"]) or not isinstance(req["nonce"], str) or not ID_RE.match(req["nonce"]) \
+            or not isinstance(req["sig"], str) or not re.fullmatch(r"[0-9a-f]{128}", req["sig"]):
+        return "bad request"
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(req["buyer_key"])).verify(
+            bytes.fromhex(req["sig"]), request_message(req))
+    except (ValueError, InvalidSignature):
+        return "the request is not signed by its buyer key"
+    now = int(time.time()) if now is None else int(now)
+    if abs(req["ts"] - now) > REQUEST_SKEW_S:
+        return "the request's time is more than 2 minutes off the seller's clock (check your computer's clock)"
+    if not isinstance(req["client_sesh"], str) or not SESH_RE.match(req["client_sesh"]):
+        return "bad client_sesh"
     if not _is_int(req["hours"]) or req["hours"] < 1:
         return "hours must be a whole number, at least 1"
     if req["hours"] > max_hours:
@@ -101,23 +138,33 @@ def request_error(req, seller: str, accept: list[int], max_hours: int, testnets:
 
 
 # ---------------------------------------------------------------- seller side: quote
+def extra_cap(base: int) -> int:
+    """Largest pay id (extra over the price) for a purchase of base units: 0.01 USDC or 2% of
+    the price, whichever is larger, and never over PAY_ID_MAX."""
+    return min(PAY_ID_MAX, max(EXTRA_MIN, int(base) // EXTRA_SHARE))
+
+
 def unique_amount(base: int, taken: set[int], rng=secrets.randbelow) -> tuple[int, int]:
     """(amount, pay_id): base + a pay id that makes the full amount differ from every amount in
     taken (all amounts quoted on this chain in the last RESERVE_S seconds).
 
-    The pay id is drawn from 1..PAY_ID_SMALL while that range is at most half used, then from a
-    10x wider range, up to PAY_ID_MAX."""
-    used = {a - base for a in taken if base < a <= base + PAY_ID_MAX}
-    if len(used) >= POOL_BUSY * PAY_ID_MAX:
+    The pay id is drawn from 1..PAY_ID_SMALL while that range is at most half used, then from
+    the next of PAY_ID_STEPS, never past extra_cap(base)."""
+    cap = extra_cap(base)
+    used = {a - base for a in taken if base < a <= base + cap}
+    if len(used) >= POOL_BUSY * cap:
         raise QuoteError("busy: too many recent quotes; try again later")
-    width = PAY_ID_SMALL
-    while width < PAY_ID_MAX and sum(1 for p in used if p <= width) * 2 > width:
-        width = min(PAY_ID_MAX, width * 10 + 9)
+    widths = sorted({min(w, cap) for w in PAY_ID_STEPS} | {cap})
+    width = widths[-1]
+    for w in widths:
+        if sum(1 for p in used if p <= w) * 2 <= w:
+            width = w
+            break
     for _ in range(64):
         pid = 1 + rng(width)
         if pid not in used:
             return base + pid, pid
-    pid = next(p for p in range(1, PAY_ID_MAX + 1) if p not in used)
+    pid = next(p for p in range(1, cap + 1) if p not in used)
     return base + pid, pid
 
 
@@ -169,7 +216,7 @@ def quote_error(doc, *, listing: dict, req: dict, cap: int, now: int | None = No
     except (KeyError, C.ChainError):
         return "the listing has no valid price"
     base = listed * q["hours"]
-    if q["price_per_hour"] != listed or not (base < q["amount"] <= base + PAY_ID_MAX):
+    if q["price_per_hour"] != listed or not (base < q["amount"] <= base + extra_cap(base)):
         return "the quoted amount does not match the listed price"
     if q["amount"] > cap:
         return (f"{C.fmt_usdc(q['amount'])} USDC is over your limit of {C.fmt_usdc(cap)} per payment "
@@ -177,6 +224,45 @@ def quote_error(doc, *, listing: dict, req: dict, cap: int, now: int | None = No
     if not (now - CLOCK_SKEW_S <= q["issued"] <= now + CLOCK_SKEW_S) or q["expires"] <= now \
             or q["expires"] - q["issued"] > MAX_QUOTE_TTL_S:
         return "the quote is expired or has bad times (check your computer's clock)"
+    return None
+
+
+# ---------------------------------------------------------------- seller side: re-check a stored quote
+def listing_terms(body: dict) -> dict:
+    """What a quote must agree with, from a verified listing body."""
+    return {"seller": body["seller"], "payout": str(body["payout"]).lower(),
+            "chains": sorted(int(c) for c in body["chains"]), "price": C.parse_usdc(body["price_per_hour_usdc"]),
+            "max_hours": int(body["max_hours"]), "quote_key": str(body["quote_key"])}
+
+
+def terms_error(doc, terms: dict, testnets: bool = False) -> str | None:
+    """None if a stored quote is one the listing with these terms could have issued: signed by
+    its quote key, its payout, one of its chains, the official USDC, 1..max_hours, the listed
+    price plus at most extra_cap(), and a sane lifetime. The watcher runs this on every quote
+    it is asked to pay out, because quote files are written by the network-facing claim desk."""
+    if not verify_quote(doc, terms["quote_key"]):
+        return "not signed by the listing's quote key"
+    q = doc["quote"]
+    if q.get("v") != 1 or q["seller"] != terms["seller"]:
+        return "not for this seller"
+    if not isinstance(q["client_sesh"], str) or not SESH_RE.match(q["client_sesh"]) \
+            or not isinstance(q["buyer_key"], str) or not HEX32_RE.match(q["buyer_key"]):
+        return "bad buyer fields"
+    if str(q["payout"]).lower() != terms["payout"]:
+        return "payout address is not the listing's"
+    if not _is_int(q["chainid"]) or q["chainid"] not in terms["chains"] or not C.supported(q["chainid"], testnets):
+        return "chain is not one the listing takes"
+    if q["token"] != C.TOKEN or str(q["token_address"]).lower() != C.usdc(q["chainid"], testnets):
+        return "token is not the official USDC on that chain"
+    if not _is_int(q["hours"]) or not (1 <= q["hours"] <= terms["max_hours"]):
+        return "hours outside the listing's 1..max_hours"
+    base = terms["price"] * q["hours"]
+    if not _is_int(q["amount"]) or q["price_per_hour"] != terms["price"] \
+            or not (base < q["amount"] <= base + extra_cap(base)):
+        return "amount does not match the listed price"
+    if not _is_int(q["issued"]) or not _is_int(q["expires"]) \
+            or not (q["issued"] < q["expires"] <= q["issued"] + MAX_QUOTE_TTL_S):
+        return "bad quote times"
     return None
 
 

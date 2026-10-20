@@ -76,6 +76,9 @@ Good to know:
   USDC only.
 - Your own RPC: `"exits": {"rpc": {"42161": "https://...", "8453": "https://..."}}`.
 - Exits from older seller packs show "seller needs to update" and can't be bought from.
+- Quote requests carry your computer's time, so its clock has to be within 2 minutes of the
+  real time. The amount you pay is the price plus a small payment ID; the payment screen shows
+  both parts.
 - The add-on keeps a small key in `~/.srnet/exits/buyer.key`. It only signs quote requests and
   payment notices; it can't move funds.
 

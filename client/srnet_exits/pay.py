@@ -129,7 +129,7 @@ class Buyer:
             raise BuyError(f"{C.fmt_usdc(price)} USDC is at or over your limit of {C.fmt_usdc(cap)} per payment "
                            "(raise it with --max-usdc or \"max_payment_usdc\" in config.json)")
         key = buyer_key(self.st.root)
-        req = Q.make_request(body["seller"], client_sesh, hours, cid, Q.pub_hex(key))
+        req = Q.make_request(body["seller"], client_sesh, hours, cid, key, now=int(self.clock()))
         try:
             qdoc = self.desk(body).quote(req)
         except claim.ClaimError as e:
@@ -153,7 +153,10 @@ class Buyer:
 
     def info(self, rec: dict) -> dict:
         q = rec["doc"]["quote"]
-        return {"id": q["id"], "seller": q["seller"], "chainid": q["chainid"], "chain": C.label(q["chainid"]),
+        price = int(q["price_per_hour"]) * int(q["hours"])
+        extra = int(q["amount"]) - price
+        return {"price": price, "price_text": C.fmt_usdc(price), "extra": extra, "extra_text": C.fmt_usdc(extra),
+                "id": q["id"], "seller": q["seller"], "chainid": q["chainid"], "chain": C.label(q["chainid"]),
                 "token": "USDC", "token_address": q["token_address"], "address": q["payout"],
                 "amount": q["amount"], "amount_text": C.fmt_usdc(q["amount"]), "hours": q["hours"],
                 "expires": q["expires"],

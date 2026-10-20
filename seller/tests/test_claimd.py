@@ -24,10 +24,12 @@ class DeskTest(unittest.TestCase):
         self.desk = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)
         self.bk, self.bpub = buyer_key()
 
-    def req(self, **kw):
-        r = Q.make_request(self.s.sesh, CLIENT, 4, 8453, self.bpub)
+    def req(self, key=None, now=None, **kw):
+        """A signed request (re-signed after kw changes, by key or the test buyer)."""
+        key = key or self.bk
+        r = Q.make_request(self.s.sesh, CLIENT, 4, 8453, key, now=self.clock() if now is None else now)
         r.update(kw)
-        return r
+        return Q.sign_request(r, key)
 
     def test_quote_follows_listing(self):
         code, doc = self.desk.quote(self.req())
@@ -50,9 +52,9 @@ class DeskTest(unittest.TestCase):
     def test_amounts_unique_among_open_quotes(self):
         amounts = set()
         for i in range(3):
-            _, k = buyer_key()
+            k, _ = buyer_key()
             c = [CLIENT, OTHER, "y" * 52 + ".sesh"][i]
-            code, doc = self.desk.quote(self.req(client_sesh=c, buyer_key=k))
+            code, doc = self.desk.quote(self.req(client_sesh=c, key=k))
             self.assertEqual(code, 200)
             amounts.add(doc["quote"]["amount"])
         self.assertEqual(len(amounts), 3)
@@ -66,17 +68,17 @@ class DeskTest(unittest.TestCase):
 
     def test_naming_a_victims_address_does_not_lock_them_out(self):
         for i in range(D.MAX_OPEN_PER_SOURCE):
-            _, k = buyer_key()
-            self.assertEqual(self.desk.quote(self.req(buyer_key=k), src="10.9.9.9")[0], 200)
-        _, k = buyer_key()
-        self.assertEqual(self.desk.quote(self.req(buyer_key=k), src="10.9.9.9")[0], 429)  # attacker's source is full
+            k, _ = buyer_key()
+            self.assertEqual(self.desk.quote(self.req(key=k), src="10.9.9.9")[0], 200)
+        k, _ = buyer_key()
+        self.assertEqual(self.desk.quote(self.req(key=k), src="10.9.9.9")[0], 429)  # attacker's source is full
         self.assertEqual(self.desk.quote(self.req(), src="10.0.0.1")[0], 200)              # the real buyer isn't
 
     def test_hourly_limits(self):
         old = D.QUOTES_PER_SOURCE, D.QUOTES_GLOBAL
         try:
             D.QUOTES_PER_SOURCE, D.QUOTES_GLOBAL = (2, 3600), (3, 3600)
-            ok = lambda src: self.desk.quote(self.req(buyer_key=buyer_key()[1]), src=src)[0]  # noqa: E731
+            ok = lambda src: self.desk.quote(self.req(key=buyer_key()[0]), src=src)[0]  # noqa: E731
             self.assertEqual([ok("a"), ok("a"), ok("a")], [200, 200, 429])
             self.assertEqual([ok("b"), ok("c")], [200, 503])   # overall: busy
             self.clock.t += 3601
@@ -88,7 +90,7 @@ class DeskTest(unittest.TestCase):
         old = D.MAX_OPEN
         try:
             D.MAX_OPEN = 2
-            ok = lambda src: self.desk.quote(self.req(buyer_key=buyer_key()[1]), src=src)[0]  # noqa: E731
+            ok = lambda src: self.desk.quote(self.req(key=buyer_key()[0]), src=src)[0]  # noqa: E731
             self.assertEqual([ok("a"), ok("b"), ok("c")], [200, 200, 503])
         finally:
             D.MAX_OPEN = old
@@ -97,7 +99,7 @@ class DeskTest(unittest.TestCase):
         self.desk.rng = lambda n: 41                       # every quote wants pay id 42
         amounts = []
         for i in range(3):
-            code, doc = self.desk.quote(self.req(buyer_key=buyer_key()[1]), src=f"s{i}")
+            code, doc = self.desk.quote(self.req(key=buyer_key()[0]), src=f"s{i}")
             self.assertEqual(code, 200)
             q = doc["quote"]
             amounts.append(q["amount"])
@@ -106,7 +108,7 @@ class DeskTest(unittest.TestCase):
         self.assertEqual(amounts[0], 2_000_042)
         self.assertEqual(len(set(amounts)), 3)
         self.clock.t = T0 + Q.QUOTE_TTL_S + Q.RESERVE_S + 1   # the first one's reservation is over
-        _, doc = self.desk.quote(self.req(buyer_key=buyer_key()[1]), src="s9")
+        _, doc = self.desk.quote(self.req(key=buyer_key()[0]), src="s9")
         self.assertEqual(doc["quote"]["amount"], 2_000_042)
 
     def test_amounts_tracked_in_full_across_price_changes(self):
@@ -116,7 +118,7 @@ class DeskTest(unittest.TestCase):
         self.s.relist(price="0.501")                         # 2h = 1.002 + id: overlaps the first range
         self.desk._listing = None
         self.desk.rng = lambda n: 2999                       # 1.002000 + 0.003000 = 1.005000 again
-        _, doc = self.desk.quote(self.req(hours=2, buyer_key=buyer_key()[1]), src="x")
+        _, doc = self.desk.quote(self.req(hours=2, key=buyer_key()[0]), src="x")
         self.assertNotEqual(doc["quote"]["amount"], 1_005_000)
 
     def test_too_many_txs_per_quote(self):
@@ -188,6 +190,91 @@ class DeskTest(unittest.TestCase):
             desk.quote(self.req())
 
 
+    # ------------------------------------------------------------ signed requests (R2-2)
+    def test_requests_in_someone_elses_name_are_refused(self):
+        _, victim = buyer_key()
+        thief, _ = buyer_key()
+        forged = Q.sign_request({**self.req(), "buyer_key": victim}, thief)
+        code, doc = self.desk.quote(forged)
+        self.assertEqual((code, "not signed" in doc["error"]), (400, True))
+        self.assertEqual(self.desk._count("SELECT COUNT(*) FROM quotes"), 0)
+
+    def test_a_seen_request_cant_be_replayed_to_use_up_the_buyers_limit(self):
+        seen = self.req()                     # e.g. kept by an earlier seller or a relay
+        self.assertEqual(self.desk.quote(seen, src="10.0.0.1")[0], 200)
+        for src in ("10.0.0.7", "10.0.0.8", "10.0.0.9"):
+            code, doc = self.desk.quote(seen, src=src)
+            self.assertEqual(code, 409, doc)
+        self.assertEqual(self.desk._count("SELECT COUNT(*) FROM quotes WHERE buyer_key = ?", self.bpub), 1)
+        # a request for another seller doesn't count here at all
+        other = Seller(price="0.50")
+        self.assertEqual(self.desk.quote(Q.make_request(other.sesh, CLIENT, 1, 8453, self.bk, now=T0))[0], 400)
+        # an old request is refused by time, and the remembered signatures are pruned
+        self.assertEqual(self.desk.quote(self.req(now=T0 - Q.REQUEST_SKEW_S - 1))[0], 400)
+        self.clock.t += D.REPLAY_KEEP_S + 1
+        self.desk.quote(self.req())
+        self.assertEqual(self.desk._count("SELECT COUNT(*) FROM requests WHERE ts <= ?", T0), 0)
+
+    def test_open_limit_per_buyer_is_five(self):
+        self.assertEqual(D.MAX_OPEN_PER_BUYER, 5)
+
+    # ------------------------------------------------------------ damaged index (R2-4)
+    def test_damaged_index_is_moved_aside_and_rebuilt_with_reports(self):
+        ids = []
+        for i in range(3):
+            _, doc = self.desk.quote(self.req(key=buyer_key()[0] if i else None), src=f"s{i}")
+            ids.append(doc["quote"])
+        bk2 = buyer_key()[0]
+        q_pending, q_done, q_rejected = ids     # spool files for the last two are written directly below
+        self.assertEqual(self.desk.paid(Q.make_paid(self.bk, q_pending, tx(1)))[0], 202)
+        (self.s.state / "spool" / "done").mkdir(exist_ok=True)
+        (self.s.state / "spool" / "rejected").mkdir(exist_ok=True)
+        (self.s.state / "spool" / "done" / f"{q_done['id']}-a.json").write_text(
+            json.dumps({"v": 1, "quote_id": q_done["id"], "tx": tx(2), "sig": "00"}))
+        for n in (3, 4):
+            (self.s.state / "spool" / "rejected" / f"{q_rejected['id']}-{n}.json").write_text(
+                json.dumps({"v": 1, "quote_id": q_rejected["id"], "tx": tx(n), "sig": "00"}))
+        self.desk.db.close()
+        for x in ("-wal", "-shm"):
+            (self.s.state / ("index.sqlite" + x)).unlink(missing_ok=True)
+        (self.s.state / "index.sqlite").write_bytes(b"SQLite format 3\x00" + b"\xff" * 4000)
+        self.clock.t += Q.QUOTE_TTL_S + D.PAID_GRACE_S + 1
+        d2 = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)
+        self.assertTrue(list(self.s.state.glob("index.sqlite.bad-*")))
+        self.assertEqual(d2._count("SELECT COUNT(*) FROM quotes"), 3)
+        self.assertEqual(d2._count("SELECT COUNT(*) FROM notices"), 4)
+        self.assertEqual(d2.status(q_pending["id"]), (200, {"status": "waiting"}))   # still reported, not expired
+        self.assertEqual(d2._count("SELECT COUNT(*) FROM notices WHERE qid = ?", q_rejected["id"]), 2)
+        # amounts stay reserved after the rebuild
+        taken = {r[0] for r in d2.db.execute("SELECT amount FROM quotes")}
+        self.assertEqual(taken, {q["amount"] for q in ids})
+        self.assertEqual(d2.quote(self.req(key=bk2))[0], 200)
+
+    def test_garbage_index_file_is_replaced(self):
+        self.desk.db.close()
+        (self.s.state / "index.sqlite").write_bytes(b"not a database at all" * 50)
+        d2 = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)
+        self.assertEqual(d2.quote(self.req())[0], 200)
+
+    # ------------------------------------------------------------ source tags (debug, off by default)
+    def test_source_tags_logged_only_with_debug(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.desk.quote(self.req(), src="10.0.0.1")
+        self.assertNotIn("source", err.getvalue())
+        d = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock, debug_sources=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            d.quote(self.req(key=buyer_key()[0]), src="10.0.0.1")
+            d.quote(self.req(key=buyer_key()[0]), src="10.0.0.2")
+        tags = [l.split()[-1] for l in err.getvalue().splitlines() if " source " in l]
+        self.assertEqual(len(tags), 2)
+        self.assertNotEqual(tags[0], tags[1])
+        self.assertNotIn("10.0.0", err.getvalue())
+
+
 class HttpTest(unittest.TestCase):
     def setUp(self):
         self.s = Seller()
@@ -210,7 +297,7 @@ class HttpTest(unittest.TestCase):
 
     def test_flow(self):
         bk, bpub = buyer_key()
-        req = Q.make_request(self.s.sesh, CLIENT, 1, 42161, bpub)
+        req = Q.make_request(self.s.sesh, CLIENT, 1, 42161, bk)
         code, doc = self.call("/claim/quote", req)
         self.assertEqual(code, 200)
         qid = doc["quote"]["id"]

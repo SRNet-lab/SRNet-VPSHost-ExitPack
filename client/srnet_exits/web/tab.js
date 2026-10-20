@@ -105,6 +105,7 @@
     const t = el("table"); t.className = "kv";
     const row = (k, v, copy) => { const tr = el("tr"); tr.appendChild(el("th", k)); const td = el("td", v); if (copy) { td.appendChild(document.createTextNode(" ")); td.appendChild(copyBtn(v)); } tr.appendChild(td); t.appendChild(tr); };
     row("Send exactly", r.amount_text + " USDC", false); row("Amount", r.amount_text, true); row("To", r.address, true);
+    if (r.price_text) row("Includes", r.price_text + " USDC for " + r.hours + " h + " + r.extra_text + " USDC payment ID", false);
     row("Network", r.chain + " (chain id " + r.chainid + ")"); row("USDC contract", r.token_address); row("Good until", hhmm(r.expires));
     p.appendChild(t);
     if (r.qr) {

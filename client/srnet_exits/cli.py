@@ -83,11 +83,18 @@ def qr_text(data: str) -> str:
         return ""
 
 
+def extra_text(i: dict) -> str:
+    """The price and the payment ID part of the amount, so a larger extra under load is visible."""
+    return (f"That is {i['price_text']} USDC for {i['hours']} h plus {i['extra_text']} USDC as a payment ID "
+            "(it makes your payment unique; the seller keeps it).")
+
+
 def payment_text(i: dict) -> str:
     qr = qr_text(i["uri"])
     return "\n".join(x for x in [
         f"Pay exactly {i['amount_text']} USDC on {i['chain']} to:",
         f"  {i['address']}",
+        extra_text(i),
         "",
         qr.rstrip("\n") if qr else "",
         f"Payment link (most wallets): {i['uri']}",
