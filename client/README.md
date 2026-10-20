@@ -41,11 +41,17 @@ The installer:
   `~/.local/bin`.
 
 Run it again to update. `client/install.sh --uninstall` removes the command, its environment and
-that one line; your paid time and settings in `~/.srnet` stay.
+that one line, and stops the page, reminder and DNS forwarder it started; your paid time and
+settings in `~/.srnet` stay. It refuses while an exit is connected (disconnect first). With
+`--force` it goes ahead and tells you how to remove the kill switch:
+`sudo nft delete table inet srnet_ks`.
 
 Every command below works the same with `srnet-exits` in place of `srnet`, and
 `srnet-exits doctor` checks Session Router, `.sesh` names, the clock and everything exits need.
-`srnet-exits ui` opens the Exits page in your browser (on 127.0.0.1 only).
+`srnet-exits ui` opens the Exits page in your browser (on 127.0.0.1 only). Each run picks a free
+port and a new key, and opens an address like `http://127.0.0.1:41873/#t=...`; the page only
+answers calls that carry that key. With `--no-browser` it prints the address for you to open.
+Running it again while the page is up opens the same page.
 
 ## Add exits to the SRNet client
 

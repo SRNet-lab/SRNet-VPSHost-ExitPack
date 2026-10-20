@@ -39,13 +39,49 @@ else
 fi
 ours() { [ -f "$1" ] && grep -qxF "$LAUNCHER_MARK" "$1"; }
 
+INSTALL_MARK="$PREFIX/.srnet-exits-install"
+
+# TERM every process of this user that runs this install's python with srnet_exits: the page
+# (srnet-exits ui), the lease reminder and the tunnel DNS forwarder.
+stop_ours() {
+  local vpy="$PREFIX/venv/bin/python" d pid cl a0
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ "$pid" = "$$" ] && continue
+    [ -O "$d" ] || continue
+    cl=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null) || continue
+    a0=${cl%%$'\n'*}
+    [ "$a0" = "$vpy" ] || continue
+    case "$cl" in *srnet_exits*) kill -TERM "$pid" 2>/dev/null && echo "stopped $pid (${cl//$'\n'/ })";; esac
+  done
+  return 0
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   STATE="${SRNET_HOME:-$HOME/.srnet}/state.json"
-  if [ "$FORCE" != 1 ] && [ -f "$STATE" ] && grep -q '"connected": {' "$STATE"; then
+  CONNECTED=0
+  if [ -f "$STATE" ]; then
+    if [ -x "$PREFIX/venv/bin/python" ]; then
+      "$PREFIX/venv/bin/python" -I -c 'import json,sys; sys.exit(1 if (json.load(open(sys.argv[1])).get("connected")) else 0)' "$STATE" 2>/dev/null \
+        || CONNECTED=1
+    elif grep -q '"connected": *{' "$STATE"; then
+      CONNECTED=1
+    fi
+  fi
+  if [ "$CONNECTED" = 1 ] && [ "$FORCE" != 1 ]; then
     echo "An exit is still connected. Disconnect first (srnet-exits disconnect), or run with --force." >&2
     exit 1
   fi
-  rm -rf "$PREFIX"
+  if [ -e "$PREFIX" ]; then
+    if [ ! -f "$INSTALL_MARK" ] || [ ! -x "$PREFIX/venv/bin/python" ]; then
+      echo "Not removing $PREFIX: it has no .srnet-exits-install and venv/bin/python, so it doesn't look like" >&2
+      echo "a srnet-exits install. Check SRNET_EXITS_PREFIX (an install made by an older install.sh gets the" >&2
+      echo "file when you run install.sh again, then --uninstall works)." >&2
+      exit 1
+    fi
+    stop_ours
+    rm -rf "$PREFIX"
+  fi
   if ours "$BIN/$CMD"; then rm -f "$BIN/$CMD"; fi
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
     if [ -f "$rc" ] && grep -qF "$RC_MARK" "$rc"; then
@@ -62,6 +98,11 @@ if [ "$UNINSTALL" = 1 ]; then
   done
   echo "Removed srnet-exits. Your paid time and settings in ~/.srnet were left in place, and so were"
   echo "Session Router's settings (the original client.ini is kept as client.ini.srnet-orig)."
+  if [ "$CONNECTED" = 1 ]; then
+    echo
+    echo "You were still connected, so the kill switch may still block traffic outside the tunnel."
+    echo "Remove it with: sudo nft delete table inet srnet_ks"
+  fi
   exit 0
 fi
 
@@ -85,6 +126,8 @@ command -v "$PY" >/dev/null || { echo "Python 3.10 or newer is required." >&2; e
 
 echo "Installing srnet-exits to $PREFIX"
 mkdir -p "$PREFIX" "$BIN"
+printf '%s\n' "srnet-exits install (client/install.sh). install.sh --uninstall removes this directory." \
+  > "$INSTALL_MARK"
 # A copy of just what the package needs, so the build never writes into your download.
 rm -rf "$PREFIX/src"
 mkdir -p "$PREFIX/src/client" "$PREFIX/src/contrib"

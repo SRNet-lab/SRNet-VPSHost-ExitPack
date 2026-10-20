@@ -14,6 +14,8 @@ INSTALL = CLIENT / "install.sh"
 FAKE_PY = r'''#!/usr/bin/env bash
 # stand-in python: logs calls; "-m venv D" makes D/bin/python a copy of this script
 echo "$*" >> "$FAKE_LOG"
+# the uninstall's state check runs real Python code
+if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then shift; exec "$REAL_PY" "$@"; fi
 case "$*" in *"-m srnet_exits setup-router"*) exit "${FAKE_ROUTER_RC:-0}";; esac
 if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then mkdir -p "$3/bin"; cp "$0" "$3/bin/python"; exit 0; fi
 exit 0
@@ -45,7 +47,7 @@ class InstallSh(unittest.TestCase):
     def run_install(self, *args, bin_dir=None, **extra):
         self.log.write_text("")
         env = {k: v for k, v in os.environ.items() if not k.startswith(("SRNET_", "FAKE_"))}
-        env.update(PYTHON=str(self.py), FAKE_LOG=str(self.log), HOME=str(self.home),
+        env.update(PYTHON=str(self.py), FAKE_LOG=str(self.log), HOME=str(self.home), REAL_PY=sys.executable,
                    PATH=f"{self.fake}:/usr/bin:/bin", SRNET_ROUTER_INI=str(self.ini), **extra)
         if bin_dir is not None:
             env["SRNET_BIN"] = str(bin_dir)
@@ -218,6 +220,91 @@ class InstallSh(unittest.TestCase):
         self.assertTrue(self.prefix.exists())
         self.assertEqual(self.run_install("--uninstall", "--force").returncode, 0)
         self.assertFalse(self.prefix.exists())
+
+    def test_uninstall_reads_compact_json(self):
+        self.run_install()
+        state = self.home / ".srnet"
+        state.mkdir()
+        (state / "state.json").write_text('{"connected":{"seller":"x.sesh"},"tunnel_dns":null}')
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("still connected", r.stderr)
+        self.assertTrue(self.prefix.exists())
+        (state / "state.json").write_text('{"connected":null}')
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertFalse(self.prefix.exists())
+
+    def test_uninstall_without_the_venv_falls_back_to_grep(self):
+        self.run_install()
+        shutil.rmtree(self.prefix / "venv")
+        state = self.home / ".srnet"
+        state.mkdir()
+        (state / "state.json").write_text('{\n  "connected": {\n    "seller": "x.sesh"\n  }\n}')
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("still connected", r.stderr)
+
+    def test_force_while_connected_names_the_kill_switch_command(self):
+        self.run_install()
+        state = self.home / ".srnet"
+        state.mkdir()
+        (state / "state.json").write_text('{"connected":{"seller":"x.sesh","killswitch":true}}')
+        r = self.run_install("--uninstall", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("sudo nft delete table inet srnet_ks", r.stdout)
+        self.assertFalse(self.prefix.exists())
+        r = self.run_install("--uninstall")
+        self.assertNotIn("srnet_ks", r.stdout)
+
+    def test_install_writes_the_marker(self):
+        self.run_install()
+        self.assertTrue((self.prefix / ".srnet-exits-install").is_file())
+
+    def test_uninstall_never_removes_a_dir_that_is_not_an_install(self):
+        wrong = self.home   # SRNET_EXITS_PREFIX=$HOME by mistake
+        (wrong / "notes.txt").write_text("mine\n")
+        r = self.run_install("--uninstall", SRNET_EXITS_PREFIX=str(wrong))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("doesn't look like", r.stderr)
+        self.assertTrue((wrong / "notes.txt").exists())
+        # the marker alone is not enough: the venv python must be there too
+        other = self.tmp / "other"
+        other.mkdir()
+        (other / ".srnet-exits-install").write_text("x\n")
+        (other / "data").write_text("keep\n")
+        self.assertEqual(self.run_install("--uninstall", SRNET_EXITS_PREFIX=str(other)).returncode, 1)
+        self.assertTrue((other / "data").exists())
+        # an install made before the marker existed: refused, and a reinstall fixes it
+        self.run_install()
+        (self.prefix / ".srnet-exits-install").unlink()
+        self.assertEqual(self.run_install("--uninstall").returncode, 1)
+        self.assertTrue(self.prefix.exists())
+        self.run_install()
+        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        self.assertFalse(self.prefix.exists())
+
+    def test_uninstall_stops_the_page_reminder_and_dns_proxy_of_this_install(self):
+        self.run_install()
+        vpy = str(self.prefix / "venv/bin/python")
+        nap = "import time; time.sleep(60)"
+
+        def start(argv0, *rest):
+            p = subprocess.Popen([argv0, "-c", nap, *rest], executable=sys.executable)
+            self.addCleanup(lambda: (p.kill(), p.wait()))
+            return p
+        ours = [start(vpy, "-I", "-m", "srnet_exits", "ui"), start(vpy, "-m", "srnet_exits.reminder"),
+                start(vpy, "-m", "srnet_exits.dnsproxy")]
+        other_venv = start("/opt/elsewhere/venv/bin/python", "-m", "srnet_exits.reminder")
+        not_exits = start(vpy, "-m", "something_else")
+        import time
+        time.sleep(0.3)
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for p in ours:
+            self.assertEqual(p.wait(10), -15)
+        self.assertEqual(r.stdout.count("stopped "), 3)
+        self.assertIsNone(other_venv.poll())
+        self.assertIsNone(not_exits.poll())
 
     def test_uninstall_leaves_a_foreign_command(self):
         self.bin.mkdir(parents=True)

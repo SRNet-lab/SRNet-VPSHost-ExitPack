@@ -71,26 +71,41 @@ out sudo ~/.local/bin/srnet-exits exits | grep -q "not with sudo" || fail "sudo 
 out srnet-exits status | grep -q "list_exits_error" || fail status
 set -o pipefail
 echo "--- page"
-srnet-exits ui --no-browser --port 48921 > /tmp/ui.log 2>&1 &
+srnet-exits ui --no-browser > /tmp/ui.log 2>&1 &
 UIPID=$!
-for i in $(seq 1 50); do grep -q "127.0.0.1:48921" /tmp/ui.log && break; sleep 0.2; done
+for i in $(seq 1 50); do grep -q "#t=" /tmp/ui.log && break; sleep 0.2; done
 "$VPY" - <<PY
-import json, urllib.request
-b = urllib.request.urlopen("http://127.0.0.1:48921/").read()
+import json, os, re, stat, urllib.error, urllib.request
+url = re.search(r"http://127\.0\.0\.1:(\d+)/#t=([A-Za-z0-9_-]+)", open("/tmp/ui.log").read())
+assert url, open("/tmp/ui.log").read()
+port, tok = int(url.group(1)), url.group(2)
+assert port != 48921, port
+info = os.path.expanduser("~/.srnet/ui.json")
+st = os.stat(info)
+assert stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.getuid(), oct(st.st_mode)
+assert json.load(open(info))["token"] == tok and json.load(open(info))["port"] == port
+base = "http://127.0.0.1:%d" % port
+b = urllib.request.urlopen(base + "/").read()
 assert b"/tab.js" in b, b[:200]
-r = urllib.request.Request("http://127.0.0.1:48921/api/addon/exits/status", data=b"{}", method="POST",
-                           headers={"X-Core": "1", "Content-Type": "application/json"})
-j = json.load(urllib.request.urlopen(r))
+def post(call, hdr):
+    return urllib.request.urlopen(urllib.request.Request(base + "/api/addon/exits/" + call, data=b"{}",
+                                  method="POST", headers=dict({"Content-Type": "application/json"}, **hdr)))
+j = json.load(post("status", {"X-Core": "1", "X-Token": tok}))
 assert j["ok"] and j["leases"] == [], j
-try:
-    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:48921/api/addon/exits/status", data=b"{}",
-                           headers={"Content-Type": "application/json"}))
-    raise SystemExit("no X-Core was accepted")
-except urllib.error.HTTPError as e:
-    assert e.code == 403
-print("page ok")
+for hdr in ({"X-Core": "1"}, {"X-Core": "1", "X-Token": "wrong"}, {"X-Token": tok}):
+    try:
+        post("settings", hdr)
+        raise SystemExit("accepted without the right X-Core/X-Token: %r" % hdr)
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, e.code
+print("page ok on port", port)
 PY
+srnet-exits ui --no-browser > /tmp/ui2.log 2>&1 || fail "second ui"
+grep -q "already running" /tmp/ui2.log || { cat /tmp/ui2.log; fail "second ui did not reuse the page"; }
+[ "$(grep -o "#t=[A-Za-z0-9_-]*" /tmp/ui2.log)" = "$(grep -o "#t=[A-Za-z0-9_-]*" /tmp/ui.log)" ] || fail "second ui other token"
 kill $UIPID
+wait $UIPID 2>/dev/null || true
+[ ! -e ~/.srnet/ui.json ] || fail "ui.json left after the page stopped"
 echo "--- client tests with the installed environment (no SRNet client; the netns lab needs a writable /proc/sys)"
 cd ~/SRNet-VPSHost-ExitPack/client
 SRNET_SKIP_LAB=1 "$VPY" -m unittest discover -s tests -t tests > /tmp/ut.log 2>&1 || { tail -60 /tmp/ut.log; fail "client tests"; }
@@ -102,7 +117,14 @@ SRNet-VPSHost-ExitPack/client/install.sh > /tmp/i2.log 2>&1 || { cat /tmp/i2.log
 srnet-exits --version
 echo "--- uninstall"
 cp ~/.bashrc /tmp/bashrc.before
-SRNet-VPSHost-ExitPack/client/install.sh --uninstall
+[ -f ~/.local/share/srnet-exits/.srnet-exits-install ] || fail "no install marker"
+srnet-exits ui --no-browser > /tmp/ui3.log 2>&1 &
+UIPID=$!
+for i in $(seq 1 50); do grep -q "#t=" /tmp/ui3.log && break; sleep 0.2; done
+SRNet-VPSHost-ExitPack/client/install.sh --uninstall | tee /tmp/un.log
+grep -q "^stopped $UIPID " /tmp/un.log || fail "uninstall did not stop the page"
+wait $UIPID 2>/dev/null || true   # it was stopped, so this returns at once (and reaps it)
+! kill -0 $UIPID 2>/dev/null || fail "page still running after uninstall"
 [ ! -e ~/.local/bin/srnet-exits ] && [ ! -e ~/.local/share/srnet-exits ] || fail "left files"
 ! grep -q "srnet-exits" ~/.bashrc || fail "PATH line left"
 [ -d ~/.srnet ] || fail "~/.srnet removed"
