@@ -38,7 +38,7 @@ class Flow(unittest.TestCase):
                 if cid not in self.chains:
                     raise F.evm.RpcError("no rpc")
                 return get(cid)
-        self.watcher = Wt.Watcher(Chains(), state_dir=self.s.state, seller_sesh=self.s.sesh,
+        self.watcher = Wt.Watcher(Chains(), state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path,
                                   issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2,
                                   admission=A, clock=self.clock)
         self.home = Path(tempfile.mkdtemp())
@@ -86,6 +86,34 @@ class QuoteBinding(Flow):
         self.assertEqual(info["uri"], "ethereum:0xaf88d065e77c8cC2239327C5EDb3A432268e5831@42161" f"/transfer?address={F.PAYOUT}"
                                       f"&uint256={q['amount']}")
         self.assertEqual(self.st.data["exits"]["quotes"][q["id"]]["state"], "open")
+
+    def test_quote_request_is_signed_with_the_buyer_key(self):
+        seen = []
+        real = self.desk.quote
+        self.desk.quote = lambda req, src="local": (seen.append(req), real(req, src))[1]
+        self.buy()
+        req = seen[0]
+        self.assertEqual(req["buyer_key"], Q.pub_hex(pay.buyer_key(self.home)))
+        self.assertEqual(req["ts"], int(self.clock()))
+        self.assertIsNone(Q.request_error(req, self.s.sesh, [42161, 8453], 168, now=int(self.clock())))
+
+    def test_clock_far_off_gets_a_clock_hint(self):
+        b = pay.Buyer(self.st, self.cfg, transport=desk_transport(self.desk),
+                      rpc_factory=lambda cid: self.chains[cid], clock=lambda: self.clock() - 600)
+        with self.assertRaises(pay.BuyError) as e:
+            b.quote(self.s.listing_doc, 1, ME)
+        self.assertIn("clock", str(e.exception))
+
+    def test_payment_screen_shows_the_payment_id_part(self):
+        from srnet_exits import cli
+        rec = self.buy(hours=2)
+        i = self.buyer.info(rec)
+        q = rec["doc"]["quote"]
+        self.assertEqual(i["price"], 2_000_000)
+        self.assertEqual(i["extra"], q["amount"] - 2_000_000)
+        self.assertTrue(0 < i["extra"] <= Q.extra_cap(2_000_000))
+        text = cli.payment_text(i)
+        self.assertIn(f"That is 2.00 USDC for 2 h plus {C.fmt_usdc(i['extra'])} USDC as a payment ID", text)
 
     def test_two_open_quotes_get_different_amounts(self):
         a = self.buy()["doc"]["quote"]["amount"]

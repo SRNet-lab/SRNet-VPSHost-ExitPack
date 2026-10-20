@@ -23,14 +23,14 @@ class WatcherTest(unittest.TestCase):
         self.clock = Clock()
         self.desk = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)
         self.chains = FakeChains(42161, 8453)
-        self.w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh,
+        self.w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path,
                            issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2,
                            admission=A, clock=self.clock)
         self.bk, self.bpub = buyer_key()
 
     def quote(self, hours=2, chainid=42161, client=CLIENT, key=None):
         k, pub = key or (self.bk, self.bpub)
-        code, doc = self.desk.quote(Q.make_request(self.s.sesh, client, hours, chainid, pub))
+        code, doc = self.desk.quote(Q.make_request(self.s.sesh, client, hours, chainid, k, now=self.clock()))
         self.assertEqual(code, 200, doc)
         return doc["quote"]
 
@@ -182,7 +182,7 @@ class WatcherTest(unittest.TestCase):
         q = self.quote()
         self.pay(q, 1)
         self.report(q, 1)
-        w2 = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh,
+        w2 = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path,
                        issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2, admission=A,
                        clock=self.clock)
         q2 = self.quote()
@@ -250,7 +250,7 @@ class WatcherTest(unittest.TestCase):
         self.assertIn("after the quote expired", self.report(q, 3)[0][2])
 
     def test_per_chain_confirmations(self):
-        w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, issuer_key=str(self.s.issuer),
+        w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path, issuer_key=str(self.s.issuer),
                       store=str(self.s.store), admission=A, clock=self.clock)
         self.assertEqual((w.confirmations(42161), w.confirmations(8453)), (20, 5))
         self.assertEqual(self.w.confirmations(8453), 2)
@@ -277,6 +277,90 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(W.parse_rpcs(["8453=https://x"]), {"8453": "https://x"})
         with self.assertRaises(SystemExit):
             W.parse_rpcs(["8453"])
+
+
+    # ------------------------------------------------------------ R2-1: seller clock a bit fast
+    def test_payment_soon_after_a_fast_clocked_quote_counts(self):
+        q = self.quote()
+        self.pay(q, 1, when=q["issued"] - 200)    # seller clock 200 s fast, buyer paid at once
+        self.assertEqual(self.report(q, 1)[0][1], "admit")
+        self.assertEqual(Q.EARLY_SKEW_S, 300)
+
+    # ------------------------------------------------------------ R2-3: quote files are not trusted
+    def tamper(self, q, **kw):
+        """What a taken-over claim desk could do: rewrite a quote file and sign it with quote.key."""
+        body = dict(q, **kw)
+        doc = {"quote": body, "sig": Q.load_key(self.s.quote_key).sign(Q._canon(Q.QUOTE_DOMAIN, body)).hex()}
+        (self.s.state / "quotes" / f"{q['id']}.json").write_text(json.dumps({"doc": doc, "pay_id": 1}))
+        return body
+
+    def test_tampered_quote_files_are_rejected_before_the_chain_is_read(self):
+        attacker = "0x" + "bb" * 20
+        for n, kw in enumerate([{"payout": attacker}, {"amount": 1}, {"hours": 999}, {"chainid": 1},
+                                {"price_per_hour": 1, "amount": 2}, {"expires": T0 + 86400 * 30},
+                                {"token_address": "0x" + "cc" * 20}], start=1):
+            key = buyer_key()
+            q = self.tamper(self.quote(key=key), **kw)
+            self.chains.get(42161).down = True     # a chain read would only make it wait
+            out = self.report(q, n, key=key[0])
+            self.chains.get(42161).down = False
+            self.assertEqual(out[0][1], "reject", kw)
+            self.assertIn("quote_does_not_match_listing", out[0][2])
+            self.clock.t += Q.QUOTE_TTL_S + 1      # room for the next open quote
+        self.assertEqual(self.admitted(), [])
+
+    def test_unsigned_or_foreign_quote_file_is_rejected(self):
+        q = self.quote()
+        f = self.s.state / "quotes" / f"{q['id']}.json"
+        rec = json.loads(f.read_text())
+        rec["doc"]["sig"] = "00" * 64
+        f.write_text(json.dumps(rec))
+        self.pay(q, 1)
+        self.assertIn("not signed", self.report(q, 1)[0][2])
+
+    def test_listing_change_keeps_earlier_quotes_payable(self):
+        q_old = self.quote(hours=1)             # at 1.00
+        self.clock.t += 60
+        self.s.relist("2.00")
+        q_new = self.quote(hours=1)
+        self.assertGreater(q_new["amount"], 2_000_000)
+        self.pay(q_old, 1, when=T0 + 30)
+        self.pay(q_new, 2, when=T0 + 90)
+        self.assertEqual(self.report(q_old, 1)[0][1], "admit")
+        self.assertEqual(self.report(q_new, 2)[0][1], "admit")
+        # a "1.00" quote dated after the change is refused, even if signed with the quote key
+        q3 = self.quote(hours=1)
+        forged = self.tamper(q3, amount=1_000_500, price_per_hour=1_000_000,
+                             issued=self.clock.t + W.LISTING_SKEW_S + 1,
+                             expires=self.clock.t + W.LISTING_SKEW_S + 600)
+        self.pay(forged, 3, when=forged["issued"] + 10)
+        self.assertIn("quote_does_not_match_listing", self.report(forged, 3)[0][2])
+
+    def test_previous_listing_from_the_installer_is_honoured(self):
+        q_old = self.quote(hours=1)             # at 1.00, the watcher never saw this listing
+        prev = self.s.listing_path.with_name("previous.json")
+        prev.write_text(json.dumps(self.s.listing_doc))
+        import os
+        os.utime(prev, (T0 + 60, T0 + 60))      # when the installer replaced it
+        self.s.relist("3.00")
+        w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path,
+                      issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2, admission=A,
+                      clock=self.clock, state_file=self.s.d / "fresh-state.json")
+        self.w = w
+        self.pay(q_old, 1)
+        self.assertEqual(self.report(q_old, 1)[0][1], "admit")
+
+    def test_missing_or_bad_listing_waits_instead_of_rejecting(self):
+        q = self.quote()
+        self.pay(q, 1)
+        good = self.s.listing_path.read_text()
+        self.s.listing_path.write_text(good.replace('"max_hours": 168', '"max_hours": 9999'))
+        out = self.report(q, 1)
+        self.assertEqual(out[0][1], "wait")
+        self.assertTrue(out[0][2].startswith("listing_unavailable"))
+        self.s.listing_path.write_text(good)
+        self.clock.t += W.BACKOFF_S[0]
+        self.assertEqual(self.w.poll_spool()[0][1], "admit")
 
 
 if __name__ == "__main__":

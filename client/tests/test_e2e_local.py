@@ -129,7 +129,7 @@ class EndToEnd(unittest.TestCase):
                     "--dir", str(self.s.state), "--quote-key", str(self.s.quote_key), "--listing",
                     str(self.s.listing_path), "--testnets"])
         self.spawn([sys.executable, str(SELLER_DIR / "watcher.py"), "--dir", str(self.s.state), "--seller", self.s.sesh,
-                    "--issuer-key", str(self.s.issuer), "--store", str(self.s.store), "--rpc", f"{CHAIN}={self.rpc}",
+                    "--listing", str(self.s.listing_path), "--issuer-key", str(self.s.issuer), "--store", str(self.s.store), "--rpc", f"{CHAIN}={self.rpc}",
                     "--testnets", "--interval", "1", "--confirmations", "2"])
         self.home = Path(tempfile.mkdtemp())
         (self.home / "visibility.ack").write_text("I UNDERSTAND\n")
