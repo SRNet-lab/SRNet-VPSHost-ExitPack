@@ -1,41 +1,46 @@
-"""evm.py: stdlib ABI encoding and EIP-191 recovery, checked against cast output."""
-import sys
+"""evm.py: stdlib ABI encoding and Transfer log decoding."""
 import unittest
-from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent))
-import evm  # noqa: E402
+from fixtures import evm
 
-# anvil account 0; signature produced by `cast wallet sign`.
-ADDR0 = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-SIG = ("0x889a82ad9d0cafcca82ef531bb2864ed34e5c9338171aa20637fb42cc1cb790c"
-       "0fec37e224557fd491d06a2fd3d139f0d1d57af66b0f2b779c2f14dcb193cca51c")
+ADDR = "0x" + "ab" * 20
 
 
 class Evm(unittest.TestCase):
     def test_selector_and_encoding(self):
         self.assertEqual(evm.selector("transfer(address,uint256)").hex(), "a9059cbb")
-        got = evm.encode_call("startLease(bytes32,uint256,uint256)", "0x" + "bb" * 32, 1_000_000, 1).hex()
-        self.assertEqual(got, "427bb23a" + "bb" * 32 + f"{1_000_000:064x}" + f"{1:064x}")
+        self.assertEqual(evm.selector("balanceOf(address)").hex(), "70a08231")
+        got = evm.encode_call("transfer(address,uint256)", ADDR, 7).hex()
+        self.assertEqual(got, "a9059cbb" + "00" * 12 + "ab" * 20 + f"{7:064x}")
 
     def test_decode(self):
         raw = bytes.fromhex("00" * 12 + "11" * 20 + f"{7:064x}" + f"{1:064x}")
         self.assertEqual(evm.decode(["address", "uint256", "bool"], raw), ("0x" + "11" * 20, 7, True))
 
-    def test_recover_matches_cast(self):
-        self.assertTrue(evm.verify_personal(ADDR0, "hello srnet", SIG))
-        self.assertFalse(evm.verify_personal(ADDR0, "hello srnet!", SIG))
-        self.assertFalse(evm.verify_personal("0x" + "11" * 20, "hello srnet", SIG))
-        self.assertFalse(evm.verify_personal(ADDR0, "hello srnet", "0x1234"))
-        self.assertFalse(evm.verify_personal(ADDR0, "hello srnet", "zz"))
+    def test_transfer_topic(self):
+        from keccak256 import keccak256
+        self.assertEqual("0x" + keccak256(b"Transfer(address,address,uint256)").hex(), evm.TRANSFER_TOPIC)
 
-    def test_chains(self):
-        self.assertIn(42161, evm.CHAINS)
-        for c in (421614, 84532, 11155111):
-            self.assertNotIn(c, evm.CHAINS)
-        self.assertNotIn(1, evm.CHAINS)
+    def test_decode_transfer(self):
+        log = {"address": "0xAF88d065e77c8cC2239327C5EDb3A432268e5831",
+               "topics": [evm.TRANSFER_TOPIC, evm.addr_topic("0x" + "11" * 20), evm.addr_topic(ADDR)],
+               "data": hex(3_000_417), "transactionHash": "0x" + "AB" * 32, "blockNumber": "0x10", "logIndex": "0x0"}
+        t = evm.decode_transfer(log)
+        self.assertEqual(t["token"], "0xaf88d065e77c8cc2239327c5edb3a432268e5831")
+        self.assertEqual((t["from"], t["to"], t["value"], t["block"]), ("0x" + "11" * 20, ADDR, 3_000_417, 16))
+        self.assertIsNone(evm.decode_transfer({**log, "topics": log["topics"][:2]}))  # ERC-721 style / junk
+        self.assertIsNone(evm.decode_transfer({**log, "topics": ["0x" + "00" * 32] + log["topics"][1:]}))
+        self.assertIsNone(evm.decode_transfer({"topics": None}))
+        rc = {"status": "0x1", "logs": [log, {"address": ADDR, "topics": [], "data": "0x"}]}
+        self.assertEqual(len(evm.receipt_transfers(rc)), 1)
+        self.assertTrue(evm.receipt_ok(rc))
+        self.assertFalse(evm.receipt_ok({"status": "0x0"}))
+
+    def test_no_signing_code(self):
+        from pathlib import Path
+        src = Path(evm.__file__).read_text()
+        for word in ("eth_sendRawTransaction", "eth_sendTransaction", "private", "sign("):
+            self.assertNotIn(word, src)
 
 
 if __name__ == "__main__":

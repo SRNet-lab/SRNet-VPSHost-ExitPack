@@ -1,19 +1,15 @@
-"""Buyer-side connect flow with spend-after-map ordering (exit lease admission).
+"""Buyer-side connect flow (exit lease admission).
 
 Nothing is relied on until the exit has actually admitted us. Ordering:
 
-  1. reserve()   lease prepaid (SRNetBalance startLease: rate per hour x whole
-                 hours, FINAL at start; each hour is the seller's as it begins). The
-                 seller's watcher writes the signed admission, one paid hour at a time.
-  2. map_exit()  MapExit full_tunnel to the seller's exit.
+  1. reserve()       check we hold paid time for this seller (bought beforehand with a direct
+                     USDC payment; the seller's watcher wrote the signed admission).
+  2. map_exit()      MapExit full_tunnel to the seller's exit.
   3. wait_capable()  session live and EXIT_CAPABLE (exit admitted us).
-  4. commit()    keep the paid hour (no transaction); the client renews hourly.
+  4. commit()        record the connection.
 
-Any failure after reserve() -> unmap (best effort) + release(): there is NO buyer
-cancel and no refund, so release() only stops hourly auto-renew. The loss is the
-prepaid hour (the client buys 1 hour at a time by default). Only the seller can
-stop a lease early, and then unused whole hours return to the buyer.
-The CLI (`srnet connect`) drives this with real backends; tests use fakes.
+Any failure after reserve() -> unmap (best effort) + release(). Payments are final, so release()
+only clears local state. The CLI (`srnet connect`) drives this with real backends; tests use fakes.
 """
 from __future__ import annotations
 

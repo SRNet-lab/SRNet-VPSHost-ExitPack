@@ -6,9 +6,9 @@ check that the offer really comes from the .sesh it names (the .sesh IS the Ed25
 z-base32 encoded).
 
   listing.py make   --identity exit.key --price-per-hour-usdc 1.00 [--max-hours 168] \
-                    --payout 0x... --vendor-id 0x... --chainid 42161 --contract 0x... \
-                    --country US [--region "US-Central"] [--policy tcp/443 --policy tcp/80] \
-                    [--speed-cap-mbps 10] [--claim-url http://<claim>.sesh/claim] > listing.json
+                    --payout 0x... --chain arbitrum --chain base --quote-key-file quote.key \
+                    --claim-url http://<claim>.sesh/claim --country US [--region "US-Central"] \
+                    [--policy tcp/443 --policy tcp/80] [--speed-cap-mbps 10] > listing.json
   listing.py verify listing.json        # exit 0 if the signature matches the named .sesh
   listing.py refresh --identity exit.key --listing listing.json [--submit-url URL]
                                         # re-sign with a new 'issued' time (same offer) and,
@@ -16,25 +16,27 @@ z-base32 encoded).
 
 Liveness: the seller pack refreshes the listing every hour (srnet-seller-listing.timer). Boards
 hide a listing that has not been refreshed for 3 hours and show it again on the next valid
-refresh, as long as the payout fields are unchanged.
+refresh.
 
-Listing body ("v":2, everything priced by the hour):
-  {"v":2, "seller":"<.sesh>", "issued":<unix>, "price_per_hour_usdc":"1.00", "max_hours":168,
-   "payout":"0x..", "vendor_id":"0x..", "chainid":N, "contract":"0x..", "country":"US", "region":"..", "policy":[..],
-   "claim_url":"http://<claim>.sesh/claim", "exit_version":"0.1.0",
-   "speed_cap_mbps":10}
-country is the ISO 3166-1 alpha-2 code (uppercase) of the exit's IP; required by `make`, but older
-listings without it stay valid (shown as unknown). region is optional finer detail.
-speed_cap_mbps (optional) is the per-buyer speed cap in Mbit/s each way; 0 = unlimited. Listings
-without it are valid (cap unknown).
-exit_version (optional) is the seller pack version, read from VERSION next to this file and
-updated on every refresh. It is self-reported and not checked. Listings without it are valid.
-dns (optional) is the exit's own resolver, an IPv4 address inside the tunnel (private range) that
-buyers send all their DNS to while connected. Listings without it offer no exit resolver.
-claim_url (optional) is where buyers POST their signed lease claim (claimd.py). It is a separate
-.sesh from the seller's, because the exit identity does not accept inbound sessions from buyers
-that are not admitted yet.
-Buyers pick whole hours (>= 1); lease amount = price_per_hour x hours, capped at $20 by the contract.
+Listing body ("v":3, priced by the hour, paid in USDC straight to the seller):
+  {"v":3, "seller":"<.sesh>", "issued":<unix>, "price_per_hour_usdc":"1.00", "max_hours":168,
+   "payout":"0x..", "chains":[42161, 8453], "token":"USDC", "quote_key":"<hex32>",
+   "claim_url":"http://<claim>.sesh/claim", "country":"US", "region":"..", "policy":[..],
+   "exit_version":"0.2.0", "speed_cap_mbps":10, "dns":"10.195.0.53"}
+chains: where the seller takes USDC. Only the chains in chains.py are allowed, and the token
+address always comes from chains.py, never from the listing.
+quote_key: public key that signs this seller's payment quotes (quote.py). It is a separate key
+so the claim host can sign quotes without holding the exit identity.
+claim_url: where buyers ask for quotes and report payments (claimd.py). It is a separate .sesh
+from the seller's, because the exit identity does not accept sessions from buyers that are not
+admitted yet.
+country is the ISO 3166-1 alpha-2 code of the exit's IP; region is optional finer detail.
+speed_cap_mbps (optional) is the per-buyer cap in Mbit/s each way; 0 = unlimited.
+exit_version (optional) is the seller pack version, read from VERSION next to this file.
+dns (optional) is the exit's own resolver, a private IPv4 address inside the tunnel.
+
+Older v2 listings (paid through a contract) can't be bought with this version. Buyers see them
+as "seller needs to update" until boards drop them.
 
 identity file: the session-router keyfile (128 hex chars = 32-byte seed || 32-byte pubkey).
 """
@@ -53,6 +55,9 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chains as C  # noqa: E402
+
 ZB32 = "ybndrfg8ejkmcpqxot1uwisza345h769"
 DOMAIN = "srnet-exit-listing/v1"
 CLAIM_URL_RE = re.compile(r"^http://[ybndrfg8ejkmcpqxot1uwisza345h769]{52}\.sesh/claim$")
@@ -70,6 +75,67 @@ def pack_version() -> str:
 
 
 COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
+HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
+PRICE_RE = re.compile(r"^[0-9]{1,6}(\.[0-9]{1,6})?$")
+LISTING_VERSION = 3
+NEEDS_UPDATE = "seller needs to update"
+
+
+def _int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def listing_error(body, testnets: bool = False) -> str | None:
+    """Why a (signature-valid) listing can't be bought from, or None if it can.
+
+    Old v2 listings give NEEDS_UPDATE."""
+    if not isinstance(body, dict):
+        return "bad listing"
+    if body.get("v") in (1, 2):
+        return NEEDS_UPDATE
+    if body.get("v") != LISTING_VERSION:
+        return "unsupported listing version"
+    for f in ("seller", "issued", "price_per_hour_usdc", "max_hours", "payout", "chains", "token", "quote_key",
+              "claim_url"):
+        if f not in body:
+            return f"missing {f}"
+    for f in ("vendor_id", "contract", "chainid"):
+        if f in body:
+            return f"unexpected {f}"
+    if not (isinstance(body["payout"], str) and ADDR_RE.match(body["payout"])) or int(body["payout"], 16) == 0:
+        return "bad or zero payout"
+    ch = body["chains"]
+    if not (isinstance(ch, list) and ch and len(ch) == len(set(ch)) and all(_int(c) for c in ch)):
+        return "bad chains"
+    if not all(C.supported(c, testnets) for c in ch):
+        return "unsupported chain"
+    if body["token"] != C.TOKEN:
+        return "only USDC is supported"
+    if not (isinstance(body["quote_key"], str) and HEX32_RE.match(body["quote_key"])):
+        return "bad quote_key"
+    if not (isinstance(body["claim_url"], str) and CLAIM_URL_RE.match(body["claim_url"])):
+        return "bad claim_url"
+    pr, mh = body["price_per_hour_usdc"], body["max_hours"]
+    if not (isinstance(pr, str) and PRICE_RE.match(pr) and float(pr) > 0):
+        return "bad price_per_hour_usdc"
+    if not (_int(mh) and 1 <= mh <= 999):
+        return "bad max_hours"
+    if "exit_version" in body and not (isinstance(body["exit_version"], str)
+                                       and EXIT_VERSION_RE.match(body["exit_version"])):
+        return "bad exit_version"
+    if "country" in body and not (isinstance(body["country"], str) and COUNTRY_RE.match(body["country"])):
+        return "bad country"
+    if "speed_cap_mbps" in body and not valid_speed_cap(body["speed_cap_mbps"]):
+        return "bad speed_cap_mbps"
+    if "dns" in body and not valid_dns(body["dns"]):
+        return "bad dns"
+    if "region" in body and not (isinstance(body["region"], str) and len(body["region"]) <= 64):
+        return "bad region"
+    if "policy" in body and not (isinstance(body["policy"], list) and len(body["policy"]) <= 32
+                                 and all(isinstance(p, str) and len(p) <= 32 for p in body["policy"])):
+        return "bad policy"
+    return None
 
 
 def valid_dns(v) -> bool:
@@ -167,7 +233,7 @@ def canonical(body: dict) -> bytes:
 
 def make(key: Ed25519PrivateKey, **fields) -> dict:
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    body = {"v": 2, "seller": sesh_of(pub), "issued": int(time.time()), **fields}
+    body = {"v": LISTING_VERSION, "seller": sesh_of(pub), "issued": int(time.time()), **fields}
     return {"listing": body, "sig": key.sign(canonical(body)).hex()}
 
 
@@ -200,6 +266,8 @@ def refresh(key: Ed25519PrivateKey, path: str | Path) -> dict:
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     if body.get("seller") != sesh_of(pub):
         raise ValueError("listing seller does not match this identity key")
+    if body.get("v") != LISTING_VERSION:
+        raise ValueError("this is an old v2 listing; make a new one (the seller pack installer does this)")
     fields = {k: v for k, v in body.items() if k not in ("v", "seller", "issued")}
     ver = pack_version()
     if ver:
@@ -233,14 +301,16 @@ def main(argv=None) -> int:
     m.add_argument("--price-per-hour-usdc", "--price-usdc", dest="price_per_hour_usdc", required=True,
                    help="USDC per hour, e.g. 1.00")
     m.add_argument("--max-hours", type=int, default=168)
-    m.add_argument("--payout", required=True)
-    m.add_argument("--vendor-id", required=True)
-    m.add_argument("--chainid", type=int, required=True)
-    m.add_argument("--contract", required=True)
+    m.add_argument("--payout", required=True, help="address that receives the USDC")
+    m.add_argument("--chain", action="append", default=[],
+                   help="chain to take payments on: arbitrum, base (repeatable; default both)")
+    m.add_argument("--quote-key-file", required=True, help="the claim host's quote signing key (quote.py)")
+    m.add_argument("--testnets", action="store_true", help="allow test chains (local testing only)")
+    m.add_argument("--draft", action="store_true", help="allow a zero payout (boards and buyers refuse it)")
     m.add_argument("--country", required=True, help="ISO 3166-1 alpha-2, e.g. US")
     m.add_argument("--region", default="")
     m.add_argument("--policy", action="append", default=[])
-    m.add_argument("--claim-url", default="")
+    m.add_argument("--claim-url", required=True)
     m.add_argument("--dns", default="", help="exit resolver address buyers use through the tunnel, e.g. 10.195.0.53")
     m.add_argument("--speed-cap-mbps", type=int, default=None, help="per-buyer cap, Mbit/s; 0 = unlimited")
     m.add_argument("--exit-version", default=None, help="default: the pack VERSION file")
@@ -265,10 +335,15 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "make":
         extra = {}
-        if a.claim_url:
-            if not CLAIM_URL_RE.match(a.claim_url):
-                ap.error("--claim-url must be http://<52 z-base32>.sesh/claim")
-            extra["claim_url"] = a.claim_url
+        if not CLAIM_URL_RE.match(a.claim_url):
+            ap.error("--claim-url must be http://<52 z-base32>.sesh/claim")
+        try:
+            chain_ids = [C.by_name(c, a.testnets) for c in (a.chain or ["arbitrum", "base"])]
+            C.parse_usdc(a.price_per_hour_usdc)
+        except C.ChainError as e:
+            ap.error(str(e))
+        import quote as Q
+        qk = Q.pub_hex(Q.load_key(a.quote_key_file))
         if a.dns:
             if not valid_dns(a.dns):
                 ap.error("--dns must be a private IPv4 address (the exit resolver inside the tunnel)")
@@ -287,9 +362,11 @@ def main(argv=None) -> int:
                 ap.error("--exit-version must look like 0.1.0")
             extra["exit_version"] = ver
         doc = make(load_identity(a.identity), price_per_hour_usdc=a.price_per_hour_usdc, max_hours=a.max_hours,
-                   payout=a.payout.lower(),
-                   vendor_id=a.vendor_id.lower(), chainid=a.chainid, contract=a.contract.lower(),
-                   region=a.region, policy=a.policy or ["tcp/443", "tcp/80"], **extra)
+                   payout=a.payout.lower(), chains=sorted(set(chain_ids)), token=C.TOKEN, quote_key=qk,
+                   claim_url=a.claim_url, region=a.region, policy=a.policy or ["tcp/443", "tcp/80"], **extra)
+        why = listing_error(doc["listing"], a.testnets)
+        if why and not (a.draft and why == "bad or zero payout"):
+            ap.error(why)
         print(json.dumps(doc, indent=1))
         return 0
     ok = verify(json.loads(Path(a.file).read_text()))

@@ -46,6 +46,9 @@ echo "$out" | grep -q "INSTALL .*--source" || fail "SRNET_BUILD=source ignored";
 
 ARGS=(--router "$RT"); out=$(run env SRNET_COUNTRY=NL)
 echo "$out" | grep -q "INSTALL .*--country NL" || fail "SRNET_COUNTRY not passed"; ok
+echo "$out" | grep -q -- "--chainid\|--contract" && fail "old contract flags passed"; ok
+ARGS=(--router "$RT"); out=$(run env SRNET_CHAINS="base" SRNET_CAP_USDC=5)
+echo "$out" | grep -q "INSTALL .*--chain base .*--cap-usdc 5" || fail "SRNET_CHAINS/SRNET_CAP_USDC not passed: $out"; ok
 
 # unpinned bootstrap (no --router-tarball) goes to source
 "$T/src/scripts/make-release.sh" --version v9.9.8 --out "$T/rel" >/dev/null

@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Claim endpoint. Buyers POST their signed lease claim here over Session Router.
+"""Claim endpoint. Buyers ask for payment quotes and report payments here, over Session Router.
 
-  claimd.py --host ADDR --port 80 --spool DIR --contract 0x.. --chainid N \
-            [--rpc URL --payout-wallet 0x..]
+  claimd.py --host ADDR --port 80 --dir STATE --quote-key quote.key --listing listing.json \
+            [--cap-usdc 20] [--testnets]
 
-  POST /claim   {"v":1, "hold_id":N, "client_sesh":"<buyer>.sesh", "sig":"0x..."}  (<= 1 KB)
+  POST /claim/quote        quote request (quote.py)          -> 200 signed quote
+  POST /claim/paid         paid notice {"v":1,"quote_id","tx","sig"} -> 202, checked by the watcher
+  GET  /claim/status/<id>  {"status": "waiting"|"admitted"|"rejected", ...}
+  POST /claim              old contract claims                -> 410
 
-The claim must be well formed and signed for this contract and chain. With --rpc and
---payout-wallet, the lease must also exist on chain, be active, be for this seller, and the
-signer must be its buyer (holdInfo, cached briefly). It is then written to the spool, where the
-watcher checks it against the chain exactly like a local claim. --host must be loopback or a private address (the router's
-tun address); a public address is refused. Requests are rate limited per source address and
-overall.
+Price, max hours, payout address and chains come from the signed listing, so a quote can never
+offer anything the listing doesn't. Each quote gets an exact amount whose last digits no other
+open quote on that chain uses. Bodies are at most 2 KB; requests are rate limited per source
+address and overall, and each buyer address can hold only a few open quotes at a time.
+
+STATE layout (shared with watcher.py):
+  quotes/<id>.json   issued quotes          spool/<id>-<tx>.json  paid notices for the watcher
+  status/<id>.json   watcher results        quotes.lock           serialises quote creation
+
+--host must be loopback or a private address (the router's tun address); a public address is
+refused.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
+import fcntl
 import ipaddress
 import json
 import os
@@ -28,14 +36,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from evm import personal_hash, recover  # noqa: E402
-from watcher import SESH_RE, claim_message  # noqa: E402
+import chains as C  # noqa: E402
+import listing as L  # noqa: E402
+import quote as Q  # noqa: E402
 
-MAX_BODY = 1024
-SIG_RE = re.compile(r"^0x[0-9a-fA-F]{130}$")
-PER_SOURCE = (10, 60.0)    # requests per window (s) from one address
-GLOBAL = (120, 60.0)       # requests per window overall
-MAX_SPOOL = 1000           # pending claims before new ones are refused
+MAX_BODY = 2048
+PER_SOURCE = (20, 60.0)    # requests per window (s) from one address
+GLOBAL = (240, 60.0)       # requests per window overall
+MAX_SPOOL = 1000           # pending paid notices before new ones are refused
+MAX_OPEN_PER_CLIENT = 3    # open (unexpired, unpaid) quotes per buyer address
+PAID_GRACE_S = 900         # paid notices accepted until this long after a quote expires
+KEEP_QUOTES_S = 2 * 86400  # quote files older than this are removed
+RESERVE_S = 3600           # a quote's amount is not reused until this long after it expires
+DEFAULT_CAP_USDC = "20"
 
 
 def bind_ok(host: str) -> bool:
@@ -71,97 +84,129 @@ class Limiter:
             return True
 
 
-def claim_signer(claim, contract: str, chainid: int) -> tuple[str | None, str | None]:
-    """(signer, None) if the claim is well formed and signed, else (None, reason)."""
-    if not isinstance(claim, dict) or set(claim) != {"v", "hold_id", "client_sesh", "sig"}:
-        return None, "bad fields"
-    if claim["v"] != 1:
-        return None, "bad version"
-    h = claim["hold_id"]
-    if not isinstance(h, int) or isinstance(h, bool) or not 0 < h < 2**64:
-        return None, "bad hold_id"
-    if not isinstance(claim["client_sesh"], str) or not SESH_RE.match(claim["client_sesh"]):
-        return None, "bad client_sesh"
-    if not isinstance(claim["sig"], str) or not SIG_RE.match(claim["sig"]):
-        return None, "bad sig"
-    msg = claim_message(contract, chainid, h, claim["client_sesh"])
-    try:
-        who = recover(personal_hash(msg), claim["sig"])
-    except Exception:
-        who = None
-    if not who:
-        return None, "bad sig"
-    return who.lower(), None
+def _write_json(path: Path, obj) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(obj, sort_keys=True))
+    os.replace(tmp, path)
 
 
-def check_claim(claim, contract: str, chainid: int) -> str | None:
-    """None if the claim is well formed and signed, else the reason."""
-    return claim_signer(claim, contract, chainid)[1]
+class Desk:
+    """Issues quotes and takes paid notices. Pure file state, so tests drive it without HTTP."""
 
+    def __init__(self, state_dir: str | Path, quote_key: str | Path, listing_path: str | Path,
+                 cap: int | None = None, testnets: bool = False, clock=time.time):
+        self.dir = Path(state_dir)
+        for sub in ("quotes", "spool", "status"):
+            (self.dir / sub).mkdir(parents=True, exist_ok=True)
+        self.key = Q.load_key(quote_key)
+        self.listing_path = Path(listing_path)
+        self.cap = C.parse_usdc(DEFAULT_CAP_USDC) if cap is None else int(cap)
+        self.testnets, self.clock = testnets, clock
+        self._listing: tuple[float, dict] | None = None
 
-class LeaseGate:
-    """Rejects claims for leases that don't exist, aren't active, aren't for this seller, or
-    weren't bought by the signer. lookup(hold_id) -> (buyer, seller_wallet, end, active)."""
+    def listing(self) -> dict:
+        m = self.listing_path.stat().st_mtime
+        if not self._listing or self._listing[0] != m:
+            doc = json.loads(self.listing_path.read_text())
+            if not L.verify(doc):
+                raise RuntimeError("listing signature is invalid")
+            body = doc["listing"]
+            why = L.listing_error(body, self.testnets)
+            if why:
+                raise RuntimeError(f"listing can't take payments: {why}")
+            if body["quote_key"] != Q.pub_hex(self.key):
+                raise RuntimeError("listing quote_key does not match --quote-key")
+            self._listing = (m, body)
+        return self._listing[1]
 
-    def __init__(self, lookup, payout_wallet: str, ttl: float = 30.0, max_entries: int = 4096,
-                 clock=time.monotonic):
-        self.lookup, self.wallet = lookup, payout_wallet.lower()
-        self.ttl, self.max, self.clock = ttl, max_entries, clock
-        self.cache: dict[int, tuple[float, tuple | None]] = {}
-        self.lock = threading.Lock()
+    def _quotes(self):
+        for f in (self.dir / "quotes").glob("*.json"):
+            try:
+                yield f, json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
 
-    def _get(self, hold_id: int):
-        now = self.clock()
-        with self.lock:
-            hit = self.cache.get(hold_id)
-            if hit and now - hit[0] < (self.ttl if hit[1] and hit[1][3] else min(self.ttl, 5.0)):
-                return hit[1]
-        try:
-            info = self.lookup(hold_id)
-        except Exception:
-            return "error"
-        with self.lock:
-            if len(self.cache) >= self.max:
-                self.cache.clear()
-            self.cache[hold_id] = (now, info)
-        return info
-
-    def check(self, hold_id: int, signer: str) -> str | None:
-        info = self._get(hold_id)
-        if info == "error":
-            return "chain unavailable"
-        if not info:
-            return "unknown lease"
-        buyer, wallet, end, active = info
-        if not active or int(end) <= time.time():
-            return "lease not active"
-        if str(wallet).lower() != self.wallet:
-            return "lease not for this seller"
-        if str(buyer).lower() != signer:
-            return "signer is not the buyer"
-        return None
-
-
-def rpc_lookup(rpc: str, contract: str):
-    from evm import JsonRpc, decode, encode_call  # noqa: E402
-
-    j = JsonRpc(rpc)
-    zero = "0x" + "00" * 20
-
-    def lookup(hold_id: int):
-        data = "0x" + encode_call("holdInfo(uint256)", hold_id).hex()
-        res = j.call("eth_call", {"to": contract, "data": data}, "latest")
-        u, _amt, wallet, end, active = decode(["address", "uint256", "address", "uint256", "bool"],
-                                              bytes.fromhex((res or "0x")[2:]))
-        if u.lower() == zero:
+    def load_quote(self, qid: str) -> dict | None:
+        if not Q.ID_RE.match(qid or ""):
             return None
-        return u, wallet, end, active
-    return lookup
+        try:
+            return json.loads((self.dir / "quotes" / f"{qid}.json").read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _paid(self, qid: str) -> bool:
+        try:
+            return json.loads((self.dir / "status" / f"{qid}.json").read_text()).get("status") == "admitted"
+        except (OSError, ValueError):
+            return False
+
+    def quote(self, req) -> tuple[int, dict]:
+        body = self.listing()
+        why = Q.request_error(req, body["seller"], body["chains"], body["max_hours"], self.testnets)
+        if why:
+            return 400, {"error": why}
+        now = int(self.clock())
+        with open(self.dir / "quotes.lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            taken: set[int] = set()
+            mine = 0
+            for f, rec in self._quotes():
+                q = rec["doc"]["quote"]
+                if now - q["issued"] > KEEP_QUOTES_S:
+                    f.unlink(missing_ok=True)
+                    continue
+                if q["expires"] + RESERVE_S < now or self._paid(q["id"]):
+                    continue
+                if q["chainid"] == req["chainid"]:
+                    taken.add(rec["pay_id"])
+                if q["client_sesh"] == req["client_sesh"] and q["expires"] > now:
+                    mine += 1
+            if mine >= MAX_OPEN_PER_CLIENT:
+                return 429, {"error": "too many open quotes for this address; pay or wait for one to expire"}
+            try:
+                doc, pid = Q.make_quote(self.key, req, payout=body["payout"],
+                                        price_per_hour=C.parse_usdc(body["price_per_hour_usdc"]), taken=taken,
+                                        cap=self.cap, now=now, testnets=self.testnets)
+            except Q.QuoteError as e:
+                return 403, {"error": str(e)}
+            _write_json(self.dir / "quotes" / f"{doc['quote']['id']}.json", {"doc": doc, "pay_id": pid})
+        return 200, doc
+
+    def paid(self, notice) -> tuple[int, dict]:
+        qid = notice.get("quote_id") if isinstance(notice, dict) else None
+        rec = self.load_quote(qid) if isinstance(qid, str) else None
+        if not rec:
+            return 404, {"error": "unknown quote"}
+        q = rec["doc"]["quote"]
+        why = Q.paid_error(notice, q)
+        if why:
+            return 403, {"error": why}
+        if self.clock() > q["expires"] + PAID_GRACE_S:
+            return 410, {"error": "quote expired; ask for a new one"}
+        if self._paid(qid):
+            return 200, self.status(qid)[1]
+        if sum(1 for _ in (self.dir / "spool").glob("*.json")) >= MAX_SPOOL:
+            return 503, {"error": "busy"}
+        name = f"{qid}-{notice['tx'][2:18]}.json"
+        if not (self.dir / "spool" / name).exists():
+            _write_json(self.dir / "spool" / name, notice)
+        return 202, {"status": "received"}
+
+    def status(self, qid: str) -> tuple[int, dict]:
+        rec = self.load_quote(qid)
+        if not rec:
+            return 404, {"error": "unknown quote"}
+        try:
+            return 200, json.loads((self.dir / "status" / f"{qid}.json").read_text())
+        except (OSError, ValueError):
+            q = rec["doc"]["quote"]
+            st = "expired" if self.clock() > q["expires"] + PAID_GRACE_S else "waiting"
+            return 200, {"status": st}
 
 
-def make_handler(spool: Path, contract: str, chainid: int, limiter: Limiter, gate: LeaseGate | None = None):
+def make_handler(desk: Desk, limiter: Limiter):
     class H(BaseHTTPRequestHandler):
-        server_version = "srnet-claim/1"
+        server_version = "srnet-claim/2"
         sys_version = ""
 
         def log_message(self, fmt, *args):  # no client addresses
@@ -170,59 +215,52 @@ def make_handler(spool: Path, contract: str, chainid: int, limiter: Limiter, gat
         def address_string(self):
             return "-"
 
-        def _send(self, code: int, text: str):
-            b = (text + "\n").encode()
+        def _send(self, code: int, obj):
+            b = (json.dumps(obj) + "\n").encode()
             self.send_response(code)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
 
         def do_GET(self):
-            self._send(404, "not found")
+            m = re.fullmatch(r"/claim/status/([0-9a-f]{16})", self.path)
+            if not m:
+                return self._send(404, {"error": "not found"})
+            if not limiter.allow(self.client_address[0]):
+                return self._send(429, {"error": "slow down"})
+            self._send(*desk.status(m.group(1)))
 
         def do_POST(self):
-            if self.path != "/claim":
-                return self._send(404, "not found")
+            if self.path == "/claim":
+                return self._send(410, {"error": "this exit takes direct USDC payments now; update SRNet Exits"})
+            if self.path not in ("/claim/quote", "/claim/paid"):
+                return self._send(404, {"error": "not found"})
             if not limiter.allow(self.client_address[0]):
-                return self._send(429, "slow down")
+                return self._send(429, {"error": "slow down"})
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 n = -1
             if n <= 0 or n > MAX_BODY:
-                return self._send(413, "too large")
+                return self._send(413, {"error": "too large"})
             try:
-                claim = json.loads(self.rfile.read(n))
+                msg = json.loads(self.rfile.read(n))
             except ValueError:
-                return self._send(400, "bad json")
-            who, why = claim_signer(claim, contract, chainid)
-            if why:
-                return self._send(400, why)
-            if gate is not None:
-                why = gate.check(claim["hold_id"], who)
-                if why == "chain unavailable":
-                    return self._send(503, why)
-                if why:
-                    return self._send(403, why)
-            if sum(1 for _ in spool.glob("*.json")) >= MAX_SPOOL:
-                return self._send(503, "busy")
-            digest = hashlib.sha256(json.dumps(claim, sort_keys=True).encode()).hexdigest()[:16]
-            name = f"hold-{claim['hold_id']}-{digest}.json"
-            if (spool / name).exists() or (spool / "done" / name).exists():
-                return self._send(202, "already received")
-            tmp = spool / f".{name}.tmp"
-            tmp.write_text(json.dumps(claim))
-            os.replace(tmp, spool / name)
-            return self._send(202, "received")
+                return self._send(400, {"error": "bad json"})
+            try:
+                if self.path == "/claim/quote":
+                    return self._send(*desk.quote(msg))
+                return self._send(*desk.paid(msg))
+            except RuntimeError as e:
+                sys.stderr.write(f"claimd: {e}\n")
+                return self._send(503, {"error": "seller is not set up to take payments right now"})
     return H
 
 
-def serve(host: str, port: int, spool: Path, contract: str, chainid: int,
-          limiter: Limiter | None = None, gate: LeaseGate | None = None) -> ThreadingHTTPServer:
+def serve(host: str, port: int, desk: Desk, limiter: Limiter | None = None) -> ThreadingHTTPServer:
     if not bind_ok(host):
         raise SystemExit("refusing to bind a public address; use the router's tun address")
-    spool.mkdir(parents=True, exist_ok=True)
     cls = ThreadingHTTPServer
     if ":" in host:
         import socket
@@ -230,26 +268,23 @@ def serve(host: str, port: int, spool: Path, contract: str, chainid: int,
         class V6(ThreadingHTTPServer):
             address_family = socket.AF_INET6
         cls = V6
-    return cls((host, port), make_handler(spool, contract.lower(), int(chainid), limiter or Limiter(), gate))
+    return cls((host, port), make_handler(desk, limiter or Limiter()))
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=80)
-    ap.add_argument("--spool", required=True)
-    ap.add_argument("--contract", required=True)
-    ap.add_argument("--chainid", type=int, required=True)
-    ap.add_argument("--rpc", help="check each claim's lease on chain before spooling")
-    ap.add_argument("--payout-wallet", help="this seller's payout address (with --rpc)")
+    ap.add_argument("--dir", required=True, help="state directory shared with watcher.py")
+    ap.add_argument("--quote-key", required=True)
+    ap.add_argument("--listing", required=True, help="this exit's signed listing.json")
+    ap.add_argument("--cap-usdc", default=DEFAULT_CAP_USDC, help="largest single payment to quote (default 20)")
+    ap.add_argument("--testnets", action="store_true")
     a = ap.parse_args(argv)
-    gate = None
-    if a.rpc or a.payout_wallet:
-        if not (a.rpc and a.payout_wallet and re.fullmatch(r"0x[0-9a-fA-F]{40}", a.payout_wallet)):
-            ap.error("--rpc and --payout-wallet go together")
-        gate = LeaseGate(rpc_lookup(a.rpc, a.contract.lower()), a.payout_wallet)
-    srv = serve(a.host, a.port, Path(a.spool), a.contract, a.chainid, gate=gate)
-    print(f"claims on http://[{a.host}]:{srv.server_address[1]}/claim", flush=True)
+    desk = Desk(a.dir, a.quote_key, a.listing, cap=C.parse_usdc(a.cap_usdc), testnets=a.testnets)
+    desk.listing()  # fail early on a bad setup
+    srv = serve(a.host, a.port, desk)
+    print(f"claims on http://[{a.host}]:{srv.server_address[1]}/claim/", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

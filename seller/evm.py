@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Minimal EVM access for the seller pack, standard library only.
+"""Minimal read-only EVM access, standard library only.
 
-JSON-RPC over HTTP(S), static ABI encode/decode (uint256, address, bytes32, bool),
-and EIP-191 personal_sign recovery on secp256k1. Read-only: nothing here holds a key
-or sends a transaction.
+JSON-RPC over HTTP(S), static ABI encode/decode, and USDC Transfer log decoding. Nothing here
+holds a key or sends a transaction: the seller pack and the buyer add-on only ever read the chain.
 """
 from __future__ import annotations
 
@@ -16,9 +15,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from keccak256 import keccak256  # noqa: E402
 
-LOCAL_CHAINS = {31337: "anvil"}  # local test chain only
-MAINNET_CHAINS = {42161: "arbitrum-one"}
-CHAINS = {**MAINNET_CHAINS, **LOCAL_CHAINS}
+# keccak256("Transfer(address,address,uint256)")
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
 class RpcError(Exception):
@@ -26,22 +24,78 @@ class RpcError(Exception):
 
 
 class JsonRpc:
-    def __init__(self, url: str, timeout: float = 20):
-        self.url, self.timeout, self._id = url, timeout, 0
+    def __init__(self, url: str, timeout: float = 20, agent: str = "srnet-exits"):
+        self.url, self.timeout, self.agent, self._id = url, timeout, agent, 0
 
     def call(self, method: str, *params):
         self._id += 1
         body = json.dumps({"jsonrpc": "2.0", "id": self._id, "method": method, "params": list(params)}).encode()
         req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json",
-                                                                   "User-Agent": "srnet-seller"})
+                                                                   "User-Agent": self.agent})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 resp = json.loads(r.read())
         except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
             raise RpcError(f"rpc {self.url}: {getattr(e, 'reason', e)}") from e
+        if not isinstance(resp, dict):
+            raise RpcError(f"rpc {method}: bad response")
         if resp.get("error"):
-            raise RpcError(f"rpc {method}: {resp['error'].get('message', resp['error'])}")
+            err = resp["error"]
+            raise RpcError(f"rpc {method}: {err.get('message', err) if isinstance(err, dict) else err}")
         return resp.get("result")
+
+    # convenience reads
+    def chain_id(self) -> int:
+        return int(self.call("eth_chainId"), 16)
+
+    def block_number(self) -> int:
+        return int(self.call("eth_blockNumber"), 16)
+
+    def block_time(self, number: int | str) -> int:
+        tag = hex(number) if isinstance(number, int) else number
+        b = self.call("eth_getBlockByNumber", tag, False)
+        if not b:
+            raise RpcError(f"block {number} not found")
+        return int(b["timestamp"], 16)
+
+    def receipt(self, tx: str) -> dict | None:
+        return self.call("eth_getTransactionReceipt", tx)
+
+    def transfer_logs(self, token: str, to: str, from_block: int, to_block: int | str = "latest") -> list[dict]:
+        tb = hex(to_block) if isinstance(to_block, int) else to_block
+        return self.call("eth_getLogs", {"address": token, "fromBlock": hex(from_block), "toBlock": tb,
+                                         "topics": [TRANSFER_TOPIC, None, addr_topic(to)]}) or []
+
+    def erc20_balance(self, token: str, who: str) -> int:
+        data = "0x" + encode_call("balanceOf(address)", who).hex()
+        return int(self.call("eth_call", {"to": token, "data": data}, "latest") or "0x0", 16)
+
+
+def addr_topic(addr: str) -> str:
+    return "0x" + "00" * 12 + addr.lower()[2:]
+
+
+def decode_transfer(log: dict) -> dict | None:
+    """{"token", "from", "to", "value", "tx", "block", "index"} for an ERC-20 Transfer log, else None."""
+    try:
+        topics = log["topics"]
+        if len(topics) != 3 or topics[0].lower() != TRANSFER_TOPIC:
+            return None
+        return {"token": log["address"].lower(), "from": "0x" + topics[1][-40:].lower(),
+                "to": "0x" + topics[2][-40:].lower(), "value": int(log["data"], 16),
+                "tx": str(log.get("transactionHash", "")).lower(),
+                "block": int(log["blockNumber"], 16) if log.get("blockNumber") else None,
+                "index": int(log["logIndex"], 16) if log.get("logIndex") else None}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def receipt_transfers(receipt: dict) -> list[dict]:
+    return [t for t in (decode_transfer(lg) for lg in (receipt or {}).get("logs") or []) if t]
+
+
+def receipt_ok(receipt: dict) -> bool:
+    return str((receipt or {}).get("status", "")).lower() in ("0x1", "1")
 
 
 # ---------------------------------------------------------------- ABI (static types only)
@@ -89,73 +143,3 @@ def decode(types: list[str], data: bytes) -> tuple:
         else:
             raise ValueError(f"unsupported ABI type {t}")
     return tuple(out)
-
-
-# ---------------------------------------------------------------- secp256k1 recovery
-_P = 2**256 - 2**32 - 977
-_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
-      0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
-
-
-def _add(a, b):
-    if a is None:
-        return b
-    if b is None:
-        return a
-    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
-        return None
-    if a == b:
-        m = 3 * a[0] * a[0] * pow(2 * a[1], -1, _P)
-    else:
-        m = (b[1] - a[1]) * pow(b[0] - a[0], -1, _P)
-    x = (m * m - a[0] - b[0]) % _P
-    return x, (m * (a[0] - x) - a[1]) % _P
-
-
-def _mul(k, pt):
-    r = None
-    while k:
-        if k & 1:
-            r = _add(r, pt)
-        pt = _add(pt, pt)
-        k >>= 1
-    return r
-
-
-def personal_hash(message: str | bytes) -> bytes:
-    m = message.encode() if isinstance(message, str) else message
-    return keccak256(b"\x19Ethereum Signed Message:\n" + str(len(m)).encode() + m)
-
-
-def recover(msg_hash: bytes, sig: str | bytes) -> str | None:
-    """Address (lowercase 0x) that produced a 65-byte r||s||v signature over msg_hash, or None."""
-    try:
-        b = bytes.fromhex(sig[2:] if isinstance(sig, str) and sig.startswith("0x") else sig) \
-            if isinstance(sig, str) else bytes(sig)
-    except ValueError:
-        return None
-    if len(b) != 65:
-        return None
-    r, s, v = int.from_bytes(b[:32], "big"), int.from_bytes(b[32:64], "big"), b[64]
-    v = v - 27 if v >= 27 else v
-    if v not in (0, 1) or not (0 < r < _N) or not (0 < s < _N):
-        return None
-    y2 = (pow(r, 3, _P) + 7) % _P
-    y = pow(y2, (_P + 1) // 4, _P)
-    if y * y % _P != y2:
-        return None
-    if y & 1 != v:
-        y = _P - y
-    e = int.from_bytes(msg_hash, "big")
-    rinv = pow(r, -1, _N)
-    q = _add(_mul(s * rinv % _N, (r, y)), _mul((-e * rinv) % _N, _G))
-    if q is None:
-        return None
-    pub = q[0].to_bytes(32, "big") + q[1].to_bytes(32, "big")
-    return "0x" + keccak256(pub)[12:].hex()
-
-
-def verify_personal(address: str, message: str, sig: str) -> bool:
-    got = recover(personal_hash(message), sig)
-    return got is not None and got == address.lower()

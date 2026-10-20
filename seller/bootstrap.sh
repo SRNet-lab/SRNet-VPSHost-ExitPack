@@ -6,7 +6,7 @@
 #   sudo SRNET_PAYOUT=0x... SRNET_PRICE_PER_HOUR_USDC=1.00 \
 #        SRNET_ACCEPT_EXIT_RESPONSIBILITY=yes bash srnet-bootstrap.sh --non-interactive
 #
-# Optional environment: SRNET_CONTRACT, SRNET_CHAINID (42161), SRNET_RPC, SRNET_COUNTRY (default: detected), SRNET_REGION,
+# Optional environment: SRNET_CHAINS ("arbitrum base"), SRNET_CAP_USDC (20), SRNET_COUNTRY (default: detected), SRNET_REGION,
 # SRNET_BOARD_SUBMIT_URL, SRNET_BUILD=release|source, SRNET_EXTRA_ARGS (passed to install.sh).
 #
 # Router binary: the pinned release tarball (session-router-<version>-linux-x86_64.tar.gz) is
@@ -18,7 +18,6 @@ set -euo pipefail
 RELEASE=@RELEASE@
 PACK_URL=@PACK_URL@
 PACK_SHA256=@PACK_SHA256@
-DEFAULT_CONTRACT=@DEFAULT_CONTRACT@
 DEFAULT_BOARD_SUBMIT_URL=@DEFAULT_BOARD_SUBMIT_URL@
 ROUTER_URL=@ROUTER_URL@
 ROUTER_SHA256=@ROUTER_SHA256@
@@ -85,11 +84,10 @@ D=$(find "$W" -mindepth 1 -maxdepth 1 -type d | head -1)
 [ -x "$D/seller/install.sh" ] || die "pack layout unexpected"
 
 ARGS=(--enable-exit --i-accept-exit-operator-responsibility
-      --payout "$SRNET_PAYOUT" --price-per-hour-usdc "$SRNET_PRICE_PER_HOUR_USDC"
-      --chainid "${SRNET_CHAINID:-42161}")
-C=${SRNET_CONTRACT:-$DEFAULT_CONTRACT}; [[ "$C" =~ ^0x[0-9a-fA-F]{40}$ ]] && ARGS+=(--contract "$C")
+      --payout "$SRNET_PAYOUT" --price-per-hour-usdc "$SRNET_PRICE_PER_HOUR_USDC")
+for c in ${SRNET_CHAINS:-}; do [[ "$c" =~ ^[a-z0-9-]+$ ]] || die "bad SRNET_CHAINS entry $c"; ARGS+=(--chain "$c"); done
+[ -n "${SRNET_CAP_USDC:-}" ] && ARGS+=(--cap-usdc "$SRNET_CAP_USDC")
 B=${SRNET_BOARD_SUBMIT_URL:-$DEFAULT_BOARD_SUBMIT_URL}; [[ "$B" =~ ^https?:// ]] && ARGS+=(--board-submit-url "$B")
-[ -n "${SRNET_RPC:-}" ] && ARGS+=(--rpc "$SRNET_RPC")
 [ -n "${SRNET_REGION:-}" ] && ARGS+=(--region "$SRNET_REGION")
 [ -n "${SRNET_COUNTRY:-}" ] && ARGS+=(--country "$SRNET_COUNTRY")
 # Pinned release binary, else build from source.

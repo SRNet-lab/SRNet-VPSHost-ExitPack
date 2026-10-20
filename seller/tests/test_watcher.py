@@ -1,219 +1,209 @@
+"""watcher.py: verify a reported payment on chain, then admit the bound buyer for the quoted hours."""
 import json
-import subprocess
-import sys
-import tempfile
-import time
 import unittest
-from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
-sys.path.insert(0, str(HERE.parent.parent / "exit-lease"))
-sys.path.insert(0, str(HERE.parent.parent / "contrib" / "exit-lease"))
-import watcher as W  # noqa: E402
-import admission as A  # noqa: E402
+from fixtures import A, C, CLIENT, OTHER, PAYOUT, Q, T0, FakeChains, Seller, buyer_key, tx
+import claimd as D
+import watcher as W
 
-SELLER = "yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo.sesh"  # valid z-base32 fixture (0x01 * 32)
-CLIENT = "ycbogyadycbogyadycbogyadycbogyadycbogyadycbogyadycbo.sesh"  # valid z-base32 fixture (0x03 * 32)
-OURS = "0x" + "aa" * 20
-OTHER = "0x" + "bb" * 20
-USER = "0x" + "11" * 20
+HOUR = 3600
+
+
+class Clock:
+    def __init__(self, t=T0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
 
 
 class WatcherTest(unittest.TestCase):
     def setUp(self):
-        self.d = Path(tempfile.mkdtemp())
-        self.key = self.d / "issuer.key"
-        self.pub = A.keygen(self.key)
-        self.store = self.d / "adm.json"
-        self.now = int(time.time())
-        self.chain = W.MockChain(clock=self.now)
-        self.w = W.Watcher(self.chain, W.MockVerifier(), payout_wallet=OURS, seller_sesh=SELLER,
-                           issuer_key=str(self.key), store=str(self.store), state=str(self.d / "st.json"),
-                           min_amount=100, provisional_ttl=900, paid_ttl=3600)
+        self.s = Seller(price="1.00")
+        self.clock = Clock()
+        self.desk = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)
+        self.chains = FakeChains(42161, 8453)
+        self.w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh,
+                           issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2,
+                           admission=A, clock=self.clock)
+        self.bk, self.bpub = buyer_key()
 
-    def hold(self, hid, wallet=OURS, amount=100, active=True, dl=3600, rate=None, start=None):
-        self.chain.holds[hid] = W.Hold(USER, amount, wallet, self.now + dl, active, rate_per_hour=rate,
-                                       start=None if start is None else self.now + start)
+    def quote(self, hours=2, chainid=42161, client=CLIENT, key=None):
+        k, pub = key or (self.bk, self.bpub)
+        code, doc = self.desk.quote(Q.make_request(self.s.sesh, client, hours, chainid, pub))
+        self.assertEqual(code, 200, doc)
+        return doc["quote"]
 
-    def claim(self, hid, client=CLIENT, signer=USER):
-        msg = W.claim_message(self.chain.contract, self.chain.chainid, hid, client)
-        return {"v": 1, "hold_id": hid, "client_sesh": client, "sig": f"mock:{signer.lower()}:{msg}"}
+    def pay(self, q, n, value=None, token=None, to=PAYOUT, when=None, chainid=None, ok=True, block=None):
+        rpc = self.chains.get(chainid or q["chainid"])
+        rpc.mine(tx(n), [(token or C.usdc(q["chainid"]), to, q["amount"] if value is None else value)],
+                 when=T0 + 20 if when is None else when, ok=ok, block=block)
+        rpc.head += 5
 
-    def verify(self, client=CLIENT):
-        recs = A.Store(self.store).records()
-        return [A.verify_record(r, self.pub, SELLER, client) for r in recs]
+    def report(self, q, n, key=None):
+        code, _ = self.desk.paid(Q.make_paid(key or self.bk, q, tx(n)))
+        self.assertEqual(code, 202)
+        return self.w.poll_spool()
 
-    def test_valid_claim_admits_and_caps_at_deadline(self):
-        self.hold(1, dl=300)
-        ok, tid = self.w.handle_claim(self.claim(1))
-        self.assertTrue(ok, tid)
-        self.assertEqual(tid, "hold-31337-1-h0")
-        rec = A.Store(self.store).records()[0]
-        self.assertLessEqual(rec["exp"], self.now + 300 + 2)  # lease end
-        self.assertEqual(self.verify(), ["admission"])
+    def spool(self, q, n):
+        """A notice written straight to the spool (claimd answers paid quotes itself)."""
+        (self.s.state / "spool" / f"{q['id']}-{n}.json").write_text(json.dumps(Q.make_paid(self.bk, q, tx(n))))
+        return self.w.poll_spool()
 
-    def test_refusals(self):
-        self.hold(2, wallet=OTHER); self.hold(3, active=False); self.hold(4, dl=-1); self.hold(5, amount=500, rate=99)
-        self.hold(6)
-        cases = {
-            2: (self.claim(2), "hold_not_for_this_seller"),
-            3: (self.claim(3), "hold_not_active"),
-            4: (self.claim(4), "hold_expired"),
-            5: (self.claim(5), "rate_below_price"),
-            6: (self.claim(6, signer=OTHER), "claim_sig_not_hold_user"),
-            99: (self.claim(99), "hold_not_active"),
-        }
-        for hid, (c, why) in cases.items():
-            self.assertEqual(self.w.handle_claim(c), (False, why), hid)
-        self.assertEqual(A.Store(self.store).records(), [])
+    def status(self, q):
+        return json.loads((self.s.state / "status" / f"{q['id']}.json").read_text())
 
-    def test_claim_sig_binds_client(self):
-        self.hold(7)
-        c = self.claim(7)
-        c["client_sesh"] = SELLER  # swap client after signing
-        self.assertEqual(self.w.handle_claim(c), (False, "claim_sig_not_hold_user"))
+    def admitted(self, client=CLIENT):
+        return [r for r in A.Store(self.s.store).records() if r["client_sesh"] == client]
 
-    def test_no_double_claim(self):
-        self.hold(8)
-        ok, tid = self.w.handle_claim(self.claim(8))
-        self.assertTrue(ok)
-        self.assertEqual(self.w.handle_claim(self.claim(8)), (True, tid))  # same claim delivered twice
-        self.assertEqual(self.w.handle_claim(self.claim(8, client=SELLER)), (False, "hold_already_claimed"))
-        self.assertEqual(len(A.Store(self.store).records()), 1)
+    def test_good_payment_admits_for_quoted_hours(self):
+        q = self.quote(hours=3)
+        self.pay(q, 1)
+        (_, verdict, tid), = self.report(q, 1)
+        self.assertEqual((verdict, tid), ("admit", f"q-{q['id']}"))
+        rec, = self.admitted()
+        self.assertEqual(rec["exp"], T0 + 3 * HOUR)
+        self.assertEqual(A.verify_record(rec, self.s.issuer_pub, self.s.sesh, CLIENT, now=T0), "admission")
+        st = self.status(q)
+        self.assertEqual((st["status"], st["lease_end"]), ("admitted", T0 + 3 * HOUR))
+        self.assertEqual(self.desk.status(q["id"])[1]["status"], "admitted")
 
-    def test_bad_input(self):
-        self.assertEqual(self.w.handle_claim({"v": 2}), (False, "bad_version"))
-        self.assertEqual(self.w.handle_claim({"v": 1}), (False, "missing_field"))
-        self.assertEqual(self.w.handle_claim({"v": 1, "hold_id": 1, "client_sesh": "x.sesh", "sig": ""}),
-                         (False, "bad_client"))
+    def test_second_purchase_extends(self):
+        q1 = self.quote(hours=1)
+        self.pay(q1, 1)
+        self.report(q1, 1)
+        self.clock.t += 1800
+        q2 = self.quote(hours=2)
+        self.pay(q2, 2, when=self.clock.t + 10)
+        self.report(q2, 2)
+        self.assertEqual(max(r["exp"] for r in self.admitted()), T0 + 3 * HOUR)
 
-    def test_seller_stop_or_end_revokes(self):
-        self.hold(10); self.hold(11)
-        self.w.handle_claim(self.claim(10)); self.w.handle_claim(self.claim(11))
-        self.assertEqual(self.w.reconcile(), [])  # both still running
-        self.chain.holds[11].active = False  # stopped by the seller (the buyer cannot cancel)
-        ev = self.w.reconcile()
-        self.assertEqual(ev, ["ended 11"])
-        tids = sorted(r["tid"] for r in A.Store(self.store).records())
-        self.assertEqual(tids, ["hold-31337-10-h0"])
-        self.assertEqual(self.w.reconcile(), [])
+    def test_replay_same_tx_for_another_quote(self):
+        q1 = self.quote(hours=1)
+        self.pay(q1, 1)
+        self.report(q1, 1)
+        q2 = self.quote(hours=1)
+        (_, verdict, why), = self.report(q2, 1)
+        self.assertEqual((verdict, why), ("reject", "payment_already_used"))
+        self.assertEqual(self.status(q2)["status"], "rejected")
 
-    def test_admits_per_paid_hour_and_revokes_when_paid_time_ends(self):
-        self.hold(40, dl=3 * 3600, start=0)  # 3 prepaid hours starting now
-        ok, tid = self.w.handle_claim(self.claim(40))
-        self.assertEqual(tid, "hold-31337-40-h0")
-        rec = A.Store(self.store).records()[0]
-        self.assertLessEqual(rec["exp"], self.now + 3600 + 2, "admission covers only the current paid hour")
-        self.assertEqual(self.w.reconcile(), [])
-        self.chain.clock = self.now + 3600 - 60  # within the renew margin of hour 0
-        self.assertEqual(self.w.reconcile(), ["hour 40 hold-31337-40-h1"])
-        self.assertEqual(self.w.state["claimed"]["40"]["exp"], self.now + 7200)
-        self.chain.clock = self.now + 7200 - 30
-        self.assertEqual(self.w.reconcile(), ["hour 40 hold-31337-40-h2"])
-        self.assertEqual(self.w.state["claimed"]["40"]["exp"], self.now + 3 * 3600)
-        self.chain.clock = self.now + 3 * 3600 - 30  # last hour: nothing more is paid, no new admission
-        self.assertEqual(self.w.reconcile(), [])
-        self.chain.clock = self.now + 3 * 3600  # paid time over -> revoke everything
-        self.assertEqual(self.w.reconcile(), ["ended 40"])
-        self.assertEqual(A.Store(self.store).records(), [])
+    def test_quote_used_once(self):
+        q = self.quote(hours=1)
+        self.pay(q, 1)
+        self.report(q, 1)
+        self.pay(q, 2)
+        self.assertEqual(self.desk.paid(Q.make_paid(self.bk, q, tx(2)))[1]["status"], "admitted")
+        (_, verdict, why), = self.spool(q, 2)
+        self.assertEqual((verdict, why), ("reject", "quote_already_paid"))
+        (_, verdict, why), = self.spool(q, 1)  # the same report again is fine
+        self.assertEqual((verdict, why), ("admit", "already_admitted"))
+        self.assertEqual(len(self.admitted()), 1)
 
-    def test_future_renewal_admitted_until_end_of_its_first_hour(self):
-        self.hold(50, dl=600 + 3600, start=600)  # renewal: starts when the previous lease ends in 10 min
-        ok, tid = self.w.handle_claim(self.claim(50))
-        self.assertTrue(ok, tid)
-        self.assertEqual(self.w.state["claimed"]["50"]["exp"], self.now + 600 + 3600)
+    def test_wrong_amount(self):
+        q = self.quote()
+        self.pay(q, 1, value=q["amount"] - 1)
+        (_, verdict, why), = self.report(q, 1)
+        self.assertEqual(verdict, "reject")
+        self.assertTrue(why.startswith("no_matching_payment: amount mismatch"), why)
+        self.assertEqual(self.admitted(), [])
+        # the buyer can still pay the right amount on the same quote
+        self.pay(q, 2)
+        self.assertEqual(self.report(q, 2)[0][1], "admit")
 
-    def test_refuses_mainnet(self):
+    def test_paid_on_wrong_chain(self):
+        q = self.quote(chainid=42161)
+        # right amount, but sent on Base: the tx doesn't exist on Arbitrum
+        self.pay(q, 1, chainid=8453, token=C.usdc(8453))
+        (_, verdict, why), = self.report(q, 1)
+        self.assertEqual((verdict, why), ("wait", "not_mined_yet"))
+        self.clock.t = q["expires"] + W.PAID_GRACE_S + 1
+        (_, verdict, why), = self.w.poll_spool()
+        self.assertEqual((verdict, why), ("reject", "no_matching_payment"))
+
+    def test_wrong_token_and_recipient_and_failed_tx(self):
+        q = self.quote()
+        self.pay(q, 1, token="0x" + "ee" * 20)
+        self.assertIn("no USDC transfer", self.report(q, 1)[0][2])
+        self.pay(q, 2, to="0x" + "dd" * 20)
+        self.assertIn("no USDC transfer", self.report(q, 2)[0][2])
+        self.pay(q, 3, ok=False)
+        self.assertIn("failed", self.report(q, 3)[0][2])
+
+    def test_old_payment_not_accepted(self):
+        q = self.quote()
+        self.pay(q, 1, when=T0 - 2 * HOUR)
+        self.assertIn("older than the quote", self.report(q, 1)[0][2])
+
+    def test_expired_quote(self):
+        q = self.quote()
+        self.pay(q, 1, when=q["expires"] + 600)
+        self.assertIn("after the quote expired", self.report(q, 1)[0][2])
+
+    def test_waits_for_confirmations(self):
+        q = self.quote()
+        rpc = self.chains.get(42161)
+        rpc.mine(tx(1), [(C.usdc(42161), PAYOUT, q["amount"])], when=T0 + 20)  # at head
+        (_, verdict, why), = self.report(q, 1)
+        self.assertEqual((verdict, why), ("wait", "waiting_for_confirmations"))
+        rpc.head += 1
+        self.assertEqual(self.w.poll_spool()[0][1], "admit")
+
+    def test_chain_down_then_up(self):
+        q = self.quote()
+        self.pay(q, 1)
+        self.chains.get(42161).down = True
+        self.assertEqual(self.report(q, 1)[0][1], "wait")
+        self.chains.get(42161).down = False
+        self.assertEqual(self.w.poll_spool()[0][1], "admit")
+
+    def test_admission_only_for_bound_address(self):
+        """Someone who learns the quote and tx can't get in: the notice needs the buyer key and
+        the admission names the quoted .sesh."""
+        q = self.quote()
+        self.pay(q, 1)
+        thief, _ = buyer_key()
+        self.assertEqual(self.desk.paid(Q.make_paid(thief, q, tx(1)))[0], 403)
+        # forged spool file straight on disk is rejected by the watcher too
+        (self.s.state / "spool" / "forged.json").write_text(json.dumps(Q.make_paid(thief, q, tx(1))))
+        (_, verdict, why), = self.w.poll_spool()
+        self.assertEqual((verdict, why), ("reject", "bad_buyer_signature"))
+        self.report(q, 1)
+        self.assertEqual(self.admitted(OTHER), [])
+        self.assertEqual(len(self.admitted(CLIENT)), 1)
+
+    def test_state_survives_restart_and_crash_reissue(self):
+        q = self.quote()
+        self.pay(q, 1)
+        self.report(q, 1)
+        w2 = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh,
+                       issuer_key=str(self.s.issuer), store=str(self.s.store), admission=A, clock=self.clock)
+        q2 = self.quote()
+        self.desk.paid(Q.make_paid(self.bk, q2, tx(1)))
+        self.assertEqual(w2.poll_spool()[0][2], "payment_already_used")
+        # crash after issuing but before saving: the next run replaces the record
+        w2.state = {"used_tx": {}, "done": {}, "clients": {}}
+        self.w = w2
+        self.assertEqual(self.spool(q, 1)[0][1], "admit")
+        self.assertEqual(len(self.admitted()), 1)
+
+    def test_tidy_and_stop(self):
+        q = self.quote(hours=1)
+        self.pay(q, 1)
+        self.report(q, 1)
+        self.assertEqual(self.w.stop(CLIENT), 1)
+        self.assertEqual(self.admitted(), [])
+        q = self.quote(hours=1)
+        self.pay(q, 2)
+        self.report(q, 2)
+        self.clock.t += 2 * HOUR
+        self.assertEqual(self.w.tidy(), 1)
+        self.assertEqual(self.w.state["clients"], {})
+
+    def test_rpc_flag(self):
+        self.assertEqual(W.parse_rpcs(["8453=https://x"]), {"8453": "https://x"})
         with self.assertRaises(SystemExit):
-            W.Watcher(W.MockChain(chainid=8453), W.MockVerifier(), payout_wallet=OURS, seller_sesh=SELLER,
-                      issuer_key=str(self.key), store=str(self.store), state=str(self.d / "x.json"))
+            W.parse_rpcs(["8453"])
 
-    def test_spool(self):
-        self.hold(20)
-        sp = self.d / "spool"; sp.mkdir()
-        (sp / "a.json").write_text(json.dumps(self.claim(20)))
-        (sp / "b.json").write_text("{not json")
-        out = self.w.poll_spool(sp)
-        self.assertEqual([(n, ok) for n, ok, _ in out], [("a.json", True), ("b.json", False)])
-        self.assertTrue((sp / "done" / "a.json").exists())
-        self.assertTrue((sp / "rejected" / "b.json").exists())
-
-    def test_state_persists(self):
-        self.hold(30)
-        self.w.handle_claim(self.claim(30))
-        w2 = W.Watcher(self.chain, W.MockVerifier(), payout_wallet=OURS, seller_sesh=SELLER,
-                       issuer_key=str(self.key), store=str(self.store), state=str(self.d / "st.json"))
-        self.assertEqual(w2.handle_claim(self.claim(30, client=SELLER)), (False, "hold_already_claimed"))
-
-    # renewedBy chains
-    def renewal(self, prev, nid, user=USER, wallet=OURS):
-        p = self.chain.holds[prev]
-        self.chain.holds[nid] = W.Hold(user, 100, wallet, p.deadline + 3600, True, rate_per_hour=100,
-                                       start=p.deadline)
-        self.chain.renewals[prev] = nid
-
-    def test_arbitrum_one_accepted(self):
-        W.Watcher(W.MockChain(chainid=42161), W.MockVerifier(), payout_wallet=OURS, seller_sesh="yryonyebyryonyebyryonyebyryonyebyryonyebyryonyebyryo.sesh",
-                  issuer_key=str(self.key), store=str(self.store), state=str(self.d / "one.json"))
-
-    def test_follows_four_renewals_without_claims(self):
-        self.hold(1, rate=100, start=0)
-        self.assertTrue(self.w.handle_claim(self.claim(1))[0])
-        prev = 1
-        for nid in (2, 3, 4, 5):
-            self.renewal(prev, nid)
-            self.chain.clock = self.chain.holds[prev].deadline - 300
-            ev = self.w.reconcile()
-            self.assertIn(f"renewal {nid} of {prev} hold-31337-{nid}-h0", ev)
-            self.assertEqual(self.w.state["claimed"][str(nid)]["client"], CLIENT)
-            self.chain.clock = self.chain.holds[prev].deadline
-            self.assertIn(f"ended {prev}", self.w.reconcile())
-            prev = nid
-        live = [r for r in A.Store(self.store).records()]
-        self.assertEqual({r["tid"] for r in live}, {"hold-31337-5-h0"})
-
-    def test_late_claim_for_followed_renewal_is_ok(self):
-        self.hold(1, rate=100, start=0)
-        self.w.handle_claim(self.claim(1))
-        self.renewal(1, 2)
-        self.w.reconcile()
-        ok, why = self.w.handle_claim(self.claim(2))
-        self.assertTrue(ok, why)
-        self.assertFalse(self.w.handle_claim(self.claim(2, client="ybndrfg8ejkmcpqxot1uwisza345h769ybndrfg8ejkmcpqxot1u.sesh"))[0])
-
-    def test_renewal_by_other_buyer_or_seller_refused(self):
-        self.hold(1, rate=100, start=0)
-        self.w.handle_claim(self.claim(1))
-        self.renewal(1, 2, user="0x" + "99" * 20)
-        self.assertIn("renewal 2 of 1 refused", self.w.reconcile())
-        self.assertNotIn("2", self.w.state["claimed"])
-
-
-    def test_auto_claim_earned_on_issue(self):
-        class FakeClaim:
-            def __init__(self):
-                self.calls = []
-            def claim_earned(self, lease_id):
-                self.calls.append(lease_id)
-                return f"0xdead{lease_id}"
-        fake = FakeClaim()
-        self.w.claim_earned = fake
-        self.hold(60, dl=3600)
-        ok, tid = self.w.handle_claim(self.claim(60))
-        self.assertTrue(ok, tid)
-        self.assertEqual(fake.calls, [60])
-        self.assertEqual(self.w.state["claimed"]["60"]["last_claim_earned"], "0xdead60")
-
-    def test_auto_claim_earned_failure_still_admits(self):
-        class Boom:
-            def claim_earned(self, lease_id):
-                raise RuntimeError("no gas")
-        self.w.claim_earned = Boom()
-        self.hold(61, dl=3600)
-        ok, tid = self.w.handle_claim(self.claim(61))
-        self.assertTrue(ok, tid)
-        self.assertIn("RuntimeError", self.w.state["claimed"]["61"]["last_claim_earned_error"])
 
 if __name__ == "__main__":
     unittest.main()

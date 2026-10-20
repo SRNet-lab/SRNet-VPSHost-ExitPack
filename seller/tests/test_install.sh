@@ -14,10 +14,15 @@ echo us > "$T/geo1"; printf 'US\n' > "$T/geo2"; echo DE > "$T/geo3"
 export SRNET_GEOIP_URLS="file://$T/geo1 file://$T/geo2"
 # 1. unpatched refused
 "$I" --binary "$T/upstream" --dry-run --root "$T/r1" >/dev/null 2>&1 && fail "unpatched accepted"; ok
-# 2. unsupported chains refused (Base 8453, Ethereum 1); Arbitrum One 42161 accepted
-for c in 8453 1; do "$I" --binary "$T/fakebin" --chainid $c --dry-run --root "$T/r1b" >/dev/null 2>&1 && fail "chain $c accepted"; done
-"$I" --binary "$T/fakebin" --chainid 42161 --dry-run --root "$T/r1d" >/dev/null 2>&1 || fail "arbitrum one refused"
-grep -rqi "0x7E0d01B7dd916BdAB96B0971ab92D160E1664431" "$T/r1d" || fail "arbitrum one contract not preset"; ok
+# 2. only Arbitrum One and Base; old contract flags refused with a clear message
+for c in ethereum 1 polygon base-sepolia 31337; do "$I" --binary "$T/fakebin" --chain $c --payout $PAY --dry-run --root "$T/r1b" >/dev/null 2>&1 && fail "chain $c accepted"; done
+"$I" --binary "$T/fakebin" --chain base --payout $PAY --dry-run --root "$T/r1d" >/dev/null 2>&1 || fail "base refused"
+python3 -c "import json,sys;assert json.load(open(sys.argv[1]))['listing']['chains']==[8453]" "$T/r1d/$U/listing/listing.json" || fail "--chain base"
+for f in --contract --chainid; do
+  out=$("$I" --binary "$T/fakebin" $f 1 --dry-run --root "$T/r1e" 2>&1) && fail "$f accepted"
+  echo "$out" | grep -q 'pay your --payout address directly' || fail "$f message"
+done
+grep -rqi "0x7E0d01B7dd916BdAB96B0971ab92D160E1664431" "$T/r1d" && fail "old contract still referenced"; ok
 # 3. payout must be an address, never a key
 "$I" --binary "$T/fakebin" --payout 0x$(printf 'ab%.0s' {1..32}) --dry-run --root "$T/r1c" >/dev/null 2>&1 && fail "64-hex payout accepted"; ok
 # 4. default: exit OFF, empty whitelist, keys+policy+listing, no DNS, no NAT
@@ -34,8 +39,20 @@ grep -q "^keyfile=/$U/config/exit.key" "$INI" || fail "keyfile"
 [ "$(stat -c %a "$T/r2/$U/config/exit.key")" = 600 ] || fail "exit.key mode"
 grep -q '"price_per_hour_usdc": "1.50"' "$T/r2/$U/config/seller-policy.json" || fail "policy"
 grep -q '"dns_forwarding": false' "$T/r2/$U/config/seller-policy.json" || fail "dns flag"
-grep -q '"chainid": 42161,' "$T/r2/$U/config/seller-policy.json" || fail "default chain not arbitrum one"
-grep -qi '"contract": "0x7E0d01B7dd916BdAB96B0971ab92D160E1664431"' "$T/r2/$U/config/seller-policy.json" || fail "default contract not live"
+python3 -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['chains']==[8453,42161] and d['token']=='USDC' and 'contract' not in d" "$T/r2/$U/config/seller-policy.json" || fail "default chains not arbitrum + base"
+LB="$T/r2/$U/listing/listing.json"
+python3 -c "
+import json,sys;sys.path.insert(0,'$HERE');import listing as L,quote as Q
+b=json.load(open(sys.argv[1]))['listing']
+assert b['v']==3 and b['chains']==[8453,42161] and b['token']=='USDC', b
+assert L.listing_error(b) is None, L.listing_error(b)
+assert b['quote_key']==Q.pub_hex(Q.load_key(sys.argv[2]))
+for k in ('vendor_id','contract','chainid'): assert k not in b
+" "$LB" "$T/r2/$U/config/quote.key" || fail "v3 listing"
+[ "$(stat -c %a "$T/r2/$U/config/quote.key")" = 600 ] || fail "quote.key mode"
+grep -rq 'cast\b\|foundry' "$T/r2/commands.log" && fail "foundry still downloaded"
+[ -e "$T/r2/$U/pack/payout.py" ] && fail "payout.py still installed"
+for f in chains.py quote.py; do [ -f "$T/r2/$U/pack/$f" ] || fail "$f not installed"; done
 python3 "$HERE/listing.py" verify "$T/r2/$U/listing/listing.json" >/dev/null || fail "listing"
 python3 "$HERE/listing.py" verify "$T/r2/$U/config/listing.json" >/dev/null || fail "listing symlink"
 grep -q 'SR_EXIT_LEASE_ISSUER_PUBKEY=[0-9a-f]\{64\}' "$T/r2/etc/systemd/system/srnet-seller-exit.service" || fail "issuer env"
@@ -47,11 +64,17 @@ grep -q 'ufw allow 22/tcp' "$T/r2/commands.log" || fail "ssh not kept open"
 grep -q 'ufw default deny incoming' "$T/r2/commands.log" || fail "default deny"
 grep -q 'build-session-router.sh --install-deps' "$T/r2/commands.log" && fail "built from source despite --binary"
 ok
-# 5. vendor id = keccak256(payout ++ salt) without foundry
-SALT=$(tr -d '\n' < "$T/r2/$U/config/vendor.salt")
-VID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["listing"]["vendor_id"])' "$T/r2/$U/listing/listing.json")
-[ "$VID" = "$(python3 "$HERE/keccak256.py" "0x${PAY#0x}$SALT")" ] || fail "vendor id"
-if command -v cast >/dev/null; then [ "$VID" = "$(cast keccak "0x${PAY#0x}$SALT")" ] || fail "vendor id vs cast"; fi
+# 5. watcher + claimd read the chain only and share the claims dir
+W5="$T/r2/etc/systemd/system/srnet-seller-watcher.service"; C5="$T/r2/etc/systemd/system/srnet-seller-claimd.service"
+grep -q -- "--dir /$U/claims --seller" "$W5" || fail "watcher dir"
+grep -q -- "--quote-key /$U/config/quote.key --listing /$U/listing/listing.json --cap-usdc" "$C5" || fail "claimd args"
+grep -qx 'CAP_USDC=20' "$T/r2/$U/config/watcher.env" || fail "default cap 20"
+grep -q 'CONTRACT\|PAYOUT_WALLET\|KEYSTORE' "$T/r2/$U/config/watcher.env" && fail "old watcher env"
+"$I" --binary "$T/fakebin" --dry-run --root "$T/r5r" --payout $PAY --rpc 8453=https://base.example/rpc --cap-usdc 5 >/dev/null 2>&1 || fail "--rpc refused"
+grep -q 'CHAIN_FLAGS=" --rpc 8453=https://base.example/rpc "' "$T/r5r/$U/config/watcher.env" || fail "--rpc not passed to the watcher"
+grep -qx 'CAP_USDC=5' "$T/r5r/$U/config/watcher.env" || fail "--cap-usdc"
+"$I" --binary "$T/fakebin" --dry-run --root "$T/r5s" --payout $PAY --chain base --rpc 42161=https://x.example >/dev/null 2>&1 && fail "--rpc for an unused chain accepted"
+"$I" --binary "$T/fakebin" --dry-run --root "$T/r5s" --payout $PAY --rpc base=https://x.example >/dev/null 2>&1 && fail "bad --rpc accepted"
 ok
 # 6. hardening + users + listing timer
 X="$T/r2/etc/systemd/system/srnet-seller-exit.service"; W="$T/r2/etc/systemd/system/srnet-seller-watcher.service"
@@ -65,7 +88,7 @@ grep -q 'useradd --system .* srnet-exit' "$T/r2/commands.log" || fail "no exit u
 grep -q 'OnUnitActiveSec=1h' "$T/r2/etc/systemd/system/srnet-seller-listing.timer" || fail "listing timer not hourly"
 grep -q 'listing.py refresh' "$T/r2/etc/systemd/system/srnet-seller-listing.service" || fail "listing refresh unit"
 grep -qE 'enable --now srnet-seller-exit.service srnet-seller-submit.service srnet-seller-claimd.service srnet-seller-listing.timer' "$T/r2/commands.log" || fail "timer/claimd not enabled"
-grep -q 'enable --now srnet-seller-watcher' "$T/r2/commands.log" || fail "watcher not enabled with default contract"
+grep -q 'enable --now srnet-seller-watcher' "$T/r2/commands.log" || fail "watcher not enabled with a payout"
 grep -qx 'BOARD_SUBMIT_URL=http://exitsrjnc83har7a17mdtjpgi1j3odgiphaffe9ejfq4wnbdxkio.sesh/submit' "$T/r2/$U/config/listing.env" || fail "default board url"
 grep -qx 'SRNET_SESH_DNS=127.0.0.1:5354' "$T/r2/$U/config/listing.env" || fail "submit dns"
 grep -qx 'listen=127.0.0.1:5354' "$T/r2/$U/config/submit.ini" || fail "submit router dns"
@@ -82,12 +105,14 @@ grep -q 'ufw allow in on sr-tun-submit to fd2e:7365:736a::1 port 80 proto tcp' "
 grep -q 'chown -R srnet-exit:srnet-exit /opt/srnet-seller/data$' "$T/r2/commands.log" || fail "router data not chowned recursively"
 grep -q 'srnet-seller-submit.service' "$T/r2/commands.log" || fail "submit router not enabled"
 grep -q '^listen=$' "$T/r2/$U/config/exit.ini" || fail "exit dns listener must stay off"
-# only Arbitrum One (and local Anvil for tests); local without --contract: watcher installed but not started
-for c in 421614 84532 11155111; do "$I" --binary "$T/fakebin" --chainid $c --dry-run --root "$T/r2x" --payout $PAY >/dev/null 2>&1 && fail "chain $c accepted"; done
-"$I" --binary "$T/fakebin" --chainid 31337 --dry-run --root "$T/r2t" --payout $PAY >/dev/null 2>&1 || fail "local chain refused"
-grep -q '"chainid": 31337' "$T/r2t/$U/config/seller-policy.json" || fail "local chain"
-grep -q 'enable --now srnet-seller-watcher' "$T/r2t/commands.log" && fail "watcher enabled without contract"
-grep -qx 'BOARD_SUBMIT_URL=' "$T/r2t/$U/config/listing.env" || fail "local chain should not submit to the board"
+# test chains only with --testnets (and then no board); no --payout: draft listing, watcher not started
+"$I" --binary "$T/fakebin" --chain anvil --testnets --dry-run --root "$T/r2t" --payout $PAY >/dev/null 2>&1 || fail "local chain refused"
+python3 -c "import json,sys;assert json.load(open(sys.argv[1]))['chains']==[31337]" "$T/r2t/$U/config/seller-policy.json" || fail "local chain"
+grep -q -- '--testnets' "$T/r2t/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd testnets"
+grep -qx 'BOARD_SUBMIT_URL=' "$T/r2t/$U/config/listing.env" || fail "test chains should not submit to the board"
+"$I" --binary "$T/fakebin" --dry-run --root "$T/r2p" >/dev/null 2>&1 || fail "no payout refused"
+grep -q 'enable --now srnet-seller-watcher' "$T/r2p/commands.log" && fail "watcher enabled without payout"
+python3 -c "import json,sys;sys.path.insert(0,'$HERE');import listing as L;assert L.listing_error(json.load(open(sys.argv[1]))['listing'])=='bad or zero payout'" "$T/r2p/$U/listing/listing.json" || fail "draft listing should be unbuyable"
 "$I" --binary "$T/fakebin" --dry-run --root "$T/r2n" --payout $PAY --board-submit-url none >/dev/null 2>&1 || fail "board none"
 grep -qx 'BOARD_SUBMIT_URL=' "$T/r2n/$U/config/listing.env" || fail "--board-submit-url none"
 grep -q 'srnet-seller-submit.service' "$T/r2n/commands.log" || fail "submit router carries claims even without a board"
@@ -97,7 +122,7 @@ set +e; "$I" --binary "$T/fakebin" --enable-exit --dry-run --root "$T/r3" >/dev/
 [ $rc = 2 ] || fail "enable without ack rc=$rc"; ok
 # 8. enable with ack: web ports + DNS to the exit resolver only, forwarded DNS dropped, private ranges dropped, NAT
 "$I" --binary "$T/fakebin" --enable-exit --i-accept-exit-operator-responsibility --dry-run --root "$T/r4" \
-  --payout $PAY --contract 0x00000000000000000000000000000000000000c0 --board-submit-url http://127.0.0.1:8787/submit >/dev/null 2>&1
+  --payout $PAY --board-submit-url http://127.0.0.1:8787/submit >/dev/null 2>&1
 E="$T/r4/$U/config/exit.ini"
 grep -q '^enable=true' "$E" || fail "not enabled"
 [ "$(grep -c '^policy=' "$E")" = 4 ] || fail "policy count"
@@ -110,7 +135,7 @@ grep -qE 'chain (fwd|in|nat) ' "$T/r4/$U/config/nat.nft" && fail "nft chain name
 if command -v nft >/dev/null && [ "$(id -u)" = 0 ]; then nft -c -f "$T/r4/$U/config/nat.nft" >/dev/null || fail "nat.nft does not parse"; fi
 grep -q 'route allow in on sr-tun-seller out on eth0 proto tcp to any port 80,443' "$T/r4/commands.log" || fail "no fwd rule"
 grep -q 'net.ipv4.ip_forward=1' "$T/r4/etc/sysctl.d/90-srnet-seller.conf" || fail "sysctl"
-grep -q 'enable --now srnet-seller-watcher' "$T/r4/commands.log" || fail "watcher not enabled with contract"
+grep -q 'enable --now srnet-seller-watcher' "$T/r4/commands.log" || fail "watcher not enabled with payout"
 grep -q 'BOARD_SUBMIT_URL=http://127.0.0.1:8787/submit' "$T/r4/$U/config/listing.env" || fail "board url"
 ok
 # 8a. exit resolver: unbound recursive from the roots, no logs, tunnel only, rate limited, advertised
@@ -185,12 +210,12 @@ grep -q 'ip link show sr-tun-seller >/dev/null 2>&1 || exit 0' "$T/r4/$U/bin/srn
 out=$("$I" --binary "$T/fakebin" --dry-run --root "$T/r8" --payout $PAY 2>&1)
 echo "$out" | grep -q 'published to the SRNet board automatically' || fail "end text"
 ok
-# 9. idempotent: issuer + exit identity + salt kept on re-run
-P1=$(cat "$T/r4/$U/config/issuer.pub"); K1=$(sha256sum < "$T/r4/$U/config/exit.key"); S1=$(cat "$T/r4/$U/config/vendor.salt")
+# 9. idempotent: issuer + exit identity + quote key kept on re-run
+P1=$(cat "$T/r4/$U/config/issuer.pub"); K1=$(sha256sum < "$T/r4/$U/config/exit.key"); S1=$(sha256sum < "$T/r4/$U/config/quote.key")
 "$I" --binary "$T/fakebin" --dry-run --root "$T/r4" --payout $PAY >/dev/null 2>&1
 [ "$P1" = "$(cat "$T/r4/$U/config/issuer.pub")" ] || fail "issuer rotated"
 [ "$K1" = "$(sha256sum < "$T/r4/$U/config/exit.key")" ] || fail "identity rotated"
-[ "$S1" = "$(cat "$T/r4/$U/config/vendor.salt")" ] || fail "salt rotated"
+[ "$S1" = "$(sha256sum < "$T/r4/$U/config/quote.key")" ] || fail "quote key rotated"
 ok
 # 10. prebuilt: unpublished -> refused; sha mismatch -> refused; match -> accepted
 "$I" --prebuilt --dry-run --root "$T/r5" >/dev/null 2>&1 && fail "prebuilt without pin accepted"

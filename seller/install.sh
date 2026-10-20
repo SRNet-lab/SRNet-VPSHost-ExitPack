@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # SRNet seller pack: installer for a fresh Ubuntu 24.04 server (Debian 12 untested)
-# (x86_64, root). Defaults to Arbitrum One (42161) and the live SRNetBalance
-# contract (real USDC, unaudited: keep amounts small).
+# (x86_64, root). Buyers pay you in USDC on Arbitrum One and Base, straight to
+# your payout address; the watcher checks each payment on chain (read-only).
 #
 # LEGAL (read before you enable forwarding):
 #   Running an exit forwards other people's traffic to the internet from YOUR
@@ -24,13 +24,14 @@
 # Seller settings:
 #   --payout 0xADDR          payout wallet ADDRESS (no private key is needed)
 #   --price-per-hour-usdc N  hourly price (default 1.00)
-#   --contract 0xADDR        SRNetBalance contract (default: the live Arbitrum One deployment)
-#   --chainid N              42161 Arbitrum One (default; 31337 = local Anvil, for tests only)
-#   --rpc URL                chain RPC for the watcher (default: public RPC for chainid)
+#   --chain NAME             chain to take USDC on: arbitrum, base (repeatable; default both)
+#   --rpc CHAINID=URL        your own RPC for a chain (repeatable; default: public RPCs)
+#   --testnets               allow test chains (arbitrum-sepolia, base-sepolia, anvil); tests only
 #   --country XX             ISO 3166-1 alpha-2 country of the exit's IP (default: detected
 #                            from the public IPv4 via two geo-IP services that must agree)
-#   --region NAME  --max-hours N  --cap-usdc N
-#   --board-submit-url URL   where the hourly listing refresh is sent (default on Arbitrum One:
+#   --region NAME  --max-hours N
+#   --cap-usdc N             largest single payment you will quote (default 20)
+#   --board-submit-url URL   where the hourly listing refresh is sent (default on mainnet chains:
 #                            the SRNet board; 'none' = re-sign locally only)
 #
 # Host settings:
@@ -54,16 +55,12 @@ set -euo pipefail
 # scripts/make-release.sh stamps these in the release pack. --source is the fallback.
 PREBUILT_URL=""
 PREBUILT_SHA256=""
-# Foundry `cast`, used only by payout.py (withdrawVendor). The watcher talks JSON-RPC itself (evm.py).
-FOUNDRY_VERSION=v1.8.5
-FOUNDRY_URL=https://github.com/foundry-rs/foundry/releases/download/$FOUNDRY_VERSION/foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz
-FOUNDRY_SHA256=6c66ffcc55fa4249197721baa3098bc208014ea1d8aa04b2ed50ac6bccffb226
 
 CLAIM_ADDR=fd2e:7365:736a::1  # submit router tun address; claimd binds here only
 PREFIX=/opt/srnet-seller; MODE=""; BINARY=""; BINARY_SHA=""; PREBUILT_ARG=""
 ENABLE_EXIT=0; ACK=0; PORT=1193; WAN_IF=""; SSH_PORT=""; MAX_MBIT=100; SPEED_CAP=10; FIREWALL=1; START=1
 ROOT=""; DRY=0; WATCHER_ENV=""; PRICE="1.00"; CAP_USDC="20"; MAX_HOURS=168
-CHAINID=42161; CONTRACT=""; PAYOUT=""; REGION=""; COUNTRY=""; RPC=""; ACTION=install; PURGE=0; BOARD_URL=default
+CHAINS=(); RPCS=(); TESTNETS=0; PAYOUT=""; REGION=""; COUNTRY=""; ACTION=install; PURGE=0; BOARD_URL=default
 TUN=sr-tun-seller; TUN_NET4=10.193.0.0/16
 # Exit resolver: an address outside the TUN range (on lo), so the router treats answers like any
 # clearnet reply; buyers reach it only through the tunnel. Advertised in the listing as "dns".
@@ -97,12 +94,13 @@ while [ $# -gt 0 ]; do
     --price-per-hour-usdc|--price-usdc) PRICE=$2; shift 2;;
     --cap-usdc) CAP_USDC=$2; shift 2;;
     --max-hours) MAX_HOURS=$2; shift 2;;
-    --chainid) CHAINID=$2; shift 2;;
-    --contract) CONTRACT=$2; shift 2;;
+    --chain) CHAINS+=("$2"); shift 2;;
+    --testnets) TESTNETS=1; shift;;
+    --chainid|--contract) die "$1 is gone: buyers now pay your --payout address directly (see --chain)";;
     --payout) PAYOUT=$2; shift 2;;
     --region) REGION=$2; shift 2;;
     --country) COUNTRY=$2; shift 2;;
-    --rpc) RPC=$2; shift 2;;
+    --rpc) RPCS+=("$2"); shift 2;;
     --board-submit-url) BOARD_URL=$2; shift 2;;
     --dry-run) DRY=1; shift;;
     --root) ROOT=$2; shift 2;;
@@ -160,7 +158,7 @@ if [ "$ACTION" = uninstall ]; then
     getent group "$GROUP" >/dev/null 2>&1 && run groupdel "$GROUP" || true
   else
     run rm -rf "$P/bin" "$P/pack" "$P/run" "$P/spool"
-    say "kept $PREFIX/config (keys), $PREFIX/listing and $PREFIX/data; use --uninstall --purge to delete them"
+    say "kept $PREFIX/config (keys), $PREFIX/listing, $PREFIX/claims (used payments) and $PREFIX/data; use --uninstall --purge to delete them"
   fi
   say "uninstalled"
   exit 0
@@ -205,19 +203,20 @@ health() {
       chk "ip_forward=1" "[ \"\$(sysctl -n net.ipv4.ip_forward)\" = 1 ]"
     fi
     chk "submit/claim router active" "systemctl is-active --quiet srnet-seller-submit"
-    if [ -n "${CONTRACT:-}" ]; then
+    if [ -n "${PAYOUT:-}" ]; then
       chk "claim endpoint active" "systemctl is-active --quiet srnet-seller-claimd"
       chk "claim endpoint listening on [$CLAIM_ADDR]:80" "ss -Hltn | grep -qF '[$CLAIM_ADDR]:80'"
     fi
     chk "listing refresh timer active (hourly)" "systemctl is-active --quiet srnet-seller-listing.timer"
-    if [ -n "${CONTRACT:-}" ]; then chk "srnet-seller-watcher active" "systemctl is-active --quiet srnet-seller-watcher"; fi
+    if [ -n "${PAYOUT:-}" ]; then chk "srnet-seller-watcher active" "systemctl is-active --quiet srnet-seller-watcher"; fi
   fi
   if [ "${FIREWALL:-1}" = 1 ] && command -v ufw >/dev/null; then
     chk "ufw active" "ufw status | grep -q 'Status: active'"
     chk "ufw allows udp/${PORT}" "ufw status | grep -q '${PORT}/udp'"
-    [ -n "${CONTRACT:-}" ] && chk "ufw allows claims on sr-tun-submit" "ufw status | grep -q 'on sr-tun-submit'"
+    [ -n "${PAYOUT:-}" ] && chk "ufw allows claims on sr-tun-submit" "ufw status | grep -q 'on sr-tun-submit'"
   fi
-  [ -x "$P/bin/cast" ] && chk "cast runs" "'$P/bin/cast' --version"
+  [ -n "${PAYOUT:-}" ] && chk "quote key 0600" "[ \"\$(stat -c %a '$P/config/quote.key')\" = 600 ]"
+  [ -n "${PAYOUT:-}" ] && chk "listing quote_key matches quote.key" "python3 -c 'import json,sys;sys.path.insert(0,sys.argv[1]);import quote as Q;sys.exit(json.load(open(sys.argv[2]))[\"listing\"].get(\"quote_key\")!=Q.pub_hex(Q.load_key(sys.argv[3])))' '$P/pack' '$P/listing/listing.json' '$P/config/quote.key'"
   [ "$fails" = 0 ] && echo "health: OK" || echo "health: $fails check(s) failed"
   return "$fails"
 }
@@ -225,18 +224,31 @@ if [ "$ACTION" = health ]; then health; exit $?; fi
 
 # ----------------------------------------------------------------- validate
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "bad --listen-port"
-SRNET_ARB_ONE_CONTRACT=0x7E0d01B7dd916BdAB96B0971ab92D160E1664431  # SRNetBalance on Arbitrum One (fundWithPermit, 2026-10-14)
-if [ "$CHAINID" = 42161 ]; then
-  [ -n "$CONTRACT" ] || CONTRACT=$SRNET_ARB_ONE_CONTRACT
-  [ "${CONTRACT,,}" = "${SRNET_ARB_ONE_CONTRACT,,}" ] || warn "--contract $CONTRACT is not the Arbitrum One deployment ($SRNET_ARB_ONE_CONTRACT)"
-fi
-case "$CHAINID" in 42161|31337) ;; *) die "chainid $CHAINID refused (Arbitrum One 42161 only)";; esac
-[ "$CHAINID" = 42161 ] && warn "Arbitrum One: real USDC. The contract is unaudited."
+[ ${#CHAINS[@]} -gt 0 ] || CHAINS=(arbitrum base)
+TESTNET_FLAG=""; [ "$TESTNETS" = 1 ] && TESTNET_FLAG=--testnets
+CHAIN_IDS=$(python3 - "$HERE" "$TESTNETS" "${CHAINS[@]}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import chains as C
+try:
+    print(" ".join(str(c) for c in sorted({C.by_name(n, sys.argv[2] == "1") for n in sys.argv[3:]})))
+except C.ChainError as e:
+    sys.exit(f"install.sh: {e}")
+PY
+) || exit 1
+MAINNET=0; for c in $CHAIN_IDS; do case $c in 42161|8453) MAINNET=1;; esac; done
+[ "$MAINNET" = 1 ] && warn "real USDC: buyers pay your --payout address directly. Keep the cap small."
 [[ "$MAX_HOURS" =~ ^[1-9][0-9]{0,2}$ ]] || die "bad --max-hours (whole hours, 1..999)"
 [[ "$PRICE" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --price-per-hour-usdc"
 MIN_RATE=$(python3 -c "from decimal import Decimal as D;import sys;print(int(D(sys.argv[1])*1000000))" "$PRICE")
 [ "$MIN_RATE" -gt 0 ] || die "--price-per-hour-usdc must be > 0"
 [[ "$CAP_USDC" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --cap-usdc"
+RPC_ARGS=""
+for r in "${RPCS[@]}"; do
+  [[ "$r" =~ ^[0-9]+=https?://[A-Za-z0-9._:/?=%-]+$ ]] || die "bad --rpc (CHAINID=URL): $r"
+  [[ " $CHAIN_IDS " == *" ${r%%=*} "* ]] || die "--rpc for chain ${r%%=*}, which is not one of your chains ($CHAIN_IDS)"
+  RPC_ARGS="$RPC_ARGS --rpc $r"
+done
 [[ "$REGION" =~ ^[A-Za-z0-9._-]{0,64}$ ]] || die "bad --region (alnum/._- only, max 64)"
 [[ "$MAX_MBIT" =~ ^[0-9]{1,5}$ ]] || die "bad --max-mbit"
 # Country: --country wins; else ask two geo-IP services over IPv4 and require them to agree.
@@ -266,17 +278,10 @@ SPEED_CAP=$((10#$SPEED_CAP))
 [ -z "$SSH_PORT" ] || [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || die "bad --ssh-port"
 [ -z "$PAYOUT" ] || [[ "$PAYOUT" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "bad --payout (an address: 0x + 40 hex; never a private key)"
 [[ "$PAYOUT" =~ ^0x0{40}$ ]] && die "--payout is the zero address"
-[ -z "$CONTRACT" ] || [[ "$CONTRACT" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "bad --contract (0x + 40 hex)"
-[ -z "$RPC" ] || [[ "$RPC" =~ ^https?://[A-Za-z0-9._:/?=%-]+$ ]] || die "bad --rpc URL"
 DEFAULT_BOARD_URL=http://exitsrjnc83har7a17mdtjpgi1j3odgiphaffe9ejfq4wnbdxkio.sesh/submit
-if [ "$BOARD_URL" = default ]; then [ "$CHAINID" = 42161 ] && BOARD_URL=$DEFAULT_BOARD_URL || BOARD_URL=""; fi
+if [ "$BOARD_URL" = default ]; then [ "$TESTNETS" = 0 ] && BOARD_URL=$DEFAULT_BOARD_URL || BOARD_URL=""; fi
 [ "$BOARD_URL" = none ] && BOARD_URL=""
 [ -z "$BOARD_URL" ] || [[ "$BOARD_URL" =~ ^https?://[A-Za-z0-9._:/?=%-]+$ ]] || die "bad --board-submit-url"
-if [ -z "$RPC" ]; then
-  case "$CHAINID" in
-    42161) RPC=https://arb1.arbitrum.io/rpc;; 31337) RPC=http://127.0.0.1:8545;;
-  esac
-fi
 if [ "$ENABLE_EXIT" = 1 ] && [ "$ACK" != 1 ]; then
   cat >&2 <<'TXT'
 LEGAL: Running an exit forwards other people's traffic from YOUR IP.
@@ -290,7 +295,7 @@ fi
 [ "$MODE" = binary ] && { [ -f "$BINARY" ] || die "--binary $BINARY not found"; }
 
 [ "$DRY" = 1 ] && { mkdir -p "$R"; : > "$R/commands.log"; }
-mkdir -p "$P/bin" "$P/config" "$P/run" "$P/data" "$P/spool" "$P/logs" "$P/pack" "$P/listing" "$R/etc/systemd/system" \
+mkdir -p "$P/bin" "$P/config" "$P/run" "$P/data" "$P/claims" "$P/logs" "$P/pack" "$P/listing" "$R/etc/systemd/system" \
   "$R/etc/sysctl.d" "$R/usr/local/sbin"
 
 # ----------------------------------------------------------------- packages
@@ -383,19 +388,8 @@ else
 fi
 say "session-router sha256: $BIN_SHA"
 
-# ----------------------------------------------------------------- cast
-if [ "$DRY" = 1 ]; then
-  run curl -fsSL -o /tmp/foundry.tgz "$FOUNDRY_URL" "# sha256 $FOUNDRY_SHA256 -> $PREFIX/bin/cast"
-elif [ ! -x "$P/bin/cast" ] || ! "$P/bin/cast" --version 2>/dev/null | grep -q "${FOUNDRY_VERSION#v}"; then
-  say "foundry cast $FOUNDRY_VERSION (sha256-pinned)"
-  curl -fsSL --proto '=https' --tlsv1.2 -o "$TMPD/foundry.tgz" "$FOUNDRY_URL"
-  [ "$(sha256_of "$TMPD/foundry.tgz")" = "$FOUNDRY_SHA256" ] || die "foundry tarball sha256 mismatch"
-  tar -xzf "$TMPD/foundry.tgz" -C "$TMPD" cast
-  install -m 755 "$TMPD/cast" "$P/bin/cast"
-fi
-
 # ----------------------------------------------------------------- pack files
-for f in watcher.py claimd.py evm.py listing.py payout.py keccak256.py seshdns.py dnscheck.py; do install -m 755 "$HERE/$f" "$P/pack/$f"; done
+for f in watcher.py claimd.py evm.py listing.py chains.py quote.py keccak256.py seshdns.py dnscheck.py; do install -m 755 "$HERE/$f" "$P/pack/$f"; done
 install -m 644 "$HERE/VERSION" "$P/pack/VERSION"
 install -m 755 "$ADMISSION_PY" "$P/pack/admission.py"
 install -m 755 "$0" "$P/pack/install.sh"
@@ -442,18 +436,21 @@ PY
 }
 new_router_key "$P/config/exit.key"
 new_router_key "$P/config/claim.key"
+# Quote key: signs payment quotes on the claim host; its public half is in the listing.
+QUOTE_PUB=$(python3 -c "import sys;sys.path.insert(0,sys.argv[1]);import quote as Q;print(Q.new_key_file(sys.argv[2]))" "$P/pack" "$P/config/quote.key")
+chmod 600 "$P/config/quote.key"
 
 # ----------------------------------------------------------------- policy + config
 DNS_ADV=""; [ "$DNS" = 1 ] && DNS_ADV=$DNS_IP
-python3 - "$P/config/seller-policy.json" "$PRICE" "$CAP_USDC" "$MAX_HOURS" "$CHAINID" \
-  "${CONTRACT:-0x0000000000000000000000000000000000000000}" \
+python3 - "$P/config/seller-policy.json" "$PRICE" "$CAP_USDC" "$MAX_HOURS" "$CHAIN_IDS" \
   "${PAYOUT:-0x0000000000000000000000000000000000000000}" "$REGION" "$MAX_MBIT" "$SPEED_CAP" "$COUNTRY" "$DNS_ADV" <<'PY'
 import json, sys
 from pathlib import Path
-path, price, cap, max_hours, chainid, contract, payout, region, mbit, speed, country, dns = sys.argv[1:13]
+path, price, cap, max_hours, chain_ids, payout, region, mbit, speed, country, dns = sys.argv[1:12]
 Path(path).write_text(json.dumps({
-    "price_per_hour_usdc": price, "cap_usdc": cap, "max_hours": int(max_hours), "chainid": int(chainid),
-    "contract": contract, "payout": payout, "country": country, "region": region,
+    "price_per_hour_usdc": price, "cap_usdc": cap, "max_hours": int(max_hours),
+    "chains": [int(c) for c in chain_ids.split()], "token": "USDC", "payout": payout, "country": country,
+    "region": region,
     "ports": ["tcp/443", "tcp/80"], "dns_forwarding": False, "dns_resolver": dns or None,
     "max_mbit": int(mbit), "speed_cap_mbps": int(speed),
     "notes": "Only tcp/80 and tcp/443 are forwarded to the internet. "
@@ -547,29 +544,20 @@ run chmod 750 "$PREFIX" "$PREFIX/config"
 run chown "$EXIT_USER":"$EXIT_USER" "$PREFIX/config/exit.key" "$PREFIX/config/claim.key"
 mkdir -p "$P/data/submit"; run chown -R "$EXIT_USER":"$EXIT_USER" "$PREFIX/data"  # -R: re-runs keep router state writable
 run chmod 700 "$PREFIX/data"
-run chown "$WATCH_USER":"$WATCH_USER" "$PREFIX/config/issuer.key"
-run chown -R "$WATCH_USER":"$GROUP" "$PREFIX/run" "$PREFIX/spool" "$PREFIX/logs"
+run chown "$WATCH_USER":"$WATCH_USER" "$PREFIX/config/issuer.key" "$PREFIX/config/quote.key"
+run chown -R "$WATCH_USER":"$GROUP" "$PREFIX/run" "$PREFIX/claims" "$PREFIX/logs"
 run chown -R "$EXIT_USER":"$GROUP" "$PREFIX/listing"
 run chmod 755 "$PREFIX/listing"
-run chmod 750 "$PREFIX/run" "$PREFIX/spool" "$PREFIX/logs"
+run chmod 750 "$PREFIX/run" "$PREFIX/claims" "$PREFIX/logs"
 run chmod 640 "$PREFIX/config/exit.ini" "$PREFIX/config/seller-policy.json"
 
-# ----------------------------------------------------------------- vendor id + listing
-VENDOR_SALT_FILE="$P/config/vendor.salt"
-[ -f "$VENDOR_SALT_FILE" ] || { python3 -c "import secrets;print(secrets.token_hex(32))" > "$VENDOR_SALT_FILE"; chmod 600 "$VENDOR_SALT_FILE"; }
-VENDOR_SALT=$(tr -d '\n' < "$VENDOR_SALT_FILE")
-if [ -n "$PAYOUT" ]; then
-  # keccak256(abi.encodePacked(payout, salt)): the vendorId configureVendor expects.
-  VENDOR_ID=$(python3 "$P/pack/keccak256.py" "0x${PAYOUT#0x}${VENDOR_SALT}")
-else
-  VENDOR_ID="0x$(python3 -c "import secrets;print(secrets.token_hex(32))")"
-  warn "no --payout: vendor-id is a placeholder; re-run with --payout 0xADDRESS"
-fi
+# ----------------------------------------------------------------- listing
+[ -n "$PAYOUT" ] || warn "no --payout: the listing has a placeholder address and buyers can't pay; re-run with --payout 0xADDRESS"
+CHAIN_ARGS=""; for c in $CHAIN_IDS; do CHAIN_ARGS="$CHAIN_ARGS --chain $c"; done
 CLAIM_SESH=$(python3 -c "import sys;sys.path.insert(0,sys.argv[1]);import listing as L;k=bytes.fromhex(open(sys.argv[2]).read().strip());print(L.sesh_of(k[32:]))" "$P/pack" "$P/config/claim.key")
 python3 "$P/pack/listing.py" make --identity "$P/config/exit.key" --price-per-hour-usdc "$PRICE" \
-  --max-hours "$MAX_HOURS" --payout "${PAYOUT:-0x0000000000000000000000000000000000000000}" \
-  --vendor-id "$VENDOR_ID" --chainid "$CHAINID" \
-  --contract "${CONTRACT:-0x0000000000000000000000000000000000000000}" \
+  --max-hours "$MAX_HOURS" --payout "${PAYOUT:-0x0000000000000000000000000000000000000000}" $( [ -n "$PAYOUT" ] || echo --draft ) \
+  $CHAIN_ARGS $TESTNET_FLAG --quote-key-file "$P/config/quote.key" \
   --country "$COUNTRY" --region "$REGION" --speed-cap-mbps "$SPEED_CAP" --policy tcp/443 --policy tcp/80 --claim-url "http://$CLAIM_SESH/claim" \
   ${DNS_ADV:+--dns "$DNS_ADV"} > "$P/listing/listing.json"
 chmod 644 "$P/listing/listing.json"
@@ -587,15 +575,12 @@ if [ -n "$WATCHER_ENV" ]; then
   install -m 640 "$WATCHER_ENV" "$P/config/watcher.env"
 else
   cat > "$P/config/watcher.env" <<ENV
-# SRNet seller watcher. Admission does not need a wallet key.
-# Optional auto claimEarned (credits payable as each paid hour begins):
-#   CLAIM_KEYSTORE=$PREFIX/config/claim-earned.keystore.json
-#   CLAIM_KEYSTORE_PASSWORD_FILE=$PREFIX/config/claim-earned.pass
-RPC=$RPC
-CONTRACT=${CONTRACT:-0x0000000000000000000000000000000000000000}
-PAYOUT_WALLET=${PAYOUT:-0x0000000000000000000000000000000000000000}
+# SRNet seller watcher and claim endpoint. No wallet key is needed: payments go straight to the
+# payout address in the listing, and the watcher only reads the chain.
 SELLER_SESH=$SELLER_SESH
-MIN_RATE_PER_HOUR=$MIN_RATE
+CAP_USDC=$CAP_USDC
+# Extra watcher/claimd flags: your own RPCs (--rpc CHAINID=URL), --testnets.
+CHAIN_FLAGS="$RPC_ARGS $TESTNET_FLAG"
 ENV
 fi
 run chown root:"$WATCH_USER" "$PREFIX/config/watcher.env"
@@ -747,10 +732,8 @@ Group=$GROUP
 EnvironmentFile=$PREFIX/config/watcher.env
 Environment=PATH=$PREFIX/bin:/usr/bin:/bin
 Environment=HOME=$PREFIX/run
-ExecStart=/usr/bin/python3 $PREFIX/pack/watcher.py --rpc \${RPC} --contract \${CONTRACT} \\
-  --payout-wallet \${PAYOUT_WALLET} --seller \${SELLER_SESH} --issuer-key $PREFIX/config/issuer.key \\
-  --store $PREFIX/run/admissions.json --state $PREFIX/run/watcher-state.json --spool $PREFIX/spool \\
-  --min-rate-per-hour \${MIN_RATE_PER_HOUR}
+ExecStart=/usr/bin/python3 $PREFIX/pack/watcher.py --dir $PREFIX/claims --seller \${SELLER_SESH} \\
+  --issuer-key $PREFIX/config/issuer.key --store $PREFIX/run/admissions.json \$CHAIN_FLAGS
 Restart=on-failure
 RestartSec=10
 UMask=0027
@@ -759,7 +742,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateDevices=yes
 ProtectSystem=strict
-ReadWritePaths=$PREFIX/run $PREFIX/spool $PREFIX/logs
+ReadWritePaths=$PREFIX/run $PREFIX/claims $PREFIX/logs
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
@@ -811,7 +794,7 @@ UNIT
 
 cat > "$R/etc/systemd/system/srnet-seller-claimd.service" <<UNIT
 [Unit]
-Description=SRNet seller claim endpoint (buyers' lease claims, on the submit router's tun only)
+Description=SRNet seller claim endpoint (buyers' quotes and payments, on the submit router's tun only)
 After=srnet-seller-submit.service
 Requires=srnet-seller-submit.service
 
@@ -820,8 +803,8 @@ Type=simple
 User=$WATCH_USER
 Group=$GROUP
 EnvironmentFile=$PREFIX/config/watcher.env
-ExecStart=/usr/bin/python3 $PREFIX/pack/claimd.py --host $CLAIM_ADDR --port 80 --spool $PREFIX/spool \
-  --contract \${CONTRACT} --chainid $CHAINID --rpc \${RPC} --payout-wallet \${PAYOUT_WALLET}
+ExecStart=/usr/bin/python3 $PREFIX/pack/claimd.py --host $CLAIM_ADDR --port 80 --dir $PREFIX/claims \
+  --quote-key $PREFIX/config/quote.key --listing $PREFIX/listing/listing.json --cap-usdc \${CAP_USDC} $TESTNET_FLAG
 Restart=always
 RestartSec=5
 UMask=0027
@@ -830,7 +813,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ReadWritePaths=$PREFIX/spool
+ReadWritePaths=$PREFIX/claims
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
@@ -1015,7 +998,7 @@ SSH_PORT=$SSH_PORT
 FIREWALL=$FIREWALL
 ENABLE_EXIT=$ENABLE_EXIT
 DNS=$DNS
-CONTRACT=$CONTRACT
+PAYOUT=$PAYOUT
 BIN_SHA256=$BIN_SHA
 CONF
 
@@ -1040,7 +1023,7 @@ fi
 
 # ----------------------------------------------------------------- services
 EXIT_UNITS="srnet-seller-exit.service srnet-seller-submit.service"
-[ -n "$CONTRACT" ] && EXIT_UNITS="$EXIT_UNITS srnet-seller-claimd.service"
+[ -n "$PAYOUT" ] && EXIT_UNITS="$EXIT_UNITS srnet-seller-claimd.service"
 if [ "$ENABLE_EXIT" = 1 ]; then
   echo "net.ipv4.ip_forward=1" > "$R/etc/sysctl.d/90-srnet-seller.conf"
   EXIT_UNITS="srnet-seller-nat.service $EXIT_UNITS"
@@ -1053,7 +1036,7 @@ if [ "$DRY" = 1 ]; then
   if [ "$ENABLE_EXIT" = 1 ]; then { echo "[dry-run] nft -f - <<EOF"; cat "$P/config/nat.nft"; echo "EOF"; } >> "$R/commands.log"; fi
   run systemctl daemon-reload
   run systemctl enable --now $EXIT_UNITS srnet-seller-listing.timer
-  [ -n "$CONTRACT" ] && run systemctl enable --now srnet-seller-watcher.service
+  [ -n "$PAYOUT" ] && run systemctl enable --now srnet-seller-watcher.service
 elif [ "$START" = 1 ] && have_systemd; then
   systemctl daemon-reload
   # The distro's own unbound (127.0.0.1) is not ours: if the package was only just installed for the
@@ -1063,8 +1046,8 @@ elif [ "$START" = 1 ] && have_systemd; then
   systemctl enable $EXIT_UNITS >/dev/null
   systemctl restart $EXIT_UNITS
   systemctl enable --now srnet-seller-listing.timer >/dev/null
-  if [ -n "$CONTRACT" ]; then systemctl enable srnet-seller-watcher.service >/dev/null; systemctl restart srnet-seller-watcher.service
-  else warn "no --contract: watcher installed but not started (set CONTRACT in $PREFIX/config/watcher.env, then: systemctl enable --now srnet-seller-watcher)"; fi
+  if [ -n "$PAYOUT" ]; then systemctl enable srnet-seller-watcher.service >/dev/null; systemctl restart srnet-seller-watcher.service
+  else warn "no --payout: watcher and claim endpoint not started (re-run with --payout 0xADDRESS)"; fi
   sleep 3
 else
   say "--no-start (or no systemd): services written but not started"
@@ -1078,7 +1061,7 @@ echo "exit resolver:   $( [ "$DNS" = 1 ] && echo "$DNS_IP (unbound: recursive fr
 echo "router:          udp/$PORT on $WAN_IF, binary sha256 $BIN_SHA"
 echo "seller .sesh:    $SELLER_SESH"
 echo "issuer pubkey:   $ISSUER_PUB"
-echo "payout address:  ${PAYOUT:-(not set)}   price/hour: $PRICE USDC   chain: $CHAINID"
+echo "payout address:  ${PAYOUT:-(not set)}   price/hour: $PRICE USDC   chains: $CHAIN_IDS   cap: $CAP_USDC USDC"
 echo "signed listing ($PREFIX/listing/listing.json, re-signed hourly${BOARD_URL:+ and sent to $BOARD_URL}):"
 python3 "$P/pack/listing.py" verify "$P/listing/listing.json" >/dev/null && cat "$P/listing/listing.json"
 if [ -n "$BOARD_URL" ]; then
@@ -1086,5 +1069,5 @@ if [ -n "$BOARD_URL" ]; then
   echo "                 and appears to buyers within minutes; it is re-sent every hour."
 fi
 echo "manage: srnet-seller status | health | listing | logs | uninstall [--purge]"
-echo "payout: auto claimEarned if CLAIM_KEYSTORE set in watcher.env; else $PREFIX/pack/payout.py claim|withdraw --keystore PATH"
+echo "payments:        USDC arrives in your payout wallet directly; there is nothing to claim"
 if [ "$DRY" = 0 ] && [ "$START" = 1 ] && have_systemd; then echo; health || true; fi

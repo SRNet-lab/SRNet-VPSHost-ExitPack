@@ -6,6 +6,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import listing as L  # noqa: E402
+import quote as Q  # noqa: E402
+
+CLAIM = "http://" + "y" * 52 + ".sesh/claim"
+
+
+def quote_key_file() -> str:
+    p = Path(tempfile.mkdtemp()) / "quote.key"
+    Q.new_key_file(p)
+    return str(p)
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
@@ -94,7 +103,7 @@ class ListingTest(unittest.TestCase):
         self.assertTrue(L.verify(got[0]))
     def test_claim_url(self):
         base = ["make", "--identity", str(self.f), "--price-per-hour-usdc", "1.00", "--payout", "0x" + "aa" * 20,
-                "--vendor-id", "0x" + "bb" * 32, "--chainid", "31337", "--contract", "0x" + "cc" * 20, "--country", "US"]
+                "--quote-key-file", quote_key_file(), "--country", "US"]
         url = "http://" + "y" * 52 + ".sesh/claim"
         import contextlib
         import io
@@ -126,8 +135,8 @@ class ExitVersionTest(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             rc = L.main(["make", "--identity", str(self.f), "--price-per-hour-usdc", "1.00",
-                         "--payout", "0x" + "aa" * 20, "--vendor-id", "0x" + "bb" * 32, "--chainid", "1",
-                         "--contract", "0x" + "cc" * 20, "--country", "us", *extra])
+                         "--payout", "0x" + "aa" * 20, "--quote-key-file", quote_key_file(),
+                         "--claim-url", CLAIM, "--country", "us", *extra])
         self.assertEqual(rc, 0)
         return json.loads(out.getvalue())
 
@@ -185,8 +194,62 @@ class ExitVersionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             L.meets_min_version({"exit_version": "0.1.0"}, "latest")
 
-if __name__ == "__main__":
-    unittest.main()
+class V3Fields(unittest.TestCase):
+    def setUp(self):
+        self.f = Path(tempfile.mkdtemp()) / "exit.key"
+        k = Ed25519PrivateKey.generate()
+        self.f.write_text(k.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                          serialization.NoEncryption()).hex())
+        self.qk = quote_key_file()
+
+    def make(self, *extra):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            L.main(["make", "--identity", str(self.f), "--price-per-hour-usdc", "0.50", "--payout", "0x" + "Aa" * 20,
+                    "--quote-key-file", self.qk, "--claim-url", CLAIM, "--country", "US", *extra])
+        return json.loads(out.getvalue())["listing"]
+
+    def test_defaults_both_chains_usdc(self):
+        b = self.make()
+        self.assertEqual(b["v"], 3)
+        self.assertEqual(b["chains"], [8453, 42161])
+        self.assertEqual(b["token"], "USDC")
+        self.assertEqual(b["quote_key"], Q.pub_hex(Q.load_key(self.qk)))
+        self.assertEqual(b["payout"], "0x" + "aa" * 20)
+        for gone in ("vendor_id", "contract", "chainid"):
+            self.assertNotIn(gone, b)
+        self.assertIsNone(L.listing_error(b))
+
+    def test_one_chain_and_bad_chain(self):
+        self.assertEqual(self.make("--chain", "base")["chains"], [8453])
+        with self.assertRaises(SystemExit):
+            self.make("--chain", "ethereum")
+        with self.assertRaises(SystemExit):
+            self.make("--chain", "base-sepolia")
+        self.assertEqual(self.make("--chain", "base-sepolia", "--testnets")["chains"], [84532])
+
+    def test_listing_error(self):
+        b = self.make()
+        self.assertIsNone(L.listing_error(b))
+        self.assertEqual(L.listing_error({**b, "chains": [84532]}), "unsupported chain")
+        self.assertIsNone(L.listing_error({**b, "chains": [84532]}, testnets=True))
+        self.assertEqual(L.listing_error({**b, "v": 2}), L.NEEDS_UPDATE)
+        self.assertEqual(L.listing_error({**b, "v": 9}), "unsupported listing version")
+        self.assertEqual(L.listing_error({**b, "token": "DAI"}), "only USDC is supported")
+        nq = dict(b); del nq["quote_key"]
+        self.assertEqual(L.listing_error(nq), "missing quote_key")
+
+    def test_refresh_refuses_v2(self):
+        d = Path(tempfile.mkdtemp())
+        key = L.load_identity(self.f)
+        body = {"v": 2, "seller": L.sesh_of(key.public_key().public_bytes(serialization.Encoding.Raw,
+                                                                             serialization.PublicFormat.Raw)),
+                "issued": 1, "price_per_hour_usdc": "1.00"}
+        (d / "l.json").write_text(json.dumps({"listing": body, "sig": key.sign(L.canonical(body)).hex()}))
+        with self.assertRaises(ValueError):
+            L.refresh(key, d / "l.json")
 
 
 class DnsField(unittest.TestCase):
@@ -196,3 +259,7 @@ class DnsField(unittest.TestCase):
             self.assertTrue(LL.valid_dns(ok), ok)
         for bad in ("1.1.1.1", "9.9.9.9", "8.8.8.8", "fd00::1", "", None, 53, "10.195.0.53:53", "localhost"):
             self.assertFalse(LL.valid_dns(bad), bad)
+
+
+if __name__ == "__main__":
+    unittest.main()

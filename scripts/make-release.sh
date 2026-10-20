@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assemble release assets locally (nothing is uploaded):
 #   scripts/make-release.sh --version v0.1.0 [--router-tarball release/v0.1.0/session-router-*.tar.gz]
-#                           [--binary dist/session-router] [--contract 0x...]
+#                           [--binary dist/session-router]
 #                           [--board-submit-url URL] [--base-url URL] [--out release]
 # Produces, in --out/<version>/:
 #   session-router-<v>-linux-x86_64.tar.gz  (if --router-tarball, from build-release.sh; pinned into
@@ -12,16 +12,15 @@
 #   user-data.yaml                  (cloud-init; pins bootstrap.sh sha256)
 #   SHA256SUMS, ONE-LINER.txt
 set -euo pipefail
-VER=""; BIN=""; RTAR=""; CONTRACT=""; BOARD=""; BASE=""; OUT=release
+VER=""; BIN=""; RTAR=""; BOARD=""; BASE=""; OUT=release
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VER=$2; shift 2;; --binary) BIN=$2; shift 2;; --router-tarball) RTAR=$2; shift 2;; --contract) CONTRACT=$2; shift 2;;
+    --version) VER=$2; shift 2;; --binary) BIN=$2; shift 2;; --router-tarball) RTAR=$2; shift 2;;
     --board-submit-url) BOARD=$2; shift 2;; --base-url) BASE=$2; shift 2;; --out) OUT=$2; shift 2;;
     *) echo "unknown arg $1" >&2; exit 1;;
   esac
 done
 [[ "$VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "--version vX.Y.Z required" >&2; exit 1; }
-[ -z "$CONTRACT" ] || [[ "$CONTRACT" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "bad --contract" >&2; exit 1; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BASE=${BASE:-https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack/releases/download/$VER}
 D="$OUT/$VER"; mkdir -p "$D"; D=$(cd "$D" && pwd)
@@ -56,7 +55,7 @@ tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 --numeric-owner --pax-opti
 PACK_SHA=$(sha256sum "$D/$NAME.tar.gz" | cut -d' ' -f1)
 
 sed -e "s|@RELEASE@|$VER|" -e "s|@PACK_URL@|$BASE/$NAME.tar.gz|" -e "s|@PACK_SHA256@|$PACK_SHA|" \
-    -e "s|@DEFAULT_CONTRACT@|$CONTRACT|" -e "s|@DEFAULT_BOARD_SUBMIT_URL@|$BOARD|" \
+    -e "s|@DEFAULT_BOARD_SUBMIT_URL@|$BOARD|" \
     -e "s|@ROUTER_URL@|$ROUTER_URL|" -e "s|@ROUTER_SHA256@|$ROUTER_SHA|" -e "s|@ROUTER_BIN_SHA256@|$ROUTER_BIN_SHA|" \
     "$ROOT/seller/bootstrap.sh" > "$D/bootstrap.sh"
 chmod 755 "$D/bootstrap.sh"

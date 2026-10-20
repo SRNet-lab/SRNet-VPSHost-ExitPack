@@ -12,8 +12,6 @@ C=$(command -v podman || command -v docker || true)
 BIN=${1:-}
 BASE=docker.io/library/ubuntu:24.04@sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b
 IMG=localhost/srnet-seller-test:24.04
-FOUNDRY=$(sed -n 's/^FOUNDRY_URL=//p' "$HERE/install.sh" | sed "s/\$FOUNDRY_VERSION/$(sed -n 's/^FOUNDRY_VERSION=//p' "$HERE/install.sh")/g; s/\${FOUNDRY_VERSION}/$(sed -n 's/^FOUNDRY_VERSION=//p' "$HERE/install.sh")/g")
-FSHA=$(sed -n 's/^FOUNDRY_SHA256=//p' "$HERE/install.sh")
 RT=""; [ -n "$BIN" ] && [ -f "$(dirname "$BIN")/RUNTIME-DEPS" ] && RT=$(tr '\n' ' ' < "$(dirname "$BIN")/RUNTIME-DEPS")
 
 CTX=$(mktemp -d); trap 'rm -rf "$CTX"' EXIT
@@ -23,9 +21,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends systemd systemd-sysv dbus \\
       python3 python3-cryptography nftables ufw iptables iproute2 ca-certificates curl tar kmod \\
       cloud-init $RT && rm -rf /var/lib/apt/lists/*
-# Foundry cast: verify the exact tarball pinned in install.sh (the installer would download it).
-RUN curl -fsSL -o /tmp/f.tgz "$FOUNDRY" && echo "$FSHA  /tmp/f.tgz" | sha256sum -c - \\
-    && mkdir -p /opt/srnet-seller/bin && tar -xzf /tmp/f.tgz -C /opt/srnet-seller/bin cast && rm /tmp/f.tgz
 CMD ["/sbin/init"]
 CF
 echo "== building test image (network only for package download)"
