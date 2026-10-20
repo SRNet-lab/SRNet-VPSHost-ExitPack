@@ -95,7 +95,7 @@ class Quotes(unittest.TestCase):
         self.assertNotIn(amt, taken)
 
     def test_unique_amount_stays_small_until_busy(self):
-        base = 10_000_000                                   # 10 USDC: 2% is over PAY_ID_MAX
+        base = 10_000_000                                   # 10 USDC: 5% is over PAY_ID_MAX
         widths = []
         Q.unique_amount(base, set(), rng=lambda n: widths.append(n) or 0)
         self.assertEqual(widths[-1], Q.PAY_ID_SMALL)        # < 1 cent normally
@@ -110,23 +110,24 @@ class Quotes(unittest.TestCase):
         Q.unique_amount(base, most, rng=lambda n: widths.append(n) or n - 1)
         self.assertEqual(widths[-1], Q.PAY_ID_MAX)
 
-    def test_extra_is_capped_at_a_cent_or_two_percent(self):
-        self.assertEqual(Q.extra_cap(500_000), 10_000)      # 0.50: 0.01 USDC
-        self.assertEqual(Q.extra_cap(2_000_000), 40_000)    # 2.00: 2% = 0.04
-        self.assertEqual(Q.extra_cap(50_000_000), Q.PAY_ID_MAX)
+    def test_extra_is_capped_at_five_cents_or_five_percent(self):
+        self.assertEqual(Q.extra_cap(500_000), 50_000)      # 0.50: 0.05 USDC
+        self.assertEqual(Q.extra_cap(1_000_000), 50_000)    # 1.00: 5% is the same 0.05
+        self.assertEqual(Q.extra_cap(1_500_000), 75_000)    # 1.50: 5% = 0.075
+        self.assertEqual(Q.extra_cap(4_000_000), Q.PAY_ID_MAX)
         base = 500_000
-        taken = {base + p for p in range(1, 5_001)}         # small range half used
+        taken = {base + p for p in range(1, 25_001)}        # 19,999 range more than half used
         seen = []
         amt, pid = Q.unique_amount(base, taken, rng=lambda n: seen.append(n) or n - 1)
-        self.assertEqual(seen[-1], 10_000)                  # may not grow past the cap
-        self.assertLessEqual(pid, 10_000)
+        self.assertEqual(seen[-1], 50_000)                  # may not grow past the cap
+        self.assertTrue(25_000 < pid <= 50_000 and amt not in taken)
         with self.assertRaises(Q.QuoteError) as e:
-            Q.unique_amount(base, {base + p for p in range(1, 9_001)})
+            Q.unique_amount(base, {base + p for p in range(1, 45_001)})
         self.assertIn("busy", str(e.exception))
         # the buyer refuses an extra over the cap, even if signed by the seller
         req = Q.make_request(self.s.sesh, CLIENT, 1, 42161, self.bk, now=T0)
         doc, _ = Q.make_quote(self.qkey, req, payout=PAYOUT, price_per_hour=1_000_000, taken=set(), now=T0)
-        body = dict(doc["quote"], amount=1_000_000 + 20_001)
+        body = dict(doc["quote"], amount=1_000_000 + 50_001)
         bad = {"quote": body, "sig": self.qkey.sign(Q._canon(Q.QUOTE_DOMAIN, body)).hex()}
         self.assertIn("amount", Q.quote_error(bad, listing=self.s.listing, req=req, cap=20_000_000, now=T0))
 

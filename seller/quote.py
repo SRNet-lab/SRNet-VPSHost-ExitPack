@@ -8,7 +8,7 @@
    plus a few millionths of a dollar that no other quote for this seller on that chain has used
    in the last 7 days, so the last digits work as a payment ID. Normally that is under one cent
    (1..9999 base units). When many quotes are out it grows in steps, but never past
-   extra_cap(): 0.01 USDC or 2% of the price, whichever is larger.
+   extra_cap(): 0.05 USDC or 5% of the price, whichever is larger.
 3. The buyer pays exactly that amount from any wallet, then sends a "paid" notice with the tx
    hash, signed by the per-install buyer key named in the quote request.
 4. The seller's watcher checks the quote against the signed listing, checks the payment on
@@ -49,8 +49,8 @@ MAX_QUOTE_TTL_S = 1800
 PAY_ID_SMALL = 9999         # unique part of the amount, in USDC base units: normally < 1 cent
 PAY_ID_STEPS = (9_999, 19_999, 49_999, 99_999)  # ranges it grows through when many quotes are out
 PAY_ID_MAX = 99_999         # ... and never more than 0.099999 USDC
-EXTRA_MIN = 10_000          # the extra may always reach 0.01 USDC ...
-EXTRA_SHARE = 50            # ... or 1/50 (2%) of the price, whichever is larger
+EXTRA_MIN = 50_000          # the extra may always reach 0.05 USDC ...
+EXTRA_SHARE = 20            # ... or 1/20 (5%) of the price, whichever is larger
 POOL_BUSY = 0.9             # refuse new quotes when this share of the amounts for a price is taken
 RESERVE_S = 7 * 86400       # an amount is never quoted again within this long (paid or not)
 KEEP_QUOTES_S = RESERVE_S + 1800 + 86400  # quote files (and paid notices for them) are kept this long
@@ -139,7 +139,7 @@ def request_error(req, seller: str, accept: list[int], max_hours: int, testnets:
 
 # ---------------------------------------------------------------- seller side: quote
 def extra_cap(base: int) -> int:
-    """Largest pay id (extra over the price) for a purchase of base units: 0.01 USDC or 2% of
+    """Largest pay id (extra over the price) for a purchase of base units: 0.05 USDC or 5% of
     the price, whichever is larger, and never over PAY_ID_MAX."""
     return min(PAY_ID_MAX, max(EXTRA_MIN, int(base) // EXTRA_SHARE))
 

@@ -2,7 +2,7 @@
 """Claim endpoint. Buyers ask for payment quotes and report payments here, over Session Router.
 
   claimd.py --host ADDR --port 80 --dir STATE --quote-key quote.key --listing listing.json \
-            [--cap-usdc 20] [--testnets] [--debug-sources]
+            [--cap-usdc 20] [--quotes-per-hour 150] [--testnets] [--debug-sources]
 
   POST /claim/quote        quote request (quote.py)          -> 200 signed quote
   POST /claim/paid         paid notice {"v":1,"quote_id","tx","sig"} -> 202, checked by the watcher
@@ -15,7 +15,7 @@ chain has used in the last 7 days, paid or not (quote.py). Bodies are at most 2 
 
 Limits, so one requester can't wear the desk down or lock other buyers out:
   - requests per source address and overall (per minute), and quotes per source and overall
-    (per hour; the overall quote rate is set so the 7-day amount pool can't run out);
+    (per hour; the overall rate, 150 by default, is set so the 7-day amount pool can't run out);
   - open quotes per buyer key and per source address. Neither is the .sesh address a request
     names, so naming someone else's address can't use up their limit. Requests are signed by
     the buyer key with the time, and a signature is taken once, so nobody can ask in another
@@ -64,7 +64,7 @@ PER_SOURCE = (20, 60.0)          # requests per window (s) from one address
 GLOBAL = (240, 60.0)             # requests per window overall
 MAX_SOURCES = 10000              # tracked sources in the request limiter
 QUOTES_PER_SOURCE = (10, 3600)   # new quotes per hour from one address
-QUOTES_GLOBAL = (400, 3600)      # new quotes per hour overall; 400 * 24 * 7 stays well under the amount pool
+QUOTES_GLOBAL = (150, 3600)      # new quotes per hour overall (default; --quotes-per-hour)
 MAX_OPEN_PER_BUYER = 5           # unexpired quotes per buyer key
 MAX_OPEN_PER_SOURCE = 5          # unexpired quotes per source address
 MAX_OPEN = 2000                  # unexpired quotes overall
@@ -79,9 +79,12 @@ MAX_CONN = 48                    # open connections overall (the unit allows 64 
 MAX_CONN_PER_SOURCE = 4
 DEFAULT_CAP_USDC = "20"
 REPLAY_KEEP_S = 2 * Q.REQUEST_SKEW_S + 60  # request signatures are remembered this long
-# Pool size: each (chain, purchase price) has at least quote.EXTRA_MIN amounts. At the global rate
-# that pool can fill inside the 7-day hold for one popular cheap purchase; the desk then answers
-# "busy" for that purchase until amounts free up. No payment is at risk (README, known limits).
+# Pool size: each (chain, purchase price) has at least quote.EXTRA_MIN amounts. At the default
+# global rate, even if every quote in the 7-day hold were for one and the same purchase, that
+# pool can't fill. A higher --quotes-per-hour than SAFE_QUOTES_PER_HOUR can make the desk answer
+# "busy" for a popular cheap purchase until amounts free up (no payment is at risk).
+SAFE_QUOTES_PER_HOUR = int(Q.POOL_BUSY * Q.EXTRA_MIN * 3600 // (RESERVE_S + Q.MAX_QUOTE_TTL_S))
+assert QUOTES_GLOBAL[0] <= SAFE_QUOTES_PER_HOUR
 
 
 def bind_ok(host: str) -> bool:
@@ -167,7 +170,8 @@ class Desk:
     """Issues quotes and takes paid notices. File state plus an sqlite index, so tests drive it without HTTP."""
 
     def __init__(self, state_dir: str | Path, quote_key: str | Path, listing_path: str | Path,
-                 cap: int | None = None, testnets: bool = False, clock=time.time, debug_sources: bool = False):
+                 cap: int | None = None, testnets: bool = False, clock=time.time, debug_sources: bool = False,
+                 quotes_per_hour: int | None = None):
         self.dir = Path(state_dir)
         for sub in ("quotes", "spool", "status"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
@@ -176,6 +180,7 @@ class Desk:
         self.cap = C.parse_usdc(DEFAULT_CAP_USDC) if cap is None else int(cap)
         self.testnets, self.clock = testnets, clock
         self.debug_sources = debug_sources
+        self.quotes_per_hour = quotes_per_hour   # None: QUOTES_GLOBAL
         self.rng = secrets.randbelow
         self._listing: tuple[float, dict] | None = None
         self.lock = threading.Lock()
@@ -320,7 +325,8 @@ class Desk:
             if self._count("SELECT COUNT(*) FROM quotes WHERE src = ? AND issued > ?",
                            tag, now - QUOTES_PER_SOURCE[1]) >= QUOTES_PER_SOURCE[0]:
                 return 429, {"error": "too many quotes from this connection; try again later"}
-            if self._count("SELECT COUNT(*) FROM quotes WHERE issued > ?", now - QUOTES_GLOBAL[1]) >= QUOTES_GLOBAL[0] \
+            per_hour = QUOTES_GLOBAL[0] if self.quotes_per_hour is None else self.quotes_per_hour
+            if self._count("SELECT COUNT(*) FROM quotes WHERE issued > ?", now - QUOTES_GLOBAL[1]) >= per_hour \
                     or self._count("SELECT COUNT(*) FROM quotes WHERE expires > ?", now) >= MAX_OPEN:
                 return 503, {"error": "busy: too many quotes right now; try again later"}
             price = C.parse_usdc(body["price_per_hour_usdc"])
@@ -493,11 +499,20 @@ def main(argv=None) -> int:
     ap.add_argument("--quote-key", required=True)
     ap.add_argument("--listing", required=True, help="this exit's signed listing.json")
     ap.add_argument("--cap-usdc", default=DEFAULT_CAP_USDC, help="largest single payment to quote (default 20)")
+    ap.add_argument("--quotes-per-hour", type=int, default=QUOTES_GLOBAL[0],
+                    help=f"new quotes per hour overall (default {QUOTES_GLOBAL[0]}; above {SAFE_QUOTES_PER_HOUR} "
+                         "a busy desk may refuse some cheap purchases for a while)")
     ap.add_argument("--testnets", action="store_true")
     ap.add_argument("--debug-sources", action="store_true",
                     help="log each quote's salted source tag (not the address), to tell buyers' sessions apart")
     a = ap.parse_args(argv)
+    if a.quotes_per_hour < 1:
+        raise SystemExit("--quotes-per-hour must be at least 1")
+    if a.quotes_per_hour > SAFE_QUOTES_PER_HOUR:
+        sys.stderr.write(f"claimd: --quotes-per-hour {a.quotes_per_hour} is over {SAFE_QUOTES_PER_HOUR}; under heavy "
+                         "load some cheap purchases may get \"busy\" until amounts free up\n")
     desk = Desk(a.dir, a.quote_key, a.listing, cap=C.parse_usdc(a.cap_usdc), testnets=a.testnets,
+                quotes_per_hour=a.quotes_per_hour,
                 debug_sources=a.debug_sources or os.environ.get("SRNET_CLAIM_DEBUG_SOURCES") == "1")
     desk.listing()  # fail early on a bad setup
     srv = serve(a.host, a.port, desk)

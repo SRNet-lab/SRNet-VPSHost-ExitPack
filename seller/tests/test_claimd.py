@@ -218,6 +218,46 @@ class DeskTest(unittest.TestCase):
     def test_open_limit_per_buyer_is_five(self):
         self.assertEqual(D.MAX_OPEN_PER_BUYER, 5)
 
+    def test_global_quote_limit_default_150_and_configurable(self):
+        self.assertEqual(D.QUOTES_GLOBAL, (150, 3600))
+        # the default can't fill the smallest amount pool inside the 7-day hold
+        self.assertLess(D.QUOTES_GLOBAL[0] * (Q.RESERVE_S + Q.MAX_QUOTE_TTL_S) / 3600, Q.POOL_BUSY * Q.EXTRA_MIN)
+        self.assertGreaterEqual(D.SAFE_QUOTES_PER_HOUR, D.QUOTES_GLOBAL[0])
+        d = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock, quotes_per_hour=2)
+        self.assertEqual(d.quote(self.req(key=buyer_key()[0]), src="a")[0], 200)
+        self.assertEqual(d.quote(self.req(key=buyer_key()[0]), src="b")[0], 200)
+        code, doc = d.quote(self.req(key=buyer_key()[0]), src="c")
+        self.assertEqual(code, 503)
+        self.assertIn("busy", doc["error"])
+        self.clock.t += 3601
+        self.assertEqual(d.quote(self.req(key=buyer_key()[0]), src="d")[0], 200)
+
+    def test_quotes_per_hour_flag(self):
+        import contextlib
+        import io
+        from unittest import mock
+        seen = {}
+
+        class Stop(Exception):
+            pass
+
+        def fake_desk(*a, **kw):
+            seen.update(kw)
+            raise Stop
+        base = ["--host", "127.0.0.1", "--dir", str(self.s.state), "--quote-key", str(self.s.quote_key),
+                "--listing", str(self.s.listing_path)]
+        with mock.patch.object(D, "Desk", fake_desk):
+            with self.assertRaises(Stop):
+                D.main(base)
+            self.assertEqual(seen["quotes_per_hour"], 150)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(Stop):
+                D.main(base + ["--quotes-per-hour", "400"])
+            self.assertEqual(seen["quotes_per_hour"], 400)
+            self.assertIn("over 267", err.getvalue())
+            with self.assertRaises(SystemExit):
+                D.main(base + ["--quotes-per-hour", "0"])
+
     # ------------------------------------------------------------ damaged index (R2-4)
     def test_damaged_index_is_moved_aside_and_rebuilt_with_reports(self):
         ids = []

@@ -31,6 +31,7 @@
 #                            from the public IPv4 via two geo-IP services that must agree)
 #   --region NAME  --max-hours N
 #   --cap-usdc N             largest single payment you will quote (default 20)
+#   --quotes-per-hour N      new quotes per hour overall on the claim desk (default 150)
 #   --board-submit-url URL   where the hourly listing refresh is sent (default on mainnet chains:
 #                            the SRNet board; 'none' = re-sign locally only)
 #
@@ -59,7 +60,7 @@ PREBUILT_SHA256=""
 CLAIM_ADDR=fd2e:7365:736a::1  # submit router tun address; claimd binds here only
 PREFIX=/opt/srnet-seller; MODE=""; BINARY=""; BINARY_SHA=""; PREBUILT_ARG=""
 ENABLE_EXIT=0; ACK=0; PORT=1193; WAN_IF=""; SSH_PORT=""; MAX_MBIT=100; SPEED_CAP=10; FIREWALL=1; START=1
-ROOT=""; DRY=0; WATCHER_ENV=""; PRICE="1.00"; CAP_USDC="20"; MAX_HOURS=168
+ROOT=""; DRY=0; WATCHER_ENV=""; PRICE="1.00"; CAP_USDC="20"; QUOTES_PER_HOUR=150; MAX_HOURS=168
 CHAINS=(); RPCS=(); TESTNETS=0; PAYOUT=""; REGION=""; COUNTRY=""; ACTION=install; PURGE=0; BOARD_URL=default
 TUN=sr-tun-seller; TUN_NET4=10.193.0.0/16
 # Exit resolver: an address outside the TUN range (on lo), so the router treats answers like any
@@ -93,6 +94,7 @@ while [ $# -gt 0 ]; do
     --watcher-env) WATCHER_ENV=$2; shift 2;;
     --price-per-hour-usdc|--price-usdc) PRICE=$2; shift 2;;
     --cap-usdc) CAP_USDC=$2; shift 2;;
+    --quotes-per-hour) QUOTES_PER_HOUR=$2; shift 2;;
     --max-hours) MAX_HOURS=$2; shift 2;;
     --chain) CHAINS+=("$2"); shift 2;;
     --testnets) TESTNETS=1; shift;;
@@ -246,6 +248,7 @@ MAINNET=0; for c in $CHAIN_IDS; do case $c in 42161|8453) MAINNET=1;; esac; done
 MIN_RATE=$(python3 -c "from decimal import Decimal as D;import sys;print(int(D(sys.argv[1])*1000000))" "$PRICE")
 [ "$MIN_RATE" -ge 10000 ] || die "--price-per-hour-usdc must be at least 0.01"
 [[ "$CAP_USDC" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --cap-usdc"
+[[ "$QUOTES_PER_HOUR" =~ ^[1-9][0-9]{0,4}$ ]] || die "bad --quotes-per-hour (a whole number, at least 1)"
 RPC_ARGS=""
 for r in "${RPCS[@]}"; do
   [[ "$r" =~ ^[0-9]+=https?://[A-Za-z0-9._:/?=%-]+$ ]] || die "bad --rpc (CHAINID=URL): $r"
@@ -613,6 +616,8 @@ chmod 640 "$P/config/watcher.env"
 cat > "$P/config/claimd.env" <<ENV
 # SRNet seller claim endpoint.
 CAP_USDC=$CAP_USDC
+# New quotes per hour overall. Above 267 a busy desk may refuse some cheap purchases for a while.
+QUOTES_PER_HOUR=$QUOTES_PER_HOUR
 # 1: log each quote's salted source tag (never the address), to check that buyers show up apart.
 SRNET_CLAIM_DEBUG_SOURCES=0
 ENV
@@ -840,7 +845,8 @@ Group=$CLAIMS_GROUP
 SupplementaryGroups=$GROUP
 EnvironmentFile=$PREFIX/config/claimd.env
 ExecStart=/usr/bin/python3 $PREFIX/pack/claimd.py --host $CLAIM_ADDR --port 80 --dir $PREFIX/claims \
-  --quote-key $PREFIX/config/quote.key --listing $PREFIX/listing/listing.json --cap-usdc \${CAP_USDC} $TESTNET_FLAG
+  --quote-key $PREFIX/config/quote.key --listing $PREFIX/listing/listing.json --cap-usdc \${CAP_USDC} \
+  --quotes-per-hour \${QUOTES_PER_HOUR} $TESTNET_FLAG
 Restart=always
 RestartSec=5
 UMask=0007

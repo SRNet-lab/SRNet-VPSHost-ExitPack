@@ -27,9 +27,9 @@ Building the router from source takes 20 to 60 minutes.
 2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
    contract, and an exact amount (the hourly price times N plus a few millionths of a USDC as a
    payment ID, so no two quotes in 7 days share an amount). The payment ID is usually under one
-   cent. When many quotes are out it can grow, but never past 0.01 USDC or 2% of the price,
-   whichever is larger, and the payment screen shows it. The quote is bound to
-   the buyer's `.sesh` address and expires after about 15 minutes. One payment is capped at
+   cent. When many quotes are out it can grow, but never past 0.05 USDC or 5% of the price,
+   whichever is larger, and the payment screen shows it. The quote is bound to the buyer's
+   `.sesh` address and expires after about 15 minutes. One payment is capped at
    20 USDC by default, and the price is at least 0.01 USDC an hour.
 3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
 4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
@@ -186,9 +186,12 @@ and each signed request is taken once, so another seller who has seen your reque
 send them again to use up your limit. One buyer key per install is enough for that, so the
 client doesn't keep one per seller.
 
+The desk gives out at most 150 new quotes an hour overall (`--quotes-per-hour` in the seller
+installer, `QUOTES_PER_HOUR` in `config/claimd.env`). At that rate the 7-day pool of payment IDs
+can't run out; above 267 an hour a busy desk may answer "busy" to some cheap purchases.
+
 Known beta limit: someone who keeps restarting Session Router to get new addresses can use up
-the desk's hourly quote limit (or, for one cheap purchase, its 7-day pool of payment IDs), and
-new buyers then get "busy" for a while; no money is at risk.
+the desk's hourly quote limit, and new buyers then get "busy" for a while; no money is at risk.
 
 If the desk's index (`claims/index.sqlite`) is damaged, the desk moves it aside and rebuilds it
 from its files on the next start. To check that two buyers come in on different sessions, set

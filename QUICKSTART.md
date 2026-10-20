@@ -108,6 +108,7 @@ Run `seller/install.sh --help` for the full list. The common ones:
 --chain NAME             arbitrum, base (repeatable; default both)
 --rpc CHAINID=URL        your own RPC for a chain (default: public RPCs)
 --cap-usdc N             largest single payment you will quote (default 20)
+--quotes-per-hour N      new quotes per hour overall on the claim desk (default 150)
 --max-hours N            most hours one quote can buy
 --country XX             ISO 3166-1 alpha-2; default: detected from the public IPv4
                          (two geo-IP services must agree, else --country is required)
