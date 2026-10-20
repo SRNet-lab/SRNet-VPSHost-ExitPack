@@ -20,7 +20,10 @@ FROM $BASE
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends systemd systemd-sysv dbus \\
       python3 python3-cryptography nftables ufw iptables iproute2 ca-certificates curl tar kmod \\
-      cloud-init $RT && rm -rf /var/lib/apt/lists/*
+      cloud-init $RT && rm -rf /var/lib/apt/lists/* \\
+ && touch /etc/cloud/cloud-init.disabled
+# cloud-init is only here for the schema check; booted without a datasource it rewrites
+# the apt sources with an UNAVAILABLE codename, so keep it from running in phase B
 CMD ["/sbin/init"]
 CF
 echo "== building test image (network only for package download)"
@@ -35,7 +38,8 @@ find . -name __pycache__ -prune -exec rm -rf {} +
 $P/tests/test_install.sh
 printf "x srnet-exit-admission/v2 y Inbound session rejected by auth policy z\n" > /tmp/fakebin
 $P/install.sh --binary /tmp/fakebin --enable-exit --i-accept-exit-operator-responsibility \
-  --payout 0x00000000000000000000000000000000000000aa --dry-run --root /stage >/tmp/out 2>&1
+  --payout 0x00000000000000000000000000000000000000aa --country US --dry-run --root /stage >/tmp/out 2>&1 \
+  || { cat /tmp/out; exit 1; }
 grep -q "SRNet seller pack .* installed" /tmp/out
 python3 $P/listing.py verify /stage/opt/srnet-seller/listing/listing.json
 if [ -f cloud-init/user-data.yaml ]; then
@@ -49,7 +53,12 @@ echo "phase A: OK"'
 echo "== phase B: real install under systemd"
 NAME=srnet-seller-e2e-$$
 $C rm -f "$NAME" >/dev/null 2>&1 || true
+# CAP_SYS_ADMIN: systemd keeps it for a moment to load the units' seccomp filters after
+# switching user (AmbientCapabilities + SystemCallArchitectures/Protect*); without it the
+# exit unit fails with 217/USER. apparmor=unconfined: the default container profile stops
+# systemd from booting once CAP_SYS_ADMIN is there (Ubuntu hosts).
 $C run -d --name "$NAME" --systemd=always --cap-add NET_ADMIN --cap-add NET_RAW --device /dev/net/tun \
+  --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
   -v "$ROOT:/src:ro" -v "$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN"):/sr-bin:ro" "$IMG" >/dev/null
 trap '$C rm -f "$NAME" >/dev/null 2>&1; rm -rf "$CTX"' EXIT
 for i in $(seq 1 30); do $C exec "$NAME" systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded' && break; sleep 1; done
@@ -57,18 +66,20 @@ $C exec "$NAME" bash -ec '
 cp -a /src /w && cd /w; P=$( [ -d seller ] && echo seller || echo seller-pack )
 cp /sr-bin /tmp/session-router
 $P/install.sh --binary /tmp/session-router --enable-exit --i-accept-exit-operator-responsibility \
-  --payout 0x00000000000000000000000000000000000000aa --price-per-hour-usdc 1.00 --country US --region test > /tmp/install.log 2>&1 \
+  --payout 0x00000000000000000000000000000000000000aa --price-per-hour-usdc 1.00 --country US --region test \
+  --board-submit-url none > /tmp/install.log 2>&1 \
   || { cat /tmp/install.log; exit 1; }
 tail -32 /tmp/install.log
 echo "--- second run (idempotent)"
 K1=$(sha256sum < /opt/srnet-seller/config/exit.key)
 $P/install.sh --binary /tmp/session-router --enable-exit --i-accept-exit-operator-responsibility \
-  --payout 0x00000000000000000000000000000000000000aa --price-per-hour-usdc 1.00 --country US --region test > /tmp/install2.log 2>&1
+  --payout 0x00000000000000000000000000000000000000aa --price-per-hour-usdc 1.00 --country US --region test \
+  --board-submit-url none > /tmp/install2.log 2>&1
 [ "$K1" = "$(sha256sum < /opt/srnet-seller/config/exit.key)" ] && echo "identity kept"
 grep -E "^health" /tmp/install2.log
 echo "--- process / caps"
 ps -o user=,comm= -C session-router
-grep -E "^Cap(Eff|Prm|Amb)" /proc/$(pgrep -x session-router)/status
+grep -E "^Cap(Eff|Prm|Amb)" /proc/$(systemctl show -p MainPID --value srnet-seller-exit)/status
 ip -br addr show sr-tun-seller
 ss -Hlun | grep 1193 || true
 nft list table inet srnet_seller | grep -E "dport 53 drop|masquerade|blocked4" | head -3
