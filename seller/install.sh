@@ -882,9 +882,14 @@ cat > "$R/etc/systemd/system/srnet-seller-listing.service" <<UNIT
 Description=SRNet seller listing refresh (re-sign and resubmit)
 After=network-online.target
 Wants=network-online.target
+# A failed board submit (say the submit router is still connecting right after install) is
+# tried again every 5 minutes instead of waiting for the next hourly run.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
+Restart=on-failure
+RestartSec=300
 User=$EXIT_USER
 Group=$GROUP
 EnvironmentFile=-$PREFIX/config/listing.env
@@ -1112,9 +1117,9 @@ echo "payout address:  ${PAYOUT:-(not set)}   price/hour: $PRICE USDC   chains: 
 echo "signed listing ($PREFIX/listing/listing.json, re-signed hourly${BOARD_URL:+ and sent to $BOARD_URL}):"
 python3 "$P/pack/listing.py" verify "$P/listing/listing.json" >/dev/null && cat "$P/listing/listing.json"
 if [ -n "$BOARD_URL" ]; then
-  echo "board:           the listing is published to the SRNet board automatically (no approval step)"
-  echo "                 and appears to buyers within minutes; it is re-sent every hour."
+  echo "board:           the listing is sent to the board automatically (no approval step) and"
+  echo "                 appears to buyers within minutes; it is re-sent every hour (every 5 min until it gets through)."
 fi
-echo "manage: srnet-seller status | health | listing | logs | uninstall [--purge]"
+echo "manage:          srnet-seller status | health | listing | logs | held | admit <quote id> | uninstall [--purge]"
 echo "payments:        USDC arrives in your payout wallet directly; there is nothing to claim"
 if [ "$DRY" = 0 ] && [ "$START" = 1 ] && have_systemd; then echo; health || true; fi

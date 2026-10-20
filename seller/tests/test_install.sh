@@ -91,6 +91,8 @@ grep -q 'private-key\|PRIVATE' "$W" "$T/r2/$U/config/watcher.env" && fail "watch
 grep -q 'useradd --system .* srnet-exit' "$T/r2/commands.log" || fail "no exit user"
 grep -q 'OnUnitActiveSec=1h' "$T/r2/etc/systemd/system/srnet-seller-listing.timer" || fail "listing timer not hourly"
 grep -q 'listing.py refresh' "$T/r2/etc/systemd/system/srnet-seller-listing.service" || fail "listing refresh unit"
+grep -qx 'Restart=on-failure' "$T/r2/etc/systemd/system/srnet-seller-listing.service" || fail "listing submit not retried"
+grep -qx 'StartLimitIntervalSec=0' "$T/r2/etc/systemd/system/srnet-seller-listing.service" || fail "listing retry start limit"
 grep -qE 'enable --now srnet-seller-exit.service srnet-seller-submit.service srnet-seller-claimd.service srnet-seller-listing.timer' "$T/r2/commands.log" || fail "timer/claimd not enabled"
 grep -q 'enable --now srnet-seller-watcher' "$T/r2/commands.log" || fail "watcher not enabled with a payout"
 grep -qx 'BOARD_SUBMIT_URL=http://exitsrjnc83har7a17mdtjpgi1j3odgiphaffe9ejfq4wnbdxkio.sesh/submit' "$T/r2/$U/config/listing.env" || fail "default board url"
@@ -220,7 +222,8 @@ grep -q 'apt-get update -q' "$T/r4/commands.log" || fail "no apt-get update"
 grep -q 'apt-get install .*libevent-core-2.1-7t64 .*libzstd1' "$T/r4/commands.log" || fail "router libs not installed for --binary"
 grep -q 'ip link show sr-tun-seller >/dev/null 2>&1 || exit 0' "$T/r4/$U/bin/srnet-seller-shape" || fail "shaper not quiet without TUN"
 out=$("$I" --binary "$T/fakebin" --dry-run --root "$T/r8" --payout $PAY 2>&1)
-echo "$out" | grep -q 'published to the SRNet board automatically' || fail "end text"
+echo "$out" | grep -q 'sent to the board automatically' || fail "end text"
+echo "$out" | grep -q "srnet-seller status | health | listing | logs | held | admit" || fail "manage line"
 ok
 # 9. idempotent: issuer + exit identity + quote key kept on re-run
 P1=$(cat "$T/r4/$U/config/issuer.pub"); K1=$(sha256sum < "$T/r4/$U/config/exit.key"); S1=$(sha256sum < "$T/r4/$U/config/quote.key")
