@@ -4,9 +4,9 @@ Everything for SRNet exits in one place:
 
 - **Seller pack** (`seller/`): patches, build scripts and an installer for running a paid,
   lease-gated Session Router exit on Ubuntu 24.04.
-- **Buyer add-on** (`client/`, the `srnet-exits` package): plugs into the SRNet client
-  ([SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop)) and adds `srnet exits`,
-  `srnet buy`, `srnet connect` and the Exits tab.
+- **Buyer client** (`client/`, the `srnet-exits` package): runs on its own as `srnet-exits`, or
+  plugs into the SRNet client ([SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop)) and
+  adds `srnet exits`, `srnet buy`, `srnet connect` and the Exits tab.
 - **Board** (`board/`): the signed list of exits that buyers browse.
 
 Buyers pay sellers directly in USDC on Arbitrum One or Base, from any wallet. There is no
@@ -48,16 +48,42 @@ seller takes the report for 8 days and keeps checking while its RPC is down. If 
 couldn't read the chain, it says so and tells you not to pay again; `srnet paid --tx 0x...`
 reports a hash you already have.
 
-## Buyer: install the add-on
+## Buyer: use exits without SRNet-Desktop
 
-The add-on goes into the same Python environment as the SRNet client:
+On Ubuntu 24.04, with Session Router installed and running (steps 1 and 2 of the
+[SRNet-Desktop install guide](https://github.com/SRNet-lab/SRNet-Desktop#1-session-router)):
+
+```sh
+cd ~
+sudo apt install -y git python3-venv nftables
+git clone https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack.git
+SRNet-VPSHost-ExitPack/client/install.sh
+```
+
+This installs only the exits client, as the `srnet-exits` command, into
+`~/.local/share/srnet-exits`. It sets up Session Router for exits (sudo asks once) and puts
+`~/.local/bin` on your PATH for new terminals. Then:
+
+```sh
+srnet-exits doctor
+srnet-exits exits
+srnet-exits buy --seller <id> --hours 1
+```
+
+`srnet-exits ui` opens the same thing as a small page in your browser.
+`client/install.sh --uninstall` removes it again. Details: [client/README.md](client/README.md).
+
+## Buyer: add exits to SRNet-Desktop
+
+If you use the SRNet client, install exits into it instead:
 
 ```sh
 ~/SRNet-Desktop/install.sh --with-exits
 ```
 
 or, by hand, `<the client's python> -m pip install "srnet-exits @ git+https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack"`.
-`srnet doctor` shows whether it is loaded. Details: [client/README.md](client/README.md).
+`srnet doctor` shows whether it is loaded. You can have both: `srnet` and `srnet-exits` share
+`~/.srnet`, so they see the same paid time, buyer key and connection.
 
 ## Seller: install
 
@@ -141,7 +167,7 @@ contrib/exit-lease/ admission issuer and exit-lease-verify
 scripts/            build and release scripts
 docker/             pinned container build
 seller/             installer, quotes, claim desk, payment watcher, listing
-client/             the buyer add-on for the SRNet client (srnet-exits)
+client/             the buyer client: srnet-exits on its own, or the SRNet client's add-on
 contrib/legacy-cashout/  take out USDC left in the old SRNet balance (until 2027-01-18)
 cloud-init/         user-data for installs without SSH
 ```

@@ -1,6 +1,7 @@
 # srnet-exits
 
-The exits add-on for the SRNet client. It adds:
+The SRNet exits client. It runs on its own as `srnet-exits`, or as an add-on for the SRNet
+client, where the same commands appear under `srnet`:
 
 ```
 srnet exits                          list exits from the signed board
@@ -12,13 +13,41 @@ srnet setup-router                   once: persistent router key, no blackhole r
 srnet verify --chain base --tx 0x.. --to 0x.. --amount 3.50   check a shop payment on chain
 ```
 
-and an **Exits** tab in `srnet ui`. Without the add-on, the SRNet client has no exit, wallet
-or payment code at all and those commands print how to install it.
+As an add-on it also adds an **Exits** tab to `srnet ui`. Without it, the SRNet client has no
+exit, wallet or payment code at all and those commands print how to install it.
 
 SRNet is an independent project. It is not affiliated with or endorsed by the Session Foundation
 or the Session Technology Foundation.
 
-## Install
+## Use exits without SRNet-Desktop
+
+You need Ubuntu 24.04 with Session Router installed and running: steps 1 and 2 of the
+[SRNet-Desktop install guide](https://github.com/SRNet-lab/SRNet-Desktop#1-session-router).
+Then, as your own user (not with sudo):
+
+```sh
+cd ~
+sudo apt install -y git python3-venv nftables
+git clone https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack.git
+SRNet-VPSHost-ExitPack/client/install.sh
+```
+
+The installer:
+
+- makes its own Python environment in `~/.local/share/srnet-exits` and puts the `srnet-exits`
+  command in `~/.local/bin` (it never touches an `srnet` command you may have);
+- runs `srnet-exits setup-router` once (sudo asks for your password);
+- adds one marked line to `~/.bashrc` (and `~/.zshrc` if you have one) so new terminals find
+  `~/.local/bin`.
+
+Run it again to update. `client/install.sh --uninstall` removes the command, its environment and
+that one line; your paid time and settings in `~/.srnet` stay.
+
+Every command below works the same with `srnet-exits` in place of `srnet`, and
+`srnet-exits doctor` checks Session Router, `.sesh` names, the clock and everything exits need.
+`srnet-exits ui` opens the Exits page in your browser (on 127.0.0.1 only).
+
+## Add exits to the SRNet client
 
 Into the same Python environment as the SRNet client:
 
@@ -34,6 +63,9 @@ python -m pip install "srnet-exits @ git+https://github.com/SRNet-lab/SRNet-VPSH
 
 `srnet doctor` lists the add-on and checks what it needs: `ip`, `nft` (kill switch),
 systemd-resolved, and the Arbitrum One and Base RPCs.
+
+You can have both. `srnet` and `srnet-exits` use the same `~/.srnet`: the same paid time, the same
+buyer key and one connection, so either one can disconnect what the other connected.
 
 ## Buying exit time
 
@@ -113,8 +145,8 @@ Session Router needs two client settings for exits: a persistent key (`keyfile=`
 belongs to your `.sesh` address, which otherwise changes at every restart) and
 `blackhole-routes=false` (otherwise the router blackholes all traffic while an exit is mapped).
 `srnet setup-router` sets both (one sudo prompt; keeps the rest of `client.ini`, keeps a copy of the
-original as `client.ini.srnet-orig`, restarts the router, changes nothing when already set), and
-the desktop's `install.sh --with-exits` runs it. It also leaves `srnet-exits.ok` next to
+original as `client.ini.srnet-orig`, restarts the router, changes nothing when already set);
+`client/install.sh` and the desktop's `install.sh --with-exits` run it. It also leaves `srnet-exits.ok` next to
 `client.ini` (world-readable: the settings plus client.ini's size, time and hash), so `srnet doctor`
 can show them without root. `srnet buy` / `srnet connect` refuse until they are set; `srnet doctor`
 points at `srnet setup-router`.
@@ -126,6 +158,7 @@ python3 -m unittest discover -s client/tests -t client/tests
 client/tests/lab/run.sh     # the real nft/ip rules in network namespaces (needs nft + user namespaces)
 ```
 
-The tests find the SRNet client in the same environment, in `$SRNET_CLIENT_DIR`, or in a
-sibling `SRNet-Desktop` checkout. `test_e2e_local.py` runs the seller's claim desk and watcher
-and the buyer commands as separate processes against a mock chain on loopback; no real funds.
+The tests run without the SRNet client. If it is installed in the same environment, in
+`$SRNET_CLIENT_DIR`, or in a sibling `SRNet-Desktop` checkout, they also check the add-on through
+`srnet`. `test_e2e_local.py` runs the seller's claim desk and watcher and the buyer commands as
+separate processes against a mock chain on loopback; no real funds.
