@@ -12,21 +12,21 @@
                                                       # ingest + sign + mirror; run hourly
   board.py publish --out WWW URL ...                  # push the signed board to mirrors
   board.py verify  WWW --pin <board.sesh>
-  board.py config  --state DIR [--min-exit-version 0.1.0 | --min-exit-version off]
+  board.py config  --state DIR [--min-exit-version 0.1.0 | --min-exit-version off] [--testnets on|off]
 
 Mirrors run board_server.py --pin <board.sesh> and accept POST /publish of a newer signed board.
 
-Listings are published automatically: a listing with a valid seller signature, the Arbitrum One
-chain id and live contract, sane fields and a non-zero payout goes live at the next sign (every
-tick). Changes to any field, including payout / vendor_id / country, go live the same way. Banned
-sellers are refused. Sellers re-sign and resubmit every hour; a listing not refreshed for 3 hours
+Listings are published automatically: a v3 listing with a valid seller signature, supported
+chains (Arbitrum One, Base), sane fields and a non-zero payout goes live at the next sign (every
+tick). Changes to any field, including payout / chains / country, go live the same way. Banned
+sellers are refused. Old v2 listings stay listed for two weeks after the board is upgraded
+(clients show them as "seller needs to update"), then are left out. Sellers re-sign and resubmit every hour; a listing not refreshed for 3 hours
 is left out of the signed board and comes back on its next valid refresh. With min_exit_version
 set (config), listings below it are left out.
 """
 from __future__ import annotations
 
 import argparse
-import re
 import json
 import urllib.request
 import os
@@ -59,43 +59,20 @@ def _log(state_dir: Path, event: dict) -> None:
         f.write(json.dumps({"t": int(time.time()), **event}, sort_keys=True) + "\n")
 
 
-ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
-HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
-PRICE_RE = re.compile(r"^[0-9]{1,6}(\.[0-9]{1,6})?$")
+def legacy_until(st: dict, now: float) -> int:
+    """End of the v2 grace period; starts the first time this board version runs."""
+    if "legacy_until" not in st:
+        st["legacy_until"] = int(now) + B.LEGACY_GRACE_S
+    return int(st["legacy_until"])
 
 
-def check_listing(body: dict) -> str | None:
+def check_listing(body: dict, st: dict | None = None, now: float | None = None) -> str | None:
     """Why a (signature-valid) listing can't go live, or None if it can."""
-    price_fields = ("price_per_hour_usdc", "max_hours") if body.get("v") == 2 else ("price_usdc", "period_s")
-    for f in B.ECONOMIC_FIELDS + price_fields:
-        if f not in body:
-            return f"missing {f}"
-    if B.DEPLOYMENTS.get(body["chainid"]) is None or not isinstance(body["chainid"], int):
-        return "unsupported chainid"
-    if not isinstance(body["contract"], str) or body["contract"].lower() != B.DEPLOYMENTS[body["chainid"]].lower():
-        return "contract is not the live deployment"
-    if not (isinstance(body["payout"], str) and ADDR_RE.match(body["payout"])) or int(body["payout"], 16) == 0:
-        return "bad or zero payout"
-    if not (isinstance(body["vendor_id"], str) and HASH_RE.match(body["vendor_id"])):
-        return "bad vendor_id"
-    if body.get("v") == 2:
-        pr, mh = body["price_per_hour_usdc"], body["max_hours"]
-        if not (isinstance(pr, str) and PRICE_RE.match(pr) and float(pr) > 0):
-            return "bad price_per_hour_usdc"
-        if not (isinstance(mh, int) and not isinstance(mh, bool) and 1 <= mh <= 999):
-            return "bad max_hours"
-    if "exit_version" in body and not (isinstance(body["exit_version"], str)
-                                       and L.EXIT_VERSION_RE.match(body["exit_version"])):
-        return "bad exit_version"
-    if "country" in body and not (isinstance(body["country"], str) and L.COUNTRY_RE.match(body["country"])):
-        return "bad country"
-    if "speed_cap_mbps" in body and not L.valid_speed_cap(body["speed_cap_mbps"]):
-        return "bad speed_cap_mbps"
-    if "dns" in body and not L.valid_dns(body["dns"]):
-        return "bad dns"
-    if "region" in body and not (isinstance(body["region"], str) and len(body["region"]) <= 64):
-        return "bad region"
-    return None
+    why = L.listing_error(body, testnets=bool((st or {}).get("testnets")))
+    if why == L.NEEDS_UPDATE and st is not None:
+        now = time.time() if now is None else now
+        return None if now < legacy_until(st, now) else "old v2 listing, grace period over"
+    return why
 
 
 def submit_doc(state_dir: Path, st: dict, doc: dict, now: float | None = None) -> str:
@@ -109,7 +86,7 @@ def submit_doc(state_dir: Path, st: dict, doc: dict, now: float | None = None) -
     max_age = st.get("max_listing_age_s", B.DEFAULT_MAX_LISTING_AGE_S)
     if not B.listing_live(doc, now, max_age):
         return "rejected:expired or future-dated"
-    why = check_listing(body)
+    why = check_listing(body, st, now)
     if why:
         return f"rejected:{why}"
     seller = body["seller"]
@@ -191,11 +168,14 @@ def cmd_list(a) -> int:
                  else f"price={b.get('price_usdc')} period={b.get('period_s')}s")
         if not L.meets_min_version(b, st.get("min_exit_version")):
             flag += f"  (HIDDEN: exit_version below {st['min_exit_version']})"
-        why = check_listing(b)
+        why = check_listing(b, st, now)
         if why:
             flag += f"  (HIDDEN: {why})"
+        elif b.get("v") != L.LISTING_VERSION:
+            flag += f"  ({L.NEEDS_UPDATE})"
         status = "banned" if seller in st.get("banned", {}) else "live"
-        print(f"{status:7} {seller}  {price} country={L.country_text(b)} region={b.get('region','')} chain={b.get('chainid')} "
+        chains = ",".join(str(c) for c in b.get("chains") or [b.get("chainid")])
+        print(f"{status:7} {seller}  {price} country={L.country_text(b)} region={b.get('region','')} chains={chains} "
               f"exit_version={b.get('exit_version') or 'unknown'} speed_cap={L.speed_cap_text(b)} "
               f"last-refresh={time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(int(b.get('issued', 0))))}"
               f"{flag}")
@@ -232,7 +212,7 @@ def build_body(st: dict, now: float, valid_hours: float) -> dict:
     minv = st.get("min_exit_version")
     banned = st.get("banned", {})
     live = [e["doc"] for seller, e in sorted(st["sellers"].items())
-            if seller not in banned and check_listing(e["doc"]["listing"]) is None
+            if seller not in banned and check_listing(e["doc"]["listing"], st, now) is None
             and B.listing_live(e["doc"], now, max_age)
             and L.meets_min_version(e["doc"]["listing"], minv)]
     return {"v": 1, "board": st["board"], "seq": st["seq"] + 1, "issued": int(now),
@@ -335,7 +315,11 @@ def cmd_config(a) -> int:
             st["min_exit_version"] = v
         _save(d, st)
         _log(d, {"ev": "config", "min_exit_version": st.get("min_exit_version")})
-    print(f"min_exit_version={st.get('min_exit_version') or 'off'}")
+    if a.testnets is not None:
+        st["testnets"] = a.testnets == "on"
+        _save(d, st)
+        _log(d, {"ev": "config", "testnets": st["testnets"]})
+    print(f"min_exit_version={st.get('min_exit_version') or 'off'} testnets={'on' if st.get('testnets') else 'off'}")
     return 0
 
 
@@ -361,6 +345,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("verify"); p.add_argument("www"); p.add_argument("--pin", required=True)
     p = sub.add_parser("config"); p.add_argument("--state", required=True)
     p.add_argument("--min-exit-version", help="hide listings below this exit_version; 'off' clears (default off)")
+    p.add_argument("--testnets", choices=("on", "off"), help="accept listings for test chains (test boards only)")
     a = ap.parse_args(argv)
     return {"init": cmd_init, "submit": cmd_submit, "ingest": cmd_ingest, "list": cmd_list,
             "ban": cmd_ban, "unban": cmd_unban, "sign": cmd_sign, "tick": cmd_tick, "publish": cmd_publish, "verify": cmd_verify,

@@ -44,13 +44,11 @@ CLOCK_SKEW_S = 300
 LISTING_REFRESH_S = 3600
 LISTING_HIDE_AFTER_S = 3 * 3600
 DEFAULT_MAX_LISTING_AGE_S = LISTING_HIDE_AFTER_S
-# Fields every listing must carry (vendor_id is derived from the payout address; chainid/contract
-# say where the payout is made).
-ECONOMIC_FIELDS = ("payout", "vendor_id", "chainid", "contract")
 # Fields whose change on a refresh is recorded in the board audit log (they go live immediately).
-AUDIT_FIELDS = ECONOMIC_FIELDS + ("country",)
-# SRNetBalance deployments a listing may point at (chain id -> contract). Arbitrum One only.
-DEPLOYMENTS = {42161: "0x7e0d01b7dd916bdab96b0971ab92d160e1664431"}  # fundWithPermit, 2026-10-14
+AUDIT_FIELDS = ("payout", "chains", "quote_key", "claim_url", "country")
+# Old v2 listings (contract payments) stay on the board, marked "seller needs to update", for this
+# long after the board first runs this version; after that they are left out.
+LEGACY_GRACE_S = 14 * 86400
 
 
 class BoardError(Exception):

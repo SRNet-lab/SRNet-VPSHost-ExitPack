@@ -51,7 +51,7 @@ command -v python3 >/dev/null && python3 -c 'import cryptography' || die "need p
 id $USER_ >/dev/null 2>&1 || useradd --system --home-dir $VAR --shell /usr/sbin/nologin $USER_
 install -d -m 755 $PREFIX $PREFIX/board $PREFIX/seller
 install -m 644 "$HERE"/boardfmt.py "$HERE"/board.py "$HERE"/board_server.py $PREFIX/board/
-install -m 644 "$HERE"/../seller/listing.py $PREFIX/seller/
+for f in listing.py chains.py quote.py; do install -m 644 "$HERE/../seller/$f" $PREFIX/seller/; done
 install -m 755 "$BIN" $PREFIX/session-router
 [ -f "$(dirname "$BIN")/../mainnet.signed" ] && install -m 644 "$(dirname "$BIN")/../mainnet.signed" $PREFIX/ || true
 install -d -m 711 $ETC

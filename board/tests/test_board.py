@@ -30,11 +30,26 @@ def keyfile(d: Path, name: str):
     return p, L.sesh_of(pub)
 
 
+CLAIM = "http://" + "y" * 52 + ".sesh/claim"
+V3 = {"chains": [8453, 42161], "token": "USDC", "quote_key": "ab" * 32, "claim_url": CLAIM}
+
+
 def listing(keypath, price="1.00", payout="0x" + "aa" * 20, **extra):
     extra.setdefault("region", "us-east")
+    for k, v in V3.items():
+        extra.setdefault(k, v)
     return L.make(L.load_identity(keypath), price_per_hour_usdc=price, max_hours=168, payout=payout,
-                  vendor_id="0x" + "bb" * 32, chainid=42161, contract="0x7e0d01b7dd916bdab96b0971ab92d160e1664431",
                   policy=["tcp/443"], **extra)
+
+
+def legacy_v2(keypath, issued=None):
+    """An old contract-era listing."""
+    key = L.load_identity(keypath)
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    body = {"v": 2, "seller": L.sesh_of(pub), "issued": int(time.time() if issued is None else issued),
+            "price_per_hour_usdc": "1.00", "max_hours": 168, "payout": "0x" + "aa" * 20,
+            "vendor_id": "0x" + "bb" * 32, "chainid": 42161, "contract": "0x" + "7e" * 20, "policy": ["tcp/443"]}
+    return {"listing": body, "sig": key.sign(L.canonical(body)).hex()}
 
 
 def quiet(fn, *a):
@@ -88,17 +103,21 @@ class AdminFlowTest(Base):
         self.assertIn("rejected:bad signature", out)
 
     def test_sanity_checks(self):
-        cases = [({"chainid": 31337}, "unsupported chainid"),
-                 ({"contract": "0x" + "c0" * 20}, "contract is not the live deployment"),
+        cases = [({"chains": [31337]}, "unsupported chain"),
+                 ({"chains": [1]}, "unsupported chain"),
+                 ({"chains": []}, "bad chains"),
+                 ({"chains": [8453, 8453]}, "bad chains"),
+                 ({"token": "USDT"}, "only USDC is supported"),
+                 ({"contract": "0x" + "c0" * 20}, "unexpected contract"),
+                 ({"quote_key": "12"}, "bad quote_key"),
+                 ({"claim_url": "http://example.com/claim"}, "bad claim_url"),
                  ({"payout": "0x" + "00" * 20}, "bad or zero payout"),
                  ({"payout": "0xnope"}, "bad or zero payout"),
-                 ({"vendor_id": "0x12"}, "bad vendor_id"),
                  ({"price_per_hour_usdc": "0"}, "bad price_per_hour_usdc"),
                  ({"max_hours": 0}, "bad max_hours")]
         for i, (over, why) in enumerate(cases):
             body = {"price_per_hour_usdc": "1.00", "max_hours": 168, "payout": "0x" + "aa" * 20,
-                    "vendor_id": "0x" + "bb" * 32, "chainid": 42161, "contract": B.DEPLOYMENTS[42161],
-                    "region": "x", "policy": ["tcp/443"], **over}
+                    "region": "x", "policy": ["tcp/443"], **V3, **over}
             doc = L.make(L.load_identity(self.s1key), **body)
             rc, out, _ = self.submit(doc, f"s{i}.json")
             self.assertIn(f"rejected:{why}", out, over)
@@ -251,13 +270,12 @@ class ServerClientTest(Base):
         self.assertIn("live", out)
 
 
-def listing_v2_at(keypath, issued, payout="0x" + "aa" * 20, price="1.00"):
-    """A v2 listing signed with an explicit issued time."""
+def listing_at(keypath, issued, payout="0x" + "aa" * 20, price="1.00"):
+    """A v3 listing signed with an explicit issued time."""
     key = L.load_identity(keypath)
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    body = {"v": 2, "seller": L.sesh_of(pub), "issued": int(issued), "price_per_hour_usdc": price,
-            "max_hours": 168, "payout": payout, "vendor_id": "0x" + "bb" * 32, "chainid": 42161,
-            "contract": "0x7e0d01b7dd916bdab96b0971ab92d160e1664431", "region": "us-east", "policy": ["tcp/443", "tcp/80"]}
+    body = {"v": 3, "seller": L.sesh_of(pub), "issued": int(issued), "price_per_hour_usdc": price,
+            "max_hours": 168, "payout": payout, **V3, "region": "us-east", "policy": ["tcp/443", "tcp/80"]}
     return {"listing": body, "sig": key.sign(L.canonical(body)).hex()}
 
 
@@ -282,7 +300,7 @@ class LivenessTest(Base):
     def test_hidden_after_3h_without_refresh(self):
         t0 = time.time()
         st = self.st()
-        self.assertEqual(admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t0), now=t0), "live")
+        self.assertEqual(admin.submit_doc(self.state, st, listing_at(self.s1key, t0), now=t0), "live")
         self.save(st)
         self.assertEqual(len(self.board_at(t0 + 2 * 3600)[1]), 1)          # refreshed 2 h ago: shown
         self.assertEqual(len(self.board_at(t0 + 3 * 3600 - 60)[1]), 1)     # just under 3 h: shown
@@ -298,10 +316,10 @@ class LivenessTest(Base):
     def test_reappears_on_refresh_without_reapproval(self):
         t0 = time.time()
         st = self.st()
-        admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t0), now=t0)
+        admin.submit_doc(self.state, st, listing_at(self.s1key, t0), now=t0)
         t1 = t0 + 5 * 3600                                                  # hidden for 2 h
         self.assertEqual(admin.build_body(st, t1, 24)["listings"], [])
-        res = admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t1, price="0.75"), now=t1)
+        res = admin.submit_doc(self.state, st, listing_at(self.s1key, t1, price="0.75"), now=t1)
         self.assertEqual(res, "refreshed")
         self.assertEqual(st["sellers"][self.s1]["status"], "live")
         self.save(st)
@@ -313,21 +331,21 @@ class LivenessTest(Base):
     def test_payout_change_goes_live_after_hidden(self):
         t0 = time.time()
         st = self.st()
-        admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t0), now=t0)
+        admin.submit_doc(self.state, st, listing_at(self.s1key, t0), now=t0)
         t1 = t0 + 5 * 3600
-        res = admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t1, payout="0x" + "dd" * 20), now=t1)
+        res = admin.submit_doc(self.state, st, listing_at(self.s1key, t1, payout="0x" + "dd" * 20), now=t1)
         self.assertEqual(res, "refreshed")
         self.assertEqual(len(admin.build_body(st, t1, 24)["listings"]), 1)
 
     def test_stale_refresh_rejected(self):
         t0 = time.time()
         st = self.st()
-        res = admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t0 - 3 * 3600 - 5), now=t0)
+        res = admin.submit_doc(self.state, st, listing_at(self.s1key, t0 - 3 * 3600 - 5), now=t0)
         self.assertTrue(res.startswith("rejected"), res)
 
-    def test_v2_listing_requires_hourly_fields(self):
+    def test_listing_requires_hourly_fields(self):
         t0 = time.time()
-        doc = listing_v2_at(self.s1key, t0)
+        doc = listing_at(self.s1key, t0)
         del doc["listing"]["max_hours"]
         key = L.load_identity(self.s1key)
         doc["sig"] = key.sign(L.canonical(doc["listing"])).hex()
@@ -336,10 +354,10 @@ class LivenessTest(Base):
     def test_tick_ingests_and_signs(self):
         t0 = time.time()
         st = self.st()
-        admin.submit_doc(self.state, st, listing_v2_at(self.s1key, t0 - 60), now=t0)
+        admin.submit_doc(self.state, st, listing_at(self.s1key, t0 - 60), now=t0)
         st["max_listing_age_s"] = 30 * 86400          # an older state file
         self.save(st)
-        (self.state / "inbox" / "r.json").write_text(json.dumps(listing_v2_at(self.s1key, t0)))
+        (self.state / "inbox" / "r.json").write_text(json.dumps(listing_at(self.s1key, t0)))
         rc, out, _ = quiet(admin.main, ["tick", "--state", str(self.state), "--key", str(self.bkey),
                                         "--out", str(self.www)])
         self.assertEqual(rc, 0, out)
@@ -468,3 +486,31 @@ class ExitVersionBoardTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacyListingTest(Base):
+    def test_v2_kept_for_two_weeks_then_dropped(self):
+        t0 = time.time()
+        st = admin._load(self.state)
+        self.assertEqual(admin.submit_doc(self.state, st, legacy_v2(self.s1key, t0), now=t0), "live")
+        self.assertEqual(st["legacy_until"], int(t0) + 14 * 86400)
+        self.assertEqual(len(admin.build_body(st, t0 + 60, 24)["listings"]), 1)
+        late = t0 + 14 * 86400 + 10
+        res = admin.submit_doc(self.state, st, legacy_v2(self.s1key, late), now=late)
+        self.assertEqual(res, "rejected:old v2 listing, grace period over")
+        st["sellers"][self.s1]["doc"] = legacy_v2(self.s1key, late)
+        self.assertEqual(admin.build_body(st, late + 1, 24)["listings"], [])
+
+    def test_v2_flagged_needs_update(self):
+        self.assertEqual(L.listing_error(legacy_v2(self.s1key)["listing"]), L.NEEDS_UPDATE)
+        self.submit(legacy_v2(self.s1key))
+        rc, out, _ = quiet(admin.main, ["list", "--state", str(self.state)])
+        self.assertIn("seller needs to update", out)
+
+    def test_testnet_chains_only_when_enabled(self):
+        doc = listing(self.s1key, chains=[84532])
+        rc, out, _ = self.submit(doc)
+        self.assertIn("rejected:unsupported chain", out)
+        quiet(admin.main, ["config", "--state", str(self.state), "--testnets", "on"])
+        rc, out, _ = self.submit(doc, "t.json")
+        self.assertIn(": live", out)
