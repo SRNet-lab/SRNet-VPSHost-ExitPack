@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srnet-exits"
+version = "0.3.0"
+description = "SRNet Exits: buy time on SRNet exits with a direct USDC payment, and connect through them"
+readme = "client/README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "srnet-client",
+    "cryptography>=41",
+    "pyzmq>=25",
+    "qrcode>=7",
+]
+
+[project.scripts]
+srnet-exits = "srnet_exits.cli:main"
+
+[project.entry-points."srnet.addons"]
+exits = "srnet_exits.addon:ADDON"
+
+[tool.setuptools]
+packages = ["srnet_exits", "srnet_exits._seller", "srnet_exits._board", "srnet_exits._lease"]
+
+[tool.setuptools.package-dir]
+"srnet_exits" = "client/srnet_exits"
+"srnet_exits._seller" = "seller"
+"srnet_exits._board" = "board"
+"srnet_exits._lease" = "contrib/exit-lease"
+
+[tool.setuptools.package-data]
+"srnet_exits" = ["web/*"]
+"srnet_exits._seller" = ["VERSION"]
