@@ -22,13 +22,34 @@ FIX = ("sudo session-router-config -k " + KEY + " && sudo chown _session:_sessio
        "  && sudo systemctl restart session-router-client")
 
 
-def read(path: str | Path = DEFAULT_INI) -> dict | None:
-    """{'keyfile': str|None, 'blackhole_routes': bool} or None when the file can't be read."""
+def _text(p: Path, privileged: bool) -> str | None:
+    try:
+        return p.read_text()
+    except PermissionError:
+        if not privileged:
+            return None
+    except (OSError, UnicodeDecodeError):
+        return None
+    # the package installs it root:_session 0640; srnet connect asks sudo anyway
+    from . import priv
+    try:
+        r = priv.run(["cat", str(p)], check=False, what="checking Session Router's settings")
+    except priv.PrivError:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def read(path: str | Path = DEFAULT_INI, privileged: bool = False) -> dict | None:
+    """{'keyfile': str|None, 'blackhole_routes': bool} or None when the file can't be read
+    (privileged: read it through sudo when it is not readable as this user)."""
     p = Path(path)
     cp = configparser.ConfigParser(strict=False, interpolation=None, inline_comment_prefixes=("#", ";"))
+    text = _text(p, privileged)
+    if text is None:
+        return None
     try:
-        cp.read_string(p.read_text())
-    except (OSError, configparser.Error, UnicodeDecodeError):
+        cp.read_string(text)
+    except configparser.Error:
         return None
     net = cp["network"] if cp.has_section("network") else {}
     bh = str(net.get("blackhole-routes", "true")).strip().lower()
@@ -36,10 +57,11 @@ def read(path: str | Path = DEFAULT_INI) -> dict | None:
             "blackhole_routes": bh not in ("false", "0", "no", "off")}
 
 
-def problems(path: str | Path = DEFAULT_INI) -> list[str]:
-    r = read(path)
+def problems(path: str | Path = DEFAULT_INI, privileged: bool = False) -> list[str] | None:
+    """The problems, [] when fine, None when the file could not be read (or does not exist)."""
+    r = read(path, privileged)
     if r is None:
-        return []
+        return None
     out = []
     if not r["keyfile"]:
         out.append("Session Router has no persistent key (keyfile= in [network]): it gets a new .sesh "

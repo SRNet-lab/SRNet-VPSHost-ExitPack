@@ -63,7 +63,7 @@ class _Base(unittest.TestCase):
              mock.patch.object(cli, "_rpc", FakeRpc), \
              mock.patch.object(cli.reminder, "start", lambda *a: None), \
              mock.patch.object(cli, "guess_wan", lambda *a: "eth0"), \
-             mock.patch.object(cli.routercfg, "problems", getattr(self, "router_problems", lambda path: [])), \
+             mock.patch.object(cli.routercfg, "problems", getattr(self, "router_problems", lambda path, privileged=False: [])), \
              mock.patch.object(cli.inbound, "up", lambda wan: self.inbound_calls.append(("up", wan))), \
              mock.patch.object(cli.inbound, "down", lambda: self.inbound_calls.append(("down",))), \
              mock.patch.object(cli, "own_sesh", lambda: ME):
@@ -178,7 +178,7 @@ class InboundSessions(_Base):
 
     def test_connect_refuses_with_router_blackhole_routes_on(self):
         home = self.home()
-        self.router_problems = lambda path: ["Session Router's blackhole-routes is on: while connected ..."]
+        self.router_problems = lambda path, privileged=False: ["Session Router's blackhole-routes is on: while connected ..."]
         err = _io.StringIO()
         with mock.patch("sys.stderr", err), mock.patch("sys.stdout", _io.StringIO()):
             self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch", "--system-dns"), 1)
@@ -188,7 +188,7 @@ class InboundSessions(_Base):
 
     def test_buy_refuses_without_a_persistent_router_key(self):
         home = self.home()
-        self.router_problems = lambda path: ["Session Router has no persistent key (keyfile= in [network]) ..."]
+        self.router_problems = lambda path, privileged=False: ["Session Router has no persistent key (keyfile= in [network]) ..."]
         err = _io.StringIO()
         with mock.patch("sys.stderr", err), mock.patch("sys.stdout", _io.StringIO()):
             self.assertEqual(self.run_cli(home, "buy", SELLER, "--hours", "1", "--client-sesh", ME), 1)

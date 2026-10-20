@@ -46,7 +46,11 @@ class ExitsAddon:
         from . import routercfg
         rc = routercfg.read(cfg.get("router_ini") or routercfg.DEFAULT_INI)
         if rc is None:
-            line(None, "Session Router settings for exits", f"could not read {routercfg.DEFAULT_INI}")
+            line(None, "Session Router settings for exits",
+                 f"{routercfg.DEFAULT_INI} needs root to read; check: sudo grep -E "
+                 "'^(keyfile|blackhole-routes)' " + routercfg.DEFAULT_INI
+                 + "  (want a keyfile= line and blackhole-routes=false; README, Install, step 5). "
+                 "srnet connect checks it itself")
         else:
             probs = routercfg.problems(cfg.get("router_ini") or routercfg.DEFAULT_INI)
             line(not probs or False, "Session Router settings for exits (persistent key, no blackhole routes)",

@@ -167,7 +167,7 @@ def cmd_buy(args, st) -> int:
         print("which seller? srnet buy --seller <id> --hours N (see: srnet exits)", file=sys.stderr)
         return 2
     warning.ensure_ack(st.root)
-    if not _router_ok(config.load(st.root), need=("persistent key",)):
+    if not _router_ok(config.load(st.root), need=("persistent key",), privileged=False):
         return 1
     client_sesh = args.client_sesh or own_sesh()
     if not client_sesh:
@@ -389,10 +389,16 @@ def dns_down(st, quiet: bool = False) -> bool:
     return ok
 
 
-def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes")) -> bool:
+def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes"), privileged: bool = True) -> bool:
     """Refuse (with the one-time fix) when Session Router's client.ini would break exits."""
-    probs = [p for p in routercfg.problems(cfg.get("router_ini") or routercfg.DEFAULT_INI)
-             if any(n in p for n in need)]
+    path = cfg.get("router_ini") or routercfg.DEFAULT_INI
+    found = routercfg.problems(path, privileged=privileged)
+    if found is None:
+        if Path(path).exists():
+            print(f"note: could not read {path} to check Session Router's settings for exits "
+                  "(README, Install, step 5)", file=sys.stderr)
+        return True
+    probs = [p for p in found if any(n in p for n in need)]
     if not probs:
         return True
     for p in probs:

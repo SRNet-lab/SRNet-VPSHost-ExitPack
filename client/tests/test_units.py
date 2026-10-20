@@ -120,7 +120,23 @@ class RouterCfg(unittest.TestCase):
     def test_unreadable_config_is_not_a_problem_here(self):
         from srnet_exits import routercfg
         self.assertIsNone(routercfg.read("/nonexistent/client.ini"))
-        self.assertEqual(routercfg.problems("/nonexistent/client.ini"), [])
+        self.assertIsNone(routercfg.problems("/nonexistent/client.ini"))
+
+    def test_unreadable_as_user_is_read_through_sudo_when_allowed(self):
+        from srnet_exits import priv, routercfg
+        p = self.ini("[network]\n")
+        calls = []
+
+        class R:
+            returncode, stdout, stderr = 0, "[network]\nkeyfile=/k\nblackhole-routes=false\n", ""
+
+        def denied(self, *a, **k):
+            raise PermissionError(13, "denied")
+        with mock.patch.object(Path, "read_text", denied), \
+                mock.patch.object(priv, "run", lambda cmd, **k: calls.append(cmd) or R()):
+            self.assertIsNone(routercfg.problems(p))          # buy: no sudo prompt, just unknown
+            self.assertEqual(routercfg.problems(p, privileged=True), [])
+        self.assertEqual(calls, [["cat", str(p)]])
 
     def test_fix_command_is_what_the_readme_says(self):
         from srnet_exits import routercfg
