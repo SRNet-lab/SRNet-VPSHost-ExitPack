@@ -1,5 +1,12 @@
 # SRNet VPS Host Exit Pack
 
+**What's new**
+
+- No developer fee anywhere in SRNet.
+- Simpler payments: buyers pay the seller's payout address straight from their own wallet, by
+  the hour. No balance, no contract and no escrow.
+- `srnet-exits` runs on its own, so you can use exits without SRNet-Desktop.
+
 Everything for SRNet exits in one place:
 
 - **Seller pack** (`seller/`): patches, build scripts and an installer for running a paid,
@@ -263,6 +270,8 @@ tunnel DNS).
   add-on installed, buyers find, pay for and connect to exits from it.
 - [Session-Router-SRNet](https://github.com/SRNet-lab/Session-Router-SRNet): the Session Router
   build the client runs, with exit mapping added.
+- [SRNet-TypedSNApp-HostPack](https://github.com/SRNet-lab/SRNet-TypedSNApp-HostPack): run your
+  own host for boards, stores, wikis, chat rooms, file drops, profiles, directories or mail.
 
 ## License
 
