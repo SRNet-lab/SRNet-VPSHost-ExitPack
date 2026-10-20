@@ -9,6 +9,7 @@ mock USDC address), the seller's claim desk and watcher as separate processes, a
 """
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -163,6 +164,14 @@ class EndToEnd(unittest.TestCase):
                 p.kill()
         self.chain.srv.shutdown()
         self.chain.srv.server_close()
+        from srnet_exits import reminder   # buying starts the real lease reminder; stop it
+        for pf in (self.home / "exits").glob("reminder-*.pid"):
+            try:
+                pid = int(pf.read_text())
+                if reminder._alive(pid):
+                    os.kill(pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
 
     def client(self, *args, timeout=90):
         pp = str(helpers.CLIENT)  # srnet-exits on its own: no SRNet client on the path
