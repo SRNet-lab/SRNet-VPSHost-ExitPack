@@ -25,15 +25,18 @@ Building the router from source takes 20 to 60 minutes.
 
 1. The buyer runs `srnet buy --seller <id> --hours N` (or presses Buy in the Exits tab).
 2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
-   contract, and an exact amount (the hourly price times N plus a few millionths of a USDC,
-   usually under one cent, so no two quotes in 7 days share an amount). The quote is bound to
+   contract, and an exact amount (the hourly price times N plus a few millionths of a USDC as a
+   payment ID, so no two quotes in 7 days share an amount). The payment ID is usually under one
+   cent. When many quotes are out it can grow, but never past 0.01 USDC or 2% of the price,
+   whichever is larger, and the payment screen shows it. The quote is bound to
    the buyer's `.sesh` address and expires after about 15 minutes. One payment is capped at
    20 USDC by default, and the price is at least 0.01 USDC an hour.
 3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
 4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
    The seller's watcher checks that transaction on chain itself (read-only) and admits the
    buyer for the quoted hours once it is a few blocks deep (Arbitrum 20, Base 5, a few seconds).
-   The block time has to fall inside the quote's 15 minutes. A transaction can only be used once.
+   The block time has to fall inside the quote's 15 minutes (with 5 minutes of slack for a
+   seller clock that runs fast). A transaction can only be used once.
 5. About 10 minutes before the time runs out the client warns. Nothing renews by itself;
    to keep going, buy again.
 
@@ -171,11 +174,26 @@ funds. The watcher (`srnet-seller-watcher`) checks each reported payment on chai
 admits anyone.
 
 The desk runs as its own user (`srnet-claim`). It holds the quote key, but it can't read the
-watcher's admission key or its record of used payments. Limits per connection and overall
-(requests a minute, quotes an hour, open quotes, 3 transaction hashes per quote, 10 second
-socket timeouts) keep one requester from wearing it down. Open quotes are counted per buyer
-key and per connection, never by the `.sesh` address a request names, so nobody can use up
-someone else's limit.
+watcher's admission key, its RPC settings or its record of used payments. The watcher doesn't
+take the desk's word for a quote either: it reads the signed listing itself and checks every
+quote's payout address, chain, token, price and hours against it before it looks at the chain.
+
+Limits per connection and overall (requests a minute, quotes an hour, open quotes, 3
+transaction hashes per quote, 10 second socket timeouts) keep one requester from wearing the
+desk down. Open quotes are counted per buyer key and per connection, never by the `.sesh`
+address a request names. Quote requests are signed by the buyer key with the current time,
+and each signed request is taken once, so another seller who has seen your requests can't
+send them again to use up your limit. One buyer key per install is enough for that, so the
+client doesn't keep one per seller.
+
+Known beta limit: someone who keeps restarting Session Router to get new addresses can use up
+the desk's hourly quote limit (or, for one cheap purchase, its 7-day pool of payment IDs), and
+new buyers then get "busy" for a while; no money is at risk.
+
+If the desk's index (`claims/index.sqlite`) is damaged, the desk moves it aside and rebuilds it
+from its files on the next start. To check that two buyers come in on different sessions, set
+`SRNET_CLAIM_DEBUG_SOURCES=1` in `config/claimd.env` and restart the desk: it then logs a salted
+tag for each quote's connection (never the address).
 
 ## Old SRNet balance
 
