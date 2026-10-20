@@ -205,13 +205,8 @@ class Backend:
             rec = (self.st.data.get("exits") or {}).get("quotes", {}).get(qid)
             if not rec:
                 return {"ok": False, "err": "unknown quote"}
-            if rec.get("tx") != tx:
-                def reopen(d):
-                    r = ((d.get("exits") or {}).get("quotes") or {}).get(qid)
-                    if r:
-                        r["state"] = "open"
-                from . import state as S
-                S.update(self.st, reopen)
+            if rec.get("tx") != tx and rec.get("state") != "admitted":
+                pay.Buyer(self.st, cfg={}).reopen(qid)
         self._start_watch(qid, tx=tx)
         return {"id": qid, "state": "confirming"}
 

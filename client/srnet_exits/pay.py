@@ -52,6 +52,14 @@ def _ex(st) -> dict:
     return _exd(st.data)
 
 
+# how far a quote has got; a stored quote never goes back to a lower one (except by reopen)
+RANK = {"open": 0, "reported": 1, "rejected": 2, "expired": 2, "admitted": 3}
+
+
+def _rank(state) -> int:
+    return RANK.get(state, 0)
+
+
 def no_match_text(q: dict, near: list[int] | None = None, other_chain: int | None = None) -> str:
     amt = C.fmt_usdc(q["amount"])
     msg = (f"No matching payment yet. Send exactly {amt} USDC on {C.label(q['chainid'])} "
@@ -113,13 +121,36 @@ class Buyer:
 
     def _put(self, rec: dict, more=None) -> None:
         """Store this quote record (and, with more(exits), a lease change) into a fresh copy of
-        state.json under the lock: everything else in it (a connect elsewhere, say) stays."""
+        state.json under the lock: everything else in it (a connect elsewhere, say) stays.
+        The stored state never moves backwards: if another process got this quote further (a CLI
+        `paid` that saw it admitted while the page still watches, say), that state, with its tx
+        and reason, is kept. Only reopen() lowers it."""
         def fn(data):
             e = _exd(data)
-            e["quotes"][rec["id"]] = rec
+            cur = e["quotes"].get(rec["id"])
+            new = rec
+            if isinstance(cur, dict) and _rank(cur.get("state")) > _rank(rec.get("state")):
+                new = dict(rec, state=cur["state"])
+                for k in ("tx", "reason"):
+                    if k in cur:
+                        new[k] = cur[k]
+                    else:
+                        new.pop(k, None)
+            e["quotes"][rec["id"]] = new
             if more:
                 more(e)
         S.update(self.st, fn)
+
+    def reopen(self, qid: str) -> bool:
+        """Watch a rejected, expired or reported quote again (for another tx). An admitted quote
+        stays admitted. True if it is open now."""
+        def fn(data):
+            r = _exd(data)["quotes"].get(qid)
+            if not r or r.get("state") == "admitted":
+                return False
+            r["state"] = "open"
+            return True
+        return bool(S.update(self.st, fn))
 
     # --------------------------------------------------------------- quote
     def desk(self, body: dict) -> claim.Desk:

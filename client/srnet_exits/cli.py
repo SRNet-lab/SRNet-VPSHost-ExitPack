@@ -217,7 +217,8 @@ def cmd_paid(args, st) -> int:
             print(rec.get("reason") or f"that quote is {rec['state']}", file=sys.stderr)
             return 1
         if args.tx and rec["state"] != "open" and rec.get("tx") != args.tx.lower():
-            rec["state"] = "open"
+            if b.reopen(rec["id"]):
+                rec["state"] = "open"
         out = b.watch(rec, _events, tx=args.tx.lower() if args.tx else None)
     except pay.BuyError as e:
         print(f"error: {e}", file=sys.stderr)

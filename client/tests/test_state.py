@@ -133,5 +133,68 @@ class StaleCopy(unittest.TestCase):
         self.assertIn(self.rec["id"], d["exits"]["quotes"])
 
 
+class QuoteStateOnlyMovesForward(unittest.TestCase):
+    """A CLI `paid` and the page's watch on the same quote: the older copy can't undo the newer."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.page = S.State(self.root)
+        q = {"id": "00112233aabbccdd", "seller": SELLER, "state": "reported", "tx": "0x" + "11" * 32, "scan": {},
+             "doc": {"quote": {"id": "00112233aabbccdd", "seller": SELLER, "client_sesh": ME,
+                                  "chainid": 42161}}, "listing": {}}
+        S.update(self.page, lambda d: pay._exd(d)["quotes"].__setitem__(q["id"], q))
+        self.rec = self.page.data["exits"]["quotes"][q["id"]]   # the watch's copy
+        self.qid = q["id"]
+
+    def disk(self):
+        return json.loads((self.root / "state.json").read_text())["exits"]["quotes"][self.qid]
+
+    def other_sets(self, **kw):
+        S.update(S.State(self.root), lambda d: d["exits"]["quotes"][self.qid].update(kw))
+
+    def test_admitted_is_not_moved_back_to_reported(self):
+        self.other_sets(state="admitted", tx="0x" + "22" * 32)
+        self.rec["scan"]["next"] = 77
+        pay.Buyer(self.page, cfg={})._put(self.rec)
+        d = self.disk()
+        self.assertEqual(d["state"], "admitted")
+        self.assertEqual(d["tx"], "0x" + "22" * 32)
+        self.assertEqual(d["scan"]["next"], 77)
+        self.assertEqual(self.rec["state"], "reported")   # the caller's copy is left alone
+
+    def test_rejected_is_not_moved_back_to_open_or_reported(self):
+        self.other_sets(state="rejected", reason="paid too little")
+        for st in ("open", "reported"):
+            self.rec["state"] = st
+            pay.Buyer(self.page, cfg={})._put(self.rec)
+            self.assertEqual((self.disk()["state"], self.disk()["reason"]), ("rejected", "paid too little"))
+
+    def test_moving_forward_is_stored(self):
+        self.other_sets(state="open")
+        b = pay.Buyer(self.page, cfg={})
+        b._put(self.rec)
+        self.assertEqual(self.disk()["state"], "reported")
+        b._settle(self.rec, {"status": "admitted", "lease_end": 9_999_999_999})
+        self.assertEqual(self.disk()["state"], "admitted")
+
+    def test_reopen_for_another_tx_but_never_an_admitted_quote(self):
+        b = pay.Buyer(self.page, cfg={})
+        self.other_sets(state="expired", reason="late")
+        self.assertTrue(b.reopen(self.qid))
+        self.assertEqual(self.disk()["state"], "open")
+        self.other_sets(state="admitted")
+        self.assertFalse(b.reopen(self.qid))
+        self.assertEqual(self.disk()["state"], "admitted")
+        self.assertFalse(b.reopen("ffffffffffffffff"))
+
+    def test_page_paid_does_not_reopen_an_admitted_quote(self):
+        from srnet_exits import ui
+        self.other_sets(state="admitted")
+        be = ui.Backend(S.State(self.root))
+        be._start_watch = lambda *a, **k: None
+        be.paid({"id": self.qid, "tx": "0x" + "33" * 32})
+        self.assertEqual(self.disk()["state"], "admitted")
+
+
 if __name__ == "__main__":
     unittest.main()
