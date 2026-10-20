@@ -4,6 +4,8 @@ import functools
 import http.client
 import io
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,10 +125,9 @@ class Addon(unittest.TestCase):
             self.assertNotIn(mod, sys.modules)
 
 
-@unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")
 class TabBackend(unittest.TestCase):
     def setUp(self):
-        from srnet.state import State
+        from srnet_exits.state import State
         from srnet_exits import ui
         self.st = State(Path(tempfile.mkdtemp()))
         self.srv, self.base, self.tok = ui.serve(ui.Backend(self.st))
@@ -177,7 +178,6 @@ class TabBackend(unittest.TestCase):
         self.assertTrue(out.get("need_ack"))
 
 
-@unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")
 class BuyCli(unittest.TestCase):
     def test_buy_no_wait_prints_address_amount_and_link(self):
         from srnet_exits import cli
@@ -231,13 +231,26 @@ class Packaging(unittest.TestCase):
         self.assertNotIn("srnet-client", names)
         self.assertNotIn("srnet-exits", names)
 
-    def test_srnet_exits_without_the_core_says_so(self):
-        from srnet_exits import cli
-        err = io.StringIO()
-        with mock.patch.dict("sys.modules", {"srnet": None, "srnet.state": None}), mock.patch("sys.stderr", err):
-            self.assertEqual(cli.main(["exits"]), 2)
-        self.assertIn("needs the SRNet client", err.getvalue())
-
+    def test_srnet_exits_runs_without_the_core(self):
+        """No SRNet client on the path: srnet-exits still lists exits from a listings file."""
+        import subprocess
+        s = F.Seller(dns="10.195.0.53")
+        home = Path(tempfile.mkdtemp())
+        lp = home / "board.json"
+        lp.write_text(json.dumps([s.listing_doc]))
+        code = ("import sys\n"
+                "class B:\n"
+                "    def find_spec(self, n, p=None, t=None):\n"
+                "        if n == 'srnet' or n.startswith('srnet.'): raise ImportError(n)\n"
+                "sys.meta_path.insert(0, B())\n"
+                "from srnet_exits import standalone\n"
+                "sys.argv[0] = 'srnet-exits'\n"
+                "sys.exit(standalone.entry())\n")
+        r = subprocess.run([sys.executable, "-c", code, "--home", str(home), "exits", "--listings", str(lp)],
+                           capture_output=True, text=True, timeout=60, cwd=str(helpers.CLIENT),
+                           env=dict(os.environ, PYTHONPATH=str(helpers.CLIENT)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(s.sesh[:16], r.stdout)
 
 if __name__ == "__main__":
     unittest.main()

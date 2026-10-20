@@ -1,4 +1,4 @@
-"""Commands the exits add-on adds to `srnet` (also usable on their own as `srnet-exits`).
+"""Commands the exits add-on adds to `srnet` (and that `srnet-exits` offers on its own).
 
   srnet exits                          list sellers from the signed board
   srnet buy --seller ID --hours N      get a quote, pay it from any wallet, wait for the exit to admit you
@@ -26,6 +26,7 @@ import chains as C  # noqa: E402
 
 from . import board as boardmod, config, inbound, listings, killswitch, pay, priv, reminder, routercfg, tunneldns, warning
 from .backend import LiveBackend
+from .prog import P as _P
 
 
 # ------------------------------------------------------------------ helpers
@@ -53,7 +54,7 @@ def own_sesh() -> str:
 
 
 def _rpc(endpoint: str):
-    from srnet.rpc import Rpc
+    from .rpc import Rpc
     return Rpc(endpoint)
 
 
@@ -148,7 +149,7 @@ def _finish(b: pay.Buyer, rec: dict, out: dict, st) -> int:
         lease = pay.active_lease(st, rec["seller"]) or {}
         end = int(lease.get("end") or out.get("lease_end") or 0)
         print(f"paid: the seller confirmed your exit time ({_left(end - time.time())})")
-        print(f"connect: srnet connect {rec['seller']}")
+        print(f"connect: {_P()} connect {rec['seller']}")
         print(f"You're in: exit time until {_hhmm(end)}")
         try:
             reminder.start(st.root, rec["seller"])
@@ -157,21 +158,21 @@ def _finish(b: pay.Buyer, rec: dict, out: dict, st) -> int:
         return 0
     print(out.get("message") or out.get("reason") or f"status: {s}", file=sys.stderr)
     if s == "waiting":
-        print(f"check again: srnet paid --quote {rec['id']}", file=sys.stderr)
+        print(f"check again: {_P()} paid --quote {rec['id']}", file=sys.stderr)
     return 1
 
 
 def cmd_buy(args, st) -> int:
     seller = args.seller or args.seller_pos
     if not seller:
-        print("which seller? srnet buy --seller <id> --hours N (see: srnet exits)", file=sys.stderr)
+        print(f"which seller? {_P()} buy --seller <id> --hours N (see: {_P()} exits)", file=sys.stderr)
         return 2
     warning.ensure_ack(st.root)
     if not _router_ok(config.load(st.root), need=("persistent key",), privileged=False):
         return 1
     client_sesh = args.client_sesh or own_sesh()
     if not client_sesh:
-        print("could not read your .sesh address from Session Router (is .sesh DNS working? run srnet doctor); "
+        print(f"could not read your .sesh address from Session Router (is .sesh DNS working? run {_P()} doctor); "
               "or pass --client-sesh ADDRESS.sesh", file=sys.stderr)
         return 1
     try:
@@ -180,7 +181,7 @@ def cmd_buy(args, st) -> int:
         print(f"board unavailable: {e}", file=sys.stderr)
         return 1
     if not doc:
-        print("seller not on the board (see: srnet exits)", file=sys.stderr)
+        print(f"seller not on the board (see: {_P()} exits)", file=sys.stderr)
         return 1
     if not listings.exit_dns(doc["listing"]) and not args.system_dns:
         print("this exit offers no DNS resolver of its own, so your DNS would leave outside the exit. "
@@ -194,9 +195,9 @@ def cmd_buy(args, st) -> int:
         return 1
     print(payment_text(b.info(rec)))
     if args.no_wait:
-        print(f"\nafter paying: srnet paid --quote {rec['id']}   (add --tx 0x... if you have the hash)")
+        print(f"\nafter paying: {_P()} paid --quote {rec['id']}   (add --tx 0x... if you have the hash)")
         return 0
-    print("\nwatching the chain for your payment (Ctrl-C is safe; carry on with: srnet paid)", file=sys.stderr)
+    print(f"\nwatching the chain for your payment (Ctrl-C is safe; carry on with: {_P()} paid)", file=sys.stderr)
     try:
         out = b.watch(rec, _events)
     except pay.BuyError as e:
@@ -228,7 +229,7 @@ def cmd_connect(args, st) -> int:
     cfg = config.load(st.root)
     lease = pay.active_lease(st, args.seller)
     if not lease:
-        print(f"no paid time for this seller; buy some first: srnet buy --seller {args.seller} --hours 1",
+        print(f"no paid time for this seller; buy some first: {_P()} buy --seller {args.seller} --hours 1",
               file=sys.stderr)
         return 1
     print(f"paid time left: {_left(lease['end'] - time.time())} (until {_hhmm(lease['end'])})")
@@ -277,7 +278,7 @@ def cmd_connect(args, st) -> int:
             print(f"kill switch NOT armed: {e}", file=sys.stderr)
             if not args.allow_no_ks:
                 print("not connecting without the kill switch. Fix the above, or connect knowingly "
-                      f"without it: srnet connect {args.seller} --no-killswitch", file=sys.stderr)
+                      f"without it: {_P()} connect {args.seller} --no-killswitch", file=sys.stderr)
                 _inbound_down(quiet=True)
                 return 1
             print("continuing WITHOUT the kill switch (--allow-no-ks)", file=sys.stderr)
@@ -296,7 +297,7 @@ def cmd_connect(args, st) -> int:
             dns_down(st, quiet=True)
             b.unmap_exit(args.seller)
             if armed:
-                print("the kill switch is still armed (clearnet blocked); remove it with: srnet disconnect",
+                print(f"the kill switch is still armed (clearnet blocked); remove it with: {_P()} disconnect",
                       file=sys.stderr)
             print(json.dumps({"ok": False, "reason": "tunnel_dns_failed", "killswitch": armed}))
             return 1
@@ -317,7 +318,7 @@ def cmd_connect(args, st) -> int:
         return 0
     print(json.dumps({"ok": False, "reason": result.reason, "steps": result.steps, "killswitch": armed}))
     if armed:
-        print("the kill switch is still armed (clearnet blocked); remove it with: srnet disconnect", file=sys.stderr)
+        print(f"the kill switch is still armed (clearnet blocked); remove it with: {_P()} disconnect", file=sys.stderr)
     return 1
 
 
@@ -333,7 +334,7 @@ def exit_dns_for(args, st, lease: dict, tun: str) -> tuple[str | None, str]:
         ip = listings.exit_dns(doc["listing"]) if doc else None
     if not ip:
         return None, ("refusing to connect: this exit offers no DNS resolver of its own, so your DNS would go out "
-                      "your normal connection, outside the exit. Use another exit (srnet exits), or connect "
+                      f"your normal connection, outside the exit. Use another exit ({_P()} exits), or connect "
                       "knowingly with --system-dns")
     for net in tunneldns.tun_networks(tun):
         if ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(net):
@@ -399,11 +400,11 @@ def cmd_setup_router(args, st) -> int:
     cfg = config.load(st.root)
     ini = args.ini or cfg.get("router_ini") or routercfg.DEFAULT_INI
     if not Path(ini).exists():
-        print(f"{ini} not found: install Session Router first (README, Install, step 1), "
-              "then run: srnet setup-router", file=sys.stderr)
+        print(f"{ini} not found: install Session Router first (SRNet-Desktop README, Install, steps 1 and 2), "
+              f"then run: {_P()} setup-router", file=sys.stderr)
         return 1
     # -I: no current directory or PYTHON* variables on sys.path for this root process; cwd="/"
-    cmd = [sys.executable, "-I", "-m", "srnet_exits.routercfg", "apply", "--ini", ini]
+    cmd = [sys.executable, "-I", "-m", "srnet_exits.routercfg", "apply", "--ini", ini, "--prog", _P()]
     if args.no_restart:
         cmd.append("--no-restart")
     try:
@@ -427,14 +428,14 @@ def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes"), privilege
         # buy (no sudo) stays quiet here: connect checks again through sudo before anything changes
         if privileged and Path(path).exists():
             print(f"note: could not read {path} to check Session Router's settings for exits "
-                  "(to check and fix it: srnet setup-router)", file=sys.stderr)
+                  f"(to check and fix it: {_P()} setup-router)", file=sys.stderr)
         return True
     probs = [p for p in found if any(n in p for n in need)]
     if not probs:
         return True
     for p in probs:
         print(p + ".", file=sys.stderr)
-    print(f"Fix it once, then try again: {routercfg.FIX}  (asks sudo; keeps the rest of client.ini)",
+    print(f"Fix it once, then try again: {routercfg.fix()}  (asks sudo; keeps the rest of client.ini)",
           file=sys.stderr)
     return False
 
@@ -466,7 +467,7 @@ def guess_wan(tun: str = killswitch.DEFAULT_TUN) -> str:
 
 def ks_word(v):
     if v is None:
-        return ("unknown (checking needs root; srnet connect/disconnect ask sudo themselves; to look: "
+        return (f"unknown (checking needs root; {_P()} connect/disconnect ask sudo themselves; to look: "
                 "sudo nft list table inet srnet_ks)" if killswitch.find_nft() else "unavailable (nftables not installed)")
     return "armed" if v else "off"
 
@@ -477,7 +478,7 @@ def dns_word(st) -> str:
         return "system (normal resolver)"
     pid = tunneldns.proxy_pid(st.root)
     return (f"through the exit's own resolver {rec.get('exit_dns') or '?'} (forwarder pid {pid})" if pid
-            else "through the exit, but the forwarder is not running: lookups fail until srnet disconnect")
+            else f"through the exit, but the forwarder is not running: lookups fail until {_P()} disconnect")
 
 
 def status_info(st, cfg: dict, endpoint: str | None = None, rpc_probe: bool = True) -> dict:
@@ -505,8 +506,8 @@ def status_info(st, cfg: dict, endpoint: str | None = None, rpc_probe: bool = Tr
         if conn and isinstance(mapped, list) and not mapped:
             # say after a reboot: the record is still here, the tunnel is not (nothing of it survives)
             info["connected_note"] = (f"not actually connected: Session Router has no exit mapped (say after a "
-                                      f"reboot). Reconnect: srnet connect {conn.get('seller')}  or clear this "
-                                      "record: srnet disconnect")
+                                      f"reboot). Reconnect: {_P()} connect {conn.get('seller')}  or clear this "
+                                      f"record: {_P()} disconnect")
     return info
 
 
@@ -535,7 +536,7 @@ def cmd_disconnect(args, st) -> int:
     ks = killswitch.KillSwitch(tun=cfg.get("tun", killswitch.DEFAULT_TUN))
     ks_ok = dns_ok
     if args.keep_killswitch:
-        print("kill switch kept armed (--keep-killswitch): clearnet stays blocked until srnet disconnect")
+        print(f"kill switch kept armed (--keep-killswitch): clearnet stays blocked until {_P()} disconnect")
     elif conn.get("killswitch") is False:
         print("kill switch was not armed for this connection")
     else:
@@ -555,7 +556,7 @@ def cmd_disconnect(args, st) -> int:
         else:
             print("kept the routing that keeps SSH/RDP sessions to this machine working, because Session "
                   "Router did not confirm the exit is unmapped (its routes may still send traffic into the "
-                  "tunnel). Run srnet disconnect again once Session Router answers; a reboot also clears it.",
+                  f"tunnel). Run {_P()} disconnect again once Session Router answers; a reboot also clears it.",
                   file=sys.stderr)
     if unmapped:
         st.data["connected"] = None   # else kept, so the next disconnect tries the unmap again
@@ -563,7 +564,7 @@ def cmd_disconnect(args, st) -> int:
     out = {"ok": ks_ok, "unmapped": seller if unmapped else None}
     lease = pay.active_lease(st, seller) if seller else None
     if lease:
-        out["reconnect"] = f"srnet connect {seller}  (works until {_hhmm(lease['end'])}; no new purchase)"
+        out["reconnect"] = f"{_P()} connect {seller}  (works until {_hhmm(lease['end'])}; no new purchase)"
     print(json.dumps(out))
     return 0 if ks_ok else 1
 
@@ -576,13 +577,13 @@ def register(sub) -> dict:
 
     b = sub.add_parser("buy", help="exits: buy time on an exit with a direct USDC payment (final, no refund)")
     b.add_argument("seller_pos", nargs="?", metavar="SELLER", help=argparse.SUPPRESS)
-    b.add_argument("--seller", help="seller .sesh id (see: srnet exits)")
+    b.add_argument("--seller", help=f"seller .sesh id (see: {_P()} exits)")
     b.add_argument("--hours", type=int, default=1, help="whole hours (default 1, up to the seller's limit)")
     b.add_argument("--chain", help="arbitrum or base (default: arbitrum if the seller takes it)")
     b.add_argument("--max-usdc", help="largest payment you allow this time (default 20, or \"max_payment_usdc\")")
     b.add_argument("--client-sesh", help="your own .sesh address (default: asked from Session Router)")
     b.add_argument("--listings", help="offline: listings file instead of the board")
-    b.add_argument("--no-wait", action="store_true", help="show the payment details and stop; finish with srnet paid")
+    b.add_argument("--no-wait", action="store_true", help=f"show the payment details and stop; finish with {_P()} paid")
     b.add_argument("--system-dns", action="store_true",
                    help="buy even if the exit runs no resolver (you will need connect --system-dns)")
 
@@ -621,24 +622,9 @@ def register(sub) -> dict:
 
 
 def main(argv=None) -> int:
-    """`srnet-exits`: the same commands without the rest of the SRNet client."""
-    try:
-        from srnet.state import State
-    except ImportError:
-        print("srnet-exits needs the SRNet client in the same Python environment: install SRNet-Desktop, "
-              "then ./install.sh --with-exits", file=sys.stderr)
-        return 2
-    ap = argparse.ArgumentParser(prog="srnet-exits", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--home", help="state dir (default ~/.srnet or $SRNET_HOME)")
-    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", required=True)
-    cmds = register(sub)
-    args = ap.parse_args(argv)
-    st = State(Path(args.home) if args.home else None)
-    try:
-        return cmds[args.cmd](args, st)
-    except KeyboardInterrupt:
-        return 130
+    """`python -m srnet_exits.cli` (the Exits tab runs connect / disconnect this way): same as srnet-exits."""
+    from . import standalone
+    return standalone.main(argv)
 
 
 if __name__ == "__main__":

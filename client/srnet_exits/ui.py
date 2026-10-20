@@ -13,6 +13,7 @@ from __future__ import annotations
 import hmac
 import io
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import chains as C  # noqa: E402
 import quote as Q  # noqa: E402
 
 from . import board as boardmod, cli, config, pay, warning
+from .prog import P as _P
 
 WEB = Path(__file__).resolve().parent / "web"
 MAX_BODY = 8 * 1024
@@ -59,7 +61,7 @@ class Backend:
         return config.load(self.st.root)
 
     def _reload(self):
-        from srnet.state import State
+        from .state import State
         self.st.data = State(self.st.root).data
 
     # ------------------------------------------------------------ board / status
@@ -221,8 +223,9 @@ class Backend:
     # ------------------------------------------------------------ connect
     def _run(self, args: list[str], timeout: float = 600) -> dict:
         cmd = [sys.executable, "-m", "srnet_exits.cli", "--home", str(self.st.root), *args]
+        env = dict(os.environ, SRNET_EXITS_PROG=_P())  # hints name the command this page belongs to
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                           cwd=str(Path(__file__).resolve().parents[1]))
+                           cwd=str(Path(__file__).resolve().parents[1]), env=env)
         return {"ok": p.returncode == 0, "out": p.stdout[-2000:], "err": p.stderr[-2000:]}
 
     def verify(self, req: dict) -> dict:

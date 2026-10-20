@@ -1,7 +1,7 @@
-"""Test paths: the add-on (client/), and the SRNet client core it plugs into (srnet-client).
+"""Test paths: srnet-exits (client/), and, if it is around, the SRNet client it plugs into.
 
-The core is found as an installed package, or from $SRNET_CLIENT_DIR, or from a sibling
-SRNet-Desktop checkout (../SRNet-Desktop/client-cli)."""
+The tests need no SRNet client. When one is found (an installed package, $SRNET_CLIENT_DIR, or a
+sibling SRNet-Desktop checkout at ../SRNet-Desktop/client-cli), the add-on checks run too."""
 import importlib.util
 import os
 import sys

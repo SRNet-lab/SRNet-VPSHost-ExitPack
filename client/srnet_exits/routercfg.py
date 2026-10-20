@@ -27,12 +27,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .prog import NAMES, P as _P
+
 DEFAULT_INI = "/etc/session-router/client.ini"
 KEY = "/var/lib/session-router/client/client.key"
-FIX = "srnet setup-router"
 SERVICE = "session-router-client"
 MARKER = "srnet-exits.ok"
 _FALSE = ("false", "0", "no", "off")
+
+
+def fix() -> str:
+    """The one-time fix, as the user types it."""
+    return f"{_P()} setup-router"
 
 
 def _text(p: Path, privileged: bool) -> str | None:
@@ -225,7 +231,7 @@ def make_key(kp: Path, run=subprocess.run) -> str | None:
         dfd = os.open(str(d), os.O_RDONLY | os.O_DIRECTORY)
     except OSError as e:
         return (f"{d} is missing ({e.strerror}); start Session Router once "
-                f"(sudo systemctl start {SERVICE}) and run srnet setup-router again")
+                f"(sudo systemctl start {SERVICE}) and run {_P()} setup-router again")
     try:
         dst = os.fstat(dfd)
         tmpd = tempfile.mkdtemp(prefix="srnet-key-")
@@ -263,14 +269,15 @@ def apply(ini: str | Path = DEFAULT_INI, key: str = KEY, restart: bool = True,
     if anything changed, and (re)write the marker. Running it again changes nothing."""
     ini = Path(ini)
     if not ini.exists():
-        log(f"{ini} not found: install Session Router first (README, Install, step 1), then run srnet setup-router")
+        log(f"{ini} not found: install Session Router first (SRNet-Desktop README, Install, steps 1 and 2), "
+            f"then run {_P()} setup-router")
         return 1
     text = ini.read_text()
     new, keyfile, changed = edit_text(text, key)
     kp = Path(keyfile)
     made_key = False
     if os.path.islink(kp):
-        log(f"{kp} is a symbolic link; refusing to touch it. Remove it and run srnet setup-router again")
+        log(f"{kp} is a symbolic link; refusing to touch it. Remove it and run {_P()} setup-router again")
         return 1
     if not kp.exists():
         err = make_key(kp, run)
@@ -304,9 +311,12 @@ def main(argv=None) -> int:
     ap.add_argument("--ini", default=DEFAULT_INI)
     ap.add_argument("--key", default=KEY)
     ap.add_argument("--no-restart", action="store_true")
+    ap.add_argument("--prog", choices=NAMES, help="command name for the hints (sudo drops the environment)")
     a = ap.parse_args(argv)
+    if a.prog:
+        os.environ["SRNET_EXITS_PROG"] = a.prog
     if os.geteuid() != 0:
-        print("run through: srnet setup-router (it asks sudo)", file=sys.stderr)
+        print(f"run through: {_P()} setup-router (it asks sudo)", file=sys.stderr)
         return 2
     return apply(a.ini, a.key, restart=not a.no_restart)
 

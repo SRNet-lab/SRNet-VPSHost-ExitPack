@@ -16,7 +16,6 @@ from helpers import ME, SELLER
 sys.stdin = _io.StringIO()
 
 
-@unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")
 class _Base(unittest.TestCase):
     STOCK = {"tun": "sr-tun0", "dns": ["127.3.2.1"], "domains": ["~sesh", "~snode"], "default_route": False}
 
@@ -26,7 +25,7 @@ class _Base(unittest.TestCase):
         FakeRpc.calls = []
 
     def home(self, dns="10.195.0.53", left=3600, seller=SELLER):
-        from srnet.state import State
+        from srnet_exits.state import State
         home = Path(tempfile.mkdtemp())
         (home / "visibility.ack").write_text("I UNDERSTAND\n")
         st = State(home)
@@ -232,7 +231,7 @@ class InboundSessions(_Base):
             with mock.patch.object(self.cli.priv, "run", run), mock.patch("sys.stdout", out):
                 self.assertEqual(self.run_cli(home, "setup-router", "--ini", str(ini)), 0)
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][1:], ["-I", "-m", "srnet_exits.routercfg", "apply", "--ini", str(ini)])
+            self.assertEqual(calls[0][1:], ["-I", "-m", "srnet_exits.routercfg", "apply", "--ini", str(ini), "--prog", "srnet"])
             self.assertIn("restarted", out.getvalue())
             err = _io.StringIO()
             with mock.patch.object(self.cli.priv, "run", run), mock.patch("sys.stderr", err):

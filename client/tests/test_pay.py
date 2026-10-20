@@ -23,10 +23,9 @@ HOUR = 3600
 OTHER_ME = F.OTHER
 
 
-@unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")
 class Flow(unittest.TestCase):
     def setUp(self, **seller):
-        from srnet.state import State
+        from srnet_exits.state import State
         self.clock = Clock(F.T0)
         self.s = F.Seller(price="1.00", **seller)
         self.desk = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock)

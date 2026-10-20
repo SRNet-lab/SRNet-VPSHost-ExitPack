@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from . import pay
+from .prog import P as _P
 
 
 class LiveBackend:
@@ -17,7 +18,7 @@ class LiveBackend:
     def reserve(self, seller: str) -> str:
         lease = pay.active_lease(self.state, seller, self.clock())
         if not lease:
-            raise RuntimeError(f"no paid time for this seller; buy some: srnet buy --seller {seller} --hours 1")
+            raise RuntimeError(f"no paid time for this seller; buy some: {_P()} buy --seller {seller} --hours 1")
         return str((lease.get("quotes") or ["lease"])[-1])
 
     def map_exit(self, seller: str) -> None:

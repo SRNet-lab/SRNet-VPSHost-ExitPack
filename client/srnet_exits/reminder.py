@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+from .prog import P as _P
+
 REMIND_S = 600
 
 
@@ -30,7 +32,7 @@ def message(seller: str, end: int, now: float) -> str:
     mins = max(0, int(end - now) // 60)
     return (f"Your SRNet exit time with {seller[:12]}... ends in about {mins} min "
             f"({time.strftime('%H:%M %Z', time.localtime(end)).strip()}). To keep going, buy more: "
-            f"srnet buy --seller {seller} --hours 1")
+            f"{_P()} buy --seller {seller} --hours 1")
 
 
 def notify(text: str) -> None:

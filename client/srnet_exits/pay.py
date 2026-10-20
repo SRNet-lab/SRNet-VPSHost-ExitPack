@@ -19,6 +19,7 @@ import listing as L  # noqa: E402
 import quote as Q  # noqa: E402
 
 from . import claim, config, watch as W
+from .prog import P as _P
 
 PAID_GRACE_S = 900       # this computer watches the chain this long after the quote expires
 REMIND_S = 600           # warn this long before a lease ends
@@ -66,8 +67,8 @@ def expired_text(q: dict, near: list[int] | None = None, other_chain: int | None
     amt = C.fmt_usdc(q["amount"])
     msg = (f"No payment of exactly {amt} USDC on {C.label(q['chainid'])} to {q['payout']} arrived "
            "before this quote expired. Don't pay this quote now; a late payment can't be matched. "
-           "If you did pay it, run `srnet paid --tx 0x...` with your transaction hash. "
-           "Otherwise get a new quote with `srnet buy`.")
+           f"If you did pay it, run `{_P()} paid --tx 0x...` with your transaction hash. "
+           f"Otherwise get a new quote with `{_P()} buy`.")
     if other_chain:
         msg += (f" A payment of that amount arrived on {C.label(other_chain)}, but this quote is for "
                 f"{C.label(q['chainid'])}; it can't be matched. Ask the seller directly about it.")
@@ -81,7 +82,7 @@ def unreadable_text(q: dict, err: str = "") -> str:
     """The last chain reads failed: we don't know whether a payment arrived."""
     return (f"Couldn't read {C.label(q['chainid'])} (the RPC didn't answer{': ' + err if err else ''}), so this "
             "computer can't tell whether you paid. Don't pay again. If you paid, run "
-            "`srnet paid --tx 0x...` with your transaction hash; the seller checks it on chain.")
+            f"`{_P()} paid --tx 0x...` with your transaction hash; the seller checks it on chain.")
 
 
 def reason_text(q: dict, reason: str) -> str:
@@ -175,7 +176,7 @@ class Buyer:
         live = [r for r in qs.values() if r["state"] in ok
                 and (seller is None or r["seller"] == seller)]
         if not live:
-            raise BuyError("no open quote; run `srnet buy --seller <id> --hours N` first")
+            raise BuyError(f"no open quote; run `{_P()} buy --seller <id> --hours N` first")
         return max(live, key=lambda r: r["doc"]["quote"]["issued"])
 
     # --------------------------------------------------------------- pay
@@ -295,12 +296,12 @@ class Buyer:
             if out.get("note") == "needs_seller":
                 return {"status": "waiting", "note": "needs_seller", "message":
                         "your payment arrived, but the seller has to confirm it by hand (the quote's price "
-                        "is not one their exit knows any more). Don't pay again; check later with `srnet paid`"}
+                        f"is not one their exit knows any more). Don't pay again; check later with `{_P()} paid`"}
             if self.clock() > confirm_by:
-                msg = "the seller has not confirmed yet; check again with `srnet paid` in a few minutes"
+                msg = f"the seller has not confirmed yet; check again with `{_P()} paid` in a few minutes"
                 if out.get("note") == "chain_unavailable":
                     msg = ("the seller can't read the chain right now; your report is saved there and is "
-                           "checked again by itself. Don't pay again; check later with `srnet paid`")
+                           f"checked again by itself. Don't pay again; check later with `{_P()} paid`")
                 return {"status": "waiting", "message": msg}
             on_event("confirming", out)
             self.sleep(poll_s)

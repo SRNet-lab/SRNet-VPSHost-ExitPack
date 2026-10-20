@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 
+from .prog import P
+
 
 class PrivError(RuntimeError):
     pass
@@ -48,6 +50,6 @@ def run(cmd: list[str], *, input: str | None = None, interactive: bool = True, c
 def fail(a: list[str], r: subprocess.CompletedProcess, what: str):
     err = (r.stderr or r.stdout or "").strip()
     if a and a[0] == "sudo" and "sudo" in err.lower():
-        raise PrivError(f"{what} needs root and sudo did not allow it ({err.splitlines()[-1]}). Run srnet in a "
+        raise PrivError(f"{what} needs root and sudo did not allow it ({err.splitlines()[-1]}). Run {P()} in a "
                         "terminal so sudo can ask for your password")
     raise PrivError(f"{' '.join(os.path.basename(x) for x in a[:3])} failed: {err or r.returncode}")

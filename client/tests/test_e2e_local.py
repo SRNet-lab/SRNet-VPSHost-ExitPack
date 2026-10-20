@@ -116,7 +116,6 @@ class MockChain:
         return f"http://127.0.0.1:{self.srv.server_address[1]}"
 
 
-@unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.procs = []
@@ -166,7 +165,7 @@ class EndToEnd(unittest.TestCase):
         self.chain.srv.server_close()
 
     def client(self, *args, timeout=90):
-        pp = os.pathsep.join([str(helpers.CLIENT), str(helpers.CORE_DIR)])
+        pp = str(helpers.CLIENT)  # srnet-exits on its own: no SRNet client on the path
         env = dict(os.environ, PYTHONPATH=pp, SRNET_EXITS_TESTNETS="1",
                    SRNET_EXITS_TEST_CLAIM_URL=f"http://127.0.0.1:{self.port}/claim")
         r = subprocess.run([sys.executable, "-m", "srnet_exits.cli", "--home", str(self.home), *args],

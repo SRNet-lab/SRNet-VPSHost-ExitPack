@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srnet-exits"
-version = "0.3.0"
+version = "0.4.0"
 description = "SRNet Exits: buy time on SRNet exits with a direct USDC payment, and connect through them"
 readme = "client/README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 # No "srnet-client" here: that name isn't on PyPI, so pip could pull someone else's package.
-# The add-on goes into the SRNet client's own environment (SRNet-Desktop install.sh --with-exits).
+# srnet-exits runs on its own (client/install.sh), or as an add-on inside the SRNet client's own
+# environment (SRNet-Desktop install.sh --with-exits).
 dependencies = [
     "cryptography>=41",
     "pyzmq>=25",
@@ -18,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-srnet-exits = "srnet_exits.cli:main"
+srnet-exits = "srnet_exits.standalone:entry"
 
 [project.entry-points."srnet.addons"]
 exits = "srnet_exits.addon:ADDON"

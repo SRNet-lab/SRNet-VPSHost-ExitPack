@@ -141,7 +141,7 @@ class RouterCfg(unittest.TestCase):
 
     def test_fix_command_is_setup_router(self):
         from srnet_exits import routercfg
-        self.assertEqual(routercfg.FIX, "srnet setup-router")
+        self.assertEqual(routercfg.fix(), "srnet setup-router")
 
 
 STOCK_INI = """# Session Router client config
@@ -504,7 +504,6 @@ class Inbound(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
-@unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")
 class BuyNoExitDns(unittest.TestCase):
     def test_buy_refuses_exit_without_resolver_before_asking_for_a_quote(self):
         from srnet_exits import cli
