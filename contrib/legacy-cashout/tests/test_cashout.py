@@ -117,5 +117,33 @@ class Cashout(unittest.TestCase):
         self.assertEqual(X.open_keystore(p, "pw").address, acct.address)
 
 
+    def test_check_command_errors_are_plain(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        def run(argv, rpc):
+            err, out = io.StringIO(), io.StringIO()
+            with mock.patch.object(X, "Rpc", lambda: rpc), contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(out):
+                return X.main(argv), err.getvalue(), out.getvalue()
+        for bad in ("0xzz", "0x" + "c0" * 19, "c0" * 20, "0x" + "g0" * 20):
+            rc, err, _ = run(["check", "--address", bad], FakeRpc())
+            self.assertEqual(rc, 2, bad)
+            self.assertIn("not an address", err)
+        rc, _, out = run(["check", "--address", WHO], FakeRpc(avail=0))
+        self.assertEqual(rc, 0)
+        self.assertIn("Nothing to take out", out)
+
+        class Broken(FakeRpc):
+            def call(self, method, params):
+                if method == "eth_call":
+                    raise RuntimeError("invalid hex")
+                return super().call(method, params)
+        rc, err, _ = run(["check", "--address", WHO], Broken())
+        self.assertEqual(rc, 1)
+        self.assertIn("couldn't read the balances: invalid hex", err)
+
+
 if __name__ == "__main__":
     unittest.main()

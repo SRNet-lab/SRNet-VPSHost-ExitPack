@@ -17,6 +17,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -28,6 +29,7 @@ import evm  # noqa: E402
 CONTRACT = "0x7E0d01B7dd916BdAB96B0971ab92D160E1664431"
 CHAIN_ID = 42161
 RPC = os.environ.get("SRNET_ARB_RPC", "https://arb1.arbitrum.io/rpc")
+ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 USDC = 10 ** 6
 GAS_MARGIN = 1.3          # on top of eth_estimateGas (Arbitrum gas includes a moving L1 part)
 
@@ -165,13 +167,25 @@ def main(argv=None) -> int:
         if not who:
             try:
                 who = "0x" + json.loads(Path(a.keystore).read_text())["address"].lower().removeprefix("0x")
-            except (OSError, ValueError, KeyError):
+            except (OSError, ValueError, KeyError, AttributeError):
                 print(f"no keystore at {a.keystore}; pass --address 0x...", file=sys.stderr)
                 return 2
-        print(report(who, balances(rpc, who)))
+        if not ADDR_RE.match(who):
+            print(f"not an address: {who} (want 0x and 40 hex digits)", file=sys.stderr)
+            return 2
+        try:
+            print(report(who, balances(rpc, who)))
+        except (RuntimeError, OSError, ValueError) as e:
+            print(f"error: couldn't read the balances: {e}", file=sys.stderr)
+            return 1
         return 0
     acct = open_keystore(Path(a.keystore))
-    send(rpc, acct, balances(rpc, acct.address))
+    try:
+        b = balances(rpc, acct.address)
+    except (RuntimeError, OSError, ValueError) as e:
+        print(f"error: couldn't read the balances: {e}", file=sys.stderr)
+        return 1
+    send(rpc, acct, b)
     return 0
 
 
