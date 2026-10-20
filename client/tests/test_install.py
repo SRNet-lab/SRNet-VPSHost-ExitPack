@@ -1,5 +1,6 @@
 """client/install.sh with a stand-in Python: install, reinstall, uninstall and the PATH line.
 Nothing is downloaded; the stand-in only logs what the installer asked for."""
+import json
 import os
 import shutil
 import subprocess
@@ -14,7 +15,9 @@ INSTALL = CLIENT / "install.sh"
 FAKE_PY = r'''#!/usr/bin/env bash
 # stand-in python: logs calls; "-m venv D" makes D/bin/python a copy of this script
 echo "$*" >> "$FAKE_LOG"
-# the uninstall's state check runs real Python code
+# the uninstall's DNS step: log it, answer with FAKE_DNS_RC
+case "$*" in *"cli.dns_down"*) echo "dns_down ${@: -1}" >> "$FAKE_LOG"; exit "${FAKE_DNS_RC:-0}";; esac
+# the uninstall's state checks run real Python code
 if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then shift; exec "$REAL_PY" "$@"; fi
 case "$*" in *"-m srnet_exits setup-router"*) exit "${FAKE_ROUTER_RC:-0}";; esac
 if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then mkdir -p "$3/bin"; cp "$0" "$3/bin/python"; exit 0; fi
@@ -52,6 +55,9 @@ class InstallSh(unittest.TestCase):
         if bin_dir is not None:
             env["SRNET_BIN"] = str(bin_dir)
         return subprocess.run(["bash", str(INSTALL), *args], env=env, capture_output=True, text=True, cwd=str(self.tmp))
+
+    def dns_calls(self):
+        return [l for l in self.calls() if l.startswith("dns_down ")]
 
     def calls(self, word=""):
         return [l for l in self.log.read_text().splitlines() if word in l]
@@ -274,14 +280,80 @@ class InstallSh(unittest.TestCase):
         (other / "data").write_text("keep\n")
         self.assertEqual(self.run_install("--uninstall", SRNET_EXITS_PREFIX=str(other)).returncode, 1)
         self.assertTrue((other / "data").exists())
-        # an install made before the marker existed: refused, and a reinstall fixes it
+        # a directory without the marker is refused by both install and uninstall
         self.run_install()
         (self.prefix / ".srnet-exits-install").unlink()
         self.assertEqual(self.run_install("--uninstall").returncode, 1)
-        self.assertTrue(self.prefix.exists())
+        self.assertEqual(self.run_install().returncode, 1)
+        self.assertTrue((self.prefix / "venv/bin/python").exists())
+
+    def test_install_refuses_a_prefix_that_is_not_an_install(self):
+        src = self.home / "src"
+        src.mkdir()
+        (src / "keep.c").write_text("mine\n")
+        r = self.run_install(SRNET_EXITS_PREFIX=str(self.home))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Not installing into", r.stderr)
+        self.assertIn("doesn't look like", r.stderr)
+        self.assertTrue((src / "keep.c").exists())
+        self.assertFalse((self.home / ".srnet-exits-install").exists())
+        self.assertFalse((self.home / "venv").exists())
+        self.assertEqual(self.calls("-m venv"), [])
+        # an empty directory is fine, and so is our own install again
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertEqual(self.run_install(SRNET_EXITS_PREFIX=str(empty)).returncode, 0)
+        self.assertTrue((empty / ".srnet-exits-install").exists())
+        self.assertEqual(self.run_install(SRNET_EXITS_PREFIX=str(empty)).returncode, 0)
+
+    def _tunnel_state(self, connected=True):
+        state = self.home / ".srnet"
+        state.mkdir(exist_ok=True)
+        d = {"connected": {"seller": "x.sesh"} if connected else None,
+             "tunnel_dns": {"saved": {"tun": "sr-tun0", "dns": ["127.3.2.1"], "domains": ["~sesh"],
+                                      "default_route": False}, "forwarder_pid": 4242}}
+        (state / "state.json").write_text(json.dumps(d))
+        return state
+
+    def test_force_while_connected_puts_dns_back_first(self):
         self.run_install()
-        self.assertEqual(self.run_install("--uninstall").returncode, 0)
+        state = self._tunnel_state()
+        r = self.run_install("--uninstall", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.dns_calls(), [f"dns_down {state}"])
+        self.assertIn("Putting DNS on sr-tun0 back", r.stdout)
+        self.assertNotIn("resolvectl revert", r.stdout)
+        self.assertIn("sudo nft delete table inet srnet_ks", r.stdout)
         self.assertFalse(self.prefix.exists())
+
+    def test_dns_that_could_not_be_put_back_gets_the_resolvectl_line(self):
+        self.run_install()
+        self._tunnel_state()
+        r = self.run_install("--uninstall", "--force", FAKE_DNS_RC="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Restore DNS with: sudo resolvectl revert sr-tun0", r.stdout)
+        self.assertIn("sudo nft delete table inet srnet_ks", r.stdout)
+        # the environment already gone: the line is printed from the state file alone
+        r = self.run_install("--uninstall", "--force")
+        self.assertEqual(self.dns_calls(), [])
+        self.assertIn("Restore DNS with: sudo resolvectl revert sr-tun0", r.stdout)
+
+    def test_leftover_tunnel_dns_is_put_back_even_when_not_connected(self):
+        self.run_install()
+        self._tunnel_state(connected=False)
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.dns_calls()), 1)
+        self.assertNotIn("srnet_ks", r.stdout)
+
+    def test_no_dns_step_without_tunnel_dns(self):
+        self.run_install()
+        state = self.home / ".srnet"
+        state.mkdir()
+        (state / "state.json").write_text('{"connected": null, "tunnel_dns": null}')
+        r = self.run_install("--uninstall")
+        self.assertEqual(self.dns_calls(), [])
+        self.assertNotIn("DNS", r.stdout)
 
     def test_uninstall_stops_the_page_reminder_and_dns_proxy_of_this_install(self):
         self.run_install()

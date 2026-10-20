@@ -40,6 +40,14 @@ fi
 ours() { [ -f "$1" ] && grep -qxF "$LAUNCHER_MARK" "$1"; }
 
 INSTALL_MARK="$PREFIX/.srnet-exits-install"
+VPY="$PREFIX/venv/bin/python"
+
+# install and uninstall touch $PREFIX only if it is empty, missing, or one of our installs
+not_an_install() {
+  echo "Not $1 $PREFIX: it has no .srnet-exits-install and venv/bin/python, so it doesn't look like" >&2
+  echo "a srnet-exits install. Check SRNET_EXITS_PREFIX." >&2
+  exit 1
+}
 
 # TERM every process of this user that runs this install's python with srnet_exits: the page
 # (srnet-exits ui), the lease reminder and the tunnel DNS forwarder.
@@ -58,11 +66,12 @@ stop_ours() {
 }
 
 if [ "$UNINSTALL" = 1 ]; then
-  STATE="${SRNET_HOME:-$HOME/.srnet}/state.json"
+  SHOME="${SRNET_HOME:-$HOME/.srnet}"
+  STATE="$SHOME/state.json"
   CONNECTED=0
   if [ -f "$STATE" ]; then
-    if [ -x "$PREFIX/venv/bin/python" ]; then
-      "$PREFIX/venv/bin/python" -I -c 'import json,sys; sys.exit(1 if (json.load(open(sys.argv[1])).get("connected")) else 0)' "$STATE" 2>/dev/null \
+    if [ -x "$VPY" ]; then
+      "$VPY" -I -c 'import json,sys; sys.exit(1 if (json.load(open(sys.argv[1])).get("connected")) else 0)' "$STATE" 2>/dev/null \
         || CONNECTED=1
     elif grep -q '"connected": *{' "$STATE"; then
       CONNECTED=1
@@ -72,13 +81,30 @@ if [ "$UNINSTALL" = 1 ]; then
     echo "An exit is still connected. Disconnect first (srnet-exits disconnect), or run with --force." >&2
     exit 1
   fi
-  if [ -e "$PREFIX" ]; then
-    if [ ! -f "$INSTALL_MARK" ] || [ ! -x "$PREFIX/venv/bin/python" ]; then
-      echo "Not removing $PREFIX: it has no .srnet-exits-install and venv/bin/python, so it doesn't look like" >&2
-      echo "a srnet-exits install. Check SRNET_EXITS_PREFIX (an install made by an older install.sh gets the" >&2
-      echo "file when you run install.sh again, then --uninstall works)." >&2
-      exit 1
+  if [ -e "$PREFIX" ] && { [ ! -f "$INSTALL_MARK" ] || [ ! -x "$VPY" ]; }; then
+    not_an_install removing
+  fi
+  # Tunnel DNS still set up (a connect, or one cut short): put the link's DNS back before the
+  # forwarder it points at is stopped, else the machine is left without DNS.
+  TUN=""
+  if [ -f "$STATE" ]; then
+    if [ -x "$VPY" ]; then
+      TUN=$("$VPY" -I -c 'import json,sys; print(((json.load(open(sys.argv[1])).get("tunnel_dns") or {}).get("saved") or {}).get("tun") or "")' "$STATE" 2>/dev/null || true)
+    else
+      TUN=$(grep -o '"tun": *"[^"]*"' "$STATE" 2>/dev/null | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/' || true)
     fi
+  fi
+  case "$TUN" in *[!A-Za-z0-9_.-]*) TUN="<tun interface>";; esac
+  DNS_LEFT=""
+  if [ -n "$TUN" ]; then
+    echo "Putting DNS on $TUN back as it was before connecting (sudo may ask for your password)."
+    if [ -x "$VPY" ] && "$VPY" -I -c 'import sys; from pathlib import Path; from srnet_exits import cli; from srnet_exits.state import State; sys.exit(0 if cli.dns_down(State(Path(sys.argv[1]))) else 1)' "$SHOME"; then
+      :
+    else
+      DNS_LEFT="$TUN"
+    fi
+  fi
+  if [ -e "$PREFIX" ]; then
     stop_ours
     rm -rf "$PREFIX"
   fi
@@ -103,6 +129,11 @@ if [ "$UNINSTALL" = 1 ]; then
     echo "You were still connected, so the kill switch may still block traffic outside the tunnel."
     echo "Remove it with: sudo nft delete table inet srnet_ks"
   fi
+  if [ -n "$DNS_LEFT" ]; then
+    echo
+    echo "DNS on $DNS_LEFT could not be put back and pointed at the stopped forwarder."
+    echo "Restore DNS with: sudo resolvectl revert $DNS_LEFT"
+  fi
   exit 0
 fi
 
@@ -124,6 +155,9 @@ command -v "$PY" >/dev/null || { echo "Python 3.10 or newer is required." >&2; e
 "$PY" -c 'import venv, ensurepip' 2>/dev/null \
   || { echo "Python venv support is missing. On Ubuntu: sudo apt install python3-venv" >&2; exit 1; }
 
+if [ -e "$PREFIX" ] && [ ! -f "$INSTALL_MARK" ] && [ -n "$(ls -A "$PREFIX" 2>/dev/null || echo x)" ]; then
+  not_an_install "installing into"
+fi
 echo "Installing srnet-exits to $PREFIX"
 mkdir -p "$PREFIX" "$BIN"
 printf '%s\n' "srnet-exits install (client/install.sh). install.sh --uninstall removes this directory." \
@@ -137,7 +171,6 @@ cp -R "$SRC/seller" "$SRC/board" "$PREFIX/src/"
 cp -R "$SRC/contrib/exit-lease" "$PREFIX/src/contrib/"
 find "$PREFIX/src" -name __pycache__ -prune -exec rm -rf {} +
 
-VPY="$PREFIX/venv/bin/python"
 [ -x "$VPY" ] || "$PY" -m venv "$PREFIX/venv"
 "$VPY" -m pip install --quiet --upgrade pip
 "$VPY" -m pip install --quiet --upgrade "$PREFIX/src"

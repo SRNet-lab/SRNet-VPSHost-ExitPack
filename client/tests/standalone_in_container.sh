@@ -121,7 +121,12 @@ cp ~/.bashrc /tmp/bashrc.before
 srnet-exits ui --no-browser > /tmp/ui3.log 2>&1 &
 UIPID=$!
 for i in $(seq 1 50); do grep -q "#t=" /tmp/ui3.log && break; sleep 0.2; done
+# tunnel DNS left over from a connect: uninstall runs the DNS step with the venv python first
+"$VPY" -c "import json,os; p=os.path.expanduser(\"~/.srnet/state.json\"); d=json.load(open(p)) if os.path.exists(p) else {}; d[\"tunnel_dns\"]={\"saved\":{\"tun\":\"sr-tun9\",\"dns\":[],\"domains\":[],\"default_route\":False}}; json.dump(d,open(p,\"w\"))"
 SRNet-VPSHost-ExitPack/client/install.sh --uninstall | tee /tmp/un.log
+grep -q "Putting DNS on sr-tun9 back" /tmp/un.log || fail "no DNS step"
+! grep -q "resolvectl revert" /tmp/un.log || fail "DNS step failed in the installed venv"
+python3 -c "import json,os,sys; sys.exit(json.load(open(os.path.expanduser(\"~/.srnet/state.json\"))).get(\"tunnel_dns\") is not None)" || fail "tunnel_dns not cleared"
 grep -q "^stopped $UIPID " /tmp/un.log || fail "uninstall did not stop the page"
 wait $UIPID 2>/dev/null || true   # it was stopped, so this returns at once (and reaps it)
 ! kill -0 $UIPID 2>/dev/null || fail "page still running after uninstall"

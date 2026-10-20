@@ -43,8 +43,10 @@ The installer:
 Run it again to update. `client/install.sh --uninstall` removes the command, its environment and
 that one line, and stops the page, reminder and DNS forwarder it started; your paid time and
 settings in `~/.srnet` stay. It refuses while an exit is connected (disconnect first). With
-`--force` it goes ahead and tells you how to remove the kill switch:
-`sudo nft delete table inet srnet_ks`.
+`--force` it goes ahead: it puts the tunnel's DNS back first (or, if it can't, prints the
+`sudo resolvectl revert <interface>` line to do it) and tells you how to remove the kill switch:
+`sudo nft delete table inet srnet_ks`. Install and uninstall only touch `SRNET_EXITS_PREFIX` if it
+is empty or holds a srnet-exits install.
 
 Every command below works the same with `srnet-exits` in place of `srnet`, and
 `srnet-exits doctor` checks Session Router, `.sesh` names, the clock and everything exits need.
