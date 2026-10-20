@@ -318,6 +318,12 @@ class DeskTest(unittest.TestCase):
 
 class HttpTest(unittest.TestCase):
     def setUp(self):
+        from unittest import mock
+        # The desk calls os._exit(1) on an index error, from a server thread. Keep the real one
+        # out of reach for the server's whole lifetime so it can never end the test run.
+        self.exits = []
+        self._exit_patch = mock.patch.object(D.os, "_exit", side_effect=self.exits.append)
+        self._exit_patch.start()
         self.s = Seller()
         self.desk = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path)
         self.srv = D.serve("127.0.0.1", 0, self.desk)
@@ -327,6 +333,7 @@ class HttpTest(unittest.TestCase):
     def tearDown(self):
         self.srv.shutdown()
         self.srv.server_close()
+        self._exit_patch.stop()
 
     def call(self, path, body=None):
         data = None if body is None else json.dumps(body).encode()
@@ -341,14 +348,19 @@ class HttpTest(unittest.TestCase):
         import sqlite3
         from unittest import mock
         bk, _ = buyer_key()
-        exits, err = [], io.StringIO()
+        import time
+        err = io.StringIO()
         boom = mock.Mock(side_effect=sqlite3.DatabaseError("database disk image is malformed"))
-        with mock.patch.object(D.os, "_exit", side_effect=exits.append), mock.patch.object(D.sys, "stderr", err), \
+        with mock.patch.object(D.sys, "stderr", err), \
                 mock.patch.object(self.desk, "quote", boom), mock.patch.object(self.desk, "status", boom):
             code, doc = self.call("/claim/quote", Q.make_request(self.s.sesh, CLIENT, 1, 42161, bk))
             self.assertEqual(code, 503)
             self.assertEqual(self.call("/claim/status/" + "ab" * 8)[0], 503)
-        self.assertEqual(exits, [1, 1])
+            for _ in range(250):              # the server thread exits after it has answered
+                if len(self.exits) == 2:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(self.exits, [1, 1])
         self.assertIn("index error, exiting", err.getvalue())
 
     def test_flow(self):
