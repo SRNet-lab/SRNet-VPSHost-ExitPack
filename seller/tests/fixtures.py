@@ -7,7 +7,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE.parent.parent / "contrib" / "exit-lease")]
 import admission as A  # noqa: E402
-import chains as C  # noqa: E402
+import chains as C  # noqa: E402,F401  (re-exported for the tests)
 import evm  # noqa: E402
 import listing as L  # noqa: E402
 import quote as Q  # noqa: E402
@@ -90,6 +90,17 @@ class Seller:
         self.listing = doc["listing"]
         self.sesh = self.listing["seller"]
         self.listing_path = self.d / "listing.json"
+        self.listing_path.write_text(json.dumps(doc))
+        self._extra = dict(max_hours=max_hours, chains=sorted(chains), **extra)
+
+    def relist(self, price: str) -> None:
+        """Sign a new listing with another price (same keys)."""
+        e = dict(self._extra)
+        doc = L.make(L.load_identity(self.identity), price_per_hour_usdc=price, max_hours=e.pop("max_hours"),
+                     payout=PAYOUT, chains=e.pop("chains"), token="USDC",
+                     quote_key=Q.pub_hex(Q.load_key(self.quote_key)), claim_url=CLAIM, country="US",
+                     policy=["tcp/443"], **e)
+        self.listing_doc, self.listing = doc, doc["listing"]
         self.listing_path.write_text(json.dumps(doc))
 
 

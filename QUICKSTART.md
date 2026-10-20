@@ -63,6 +63,7 @@ boot. Progress goes to the serial console and
 - systemd services, each under its own user:
   - `srnet-seller-exit`: the router, with only `CAP_NET_ADMIN`
   - `srnet-seller-claimd`: the claim desk; gives signed quotes and takes payment notices
+    (user `srnet-claim`; it can't read the watcher's admission key)
   - `srnet-seller-watcher`: checks reported payments on chain and admits the buyer for the
     paid hours; holds no wallet key
   - `srnet-seller-listing.timer`: re-signs the listing every hour

@@ -116,9 +116,12 @@ class WatcherTest(unittest.TestCase):
         self.pay(q, 1, chainid=8453, token=C.usdc(8453))
         (_, verdict, why), = self.report(q, 1)
         self.assertEqual((verdict, why), ("wait", "not_mined_yet"))
-        self.clock.t = q["expires"] + W.PAID_GRACE_S + 1
+        self.clock.t = q["expires"] + 3600
+        self.assertEqual(self.w.poll_spool()[0][1], "wait")   # still retried well after expiry
+        self.clock.t = T0 + W.NOT_MINED_S + 1
         (_, verdict, why), = self.w.poll_spool()
-        self.assertEqual((verdict, why), ("reject", "no_matching_payment"))
+        self.assertEqual(verdict, "reject")
+        self.assertIn("does not know that transaction", why)
 
     def test_wrong_token_and_recipient_and_failed_tx(self):
         q = self.quote()
@@ -146,6 +149,8 @@ class WatcherTest(unittest.TestCase):
         (_, verdict, why), = self.report(q, 1)
         self.assertEqual((verdict, why), ("wait", "waiting_for_confirmations"))
         rpc.head += 1
+        self.assertEqual(self.w.poll_spool(), [])          # backing off
+        self.clock.t += W.BACKOFF_S[0]
         self.assertEqual(self.w.poll_spool()[0][1], "admit")
 
     def test_chain_down_then_up(self):
@@ -153,7 +158,9 @@ class WatcherTest(unittest.TestCase):
         self.pay(q, 1)
         self.chains.get(42161).down = True
         self.assertEqual(self.report(q, 1)[0][1], "wait")
+        self.assertEqual(self.status(q)["note"], "chain_unavailable")
         self.chains.get(42161).down = False
+        self.clock.t += W.BACKOFF_S[0]
         self.assertEqual(self.w.poll_spool()[0][1], "admit")
 
     def test_admission_only_for_bound_address(self):
@@ -176,12 +183,13 @@ class WatcherTest(unittest.TestCase):
         self.pay(q, 1)
         self.report(q, 1)
         w2 = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh,
-                       issuer_key=str(self.s.issuer), store=str(self.s.store), admission=A, clock=self.clock)
+                       issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2, admission=A,
+                       clock=self.clock)
         q2 = self.quote()
         self.desk.paid(Q.make_paid(self.bk, q2, tx(1)))
         self.assertEqual(w2.poll_spool()[0][2], "payment_already_used")
         # crash after issuing but before saving: the next run replaces the record
-        w2.state = {"used_tx": {}, "done": {}, "clients": {}}
+        w2.state = {"used_tx": {}, "done": {}, "clients": {}, "retry": {}}
         self.w = w2
         self.assertEqual(self.spool(q, 1)[0][1], "admit")
         self.assertEqual(len(self.admitted()), 1)
@@ -198,6 +206,72 @@ class WatcherTest(unittest.TestCase):
         self.clock.t += 2 * HOUR
         self.assertEqual(self.w.tidy(), 1)
         self.assertEqual(self.w.state["clients"], {})
+
+    def test_rpc_outage_never_rejects_a_real_payment(self):
+        """A long RPC outage, even days past expiry, only delays the admission."""
+        q = self.quote()
+        self.pay(q, 1, when=q["expires"] - 60)
+        self.chains.get(42161).down = True
+        self.assertEqual(self.report(q, 1)[0][1], "wait")
+        delays = []
+        for _ in range(6):
+            nxt = self.w.state["retry"][f"{q['id']}-{tx(1)[2:18]}.json"]["next"]
+            delays.append(nxt - self.clock.t)
+            self.clock.t = nxt
+            self.assertEqual(self.w.poll_spool()[0][1], "wait")
+        self.assertEqual(delays[:3], list(W.BACKOFF_S))
+        self.assertEqual(max(delays), W.BACKOFF_S[-1])
+        self.clock.t = q["expires"] + 3 * 86400
+        self.chains.get(42161).down = False
+        self.assertEqual(self.w.poll_spool()[0][1], "admit")
+        self.assertEqual(self.w.state["retry"], {})
+
+    def test_late_notice_is_still_taken(self):
+        """The buyer paid in time but reports a day later (closed the terminal)."""
+        q = self.quote()
+        self.pay(q, 1, when=q["expires"] - 30)
+        self.clock.t = q["expires"] + 86400
+        self.assertEqual(self.report(q, 1)[0][1], "admit")
+
+    def test_quote_older_than_keep_is_refused(self):
+        q = self.quote()
+        self.pay(q, 1)
+        self.clock.t = q["issued"] + Q.KEEP_QUOTES_S + 1
+        self.assertEqual(self.spool(q, 1)[0][1:], ("reject", "quote_too_old"))
+
+    def test_block_time_window(self):
+        q = self.quote()
+        self.pay(q, 1, when=q["issued"] - Q.EARLY_SKEW_S - 1)
+        self.assertIn("older than the quote", self.report(q, 1)[0][2])
+        self.pay(q, 2, when=q["issued"] - Q.EARLY_SKEW_S)
+        self.assertEqual(self.report(q, 2)[0][1], "admit")
+        q = self.quote()
+        self.pay(q, 3, when=q["expires"] + Q.LATE_SKEW_S + 1)
+        self.assertIn("after the quote expired", self.report(q, 3)[0][2])
+
+    def test_per_chain_confirmations(self):
+        w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, issuer_key=str(self.s.issuer),
+                      store=str(self.s.store), admission=A, clock=self.clock)
+        self.assertEqual((w.confirmations(42161), w.confirmations(8453)), (20, 5))
+        self.assertEqual(self.w.confirmations(8453), 2)
+        q = self.quote(chainid=8453)
+        rpc = self.chains.get(8453)
+        rpc.mine(tx(1), [(C.usdc(8453), PAYOUT, q["amount"])], when=T0 + 20)
+        rpc.head += 3
+        self.desk.paid(Q.make_paid(self.bk, q, tx(1)))
+        self.assertEqual(w.poll_spool()[0][1:], ("wait", "waiting_for_confirmations"))
+        rpc.head += 1
+        self.clock.t += W.BACKOFF_S[0]
+        self.assertEqual(w.poll_spool()[0][1], "admit")
+
+    def test_state_writes_are_fsynced(self):
+        import os
+        from unittest import mock
+        calls = []
+        real = os.fsync
+        with mock.patch.object(W.os, "fsync", side_effect=lambda fd: (calls.append(fd), real(fd))):
+            self.w._save()
+        self.assertGreaterEqual(len(calls), 1)
 
     def test_rpc_flag(self):
         self.assertEqual(W.parse_rpcs(["8453=https://x"]), {"8453": "https://x"})

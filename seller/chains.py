@@ -19,17 +19,21 @@ TOKEN = "USDC"
 
 MAINNETS = {
     42161: {"name": "arbitrum", "label": "Arbitrum One", "usdc": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-            "rpc": "https://arb1.arbitrum.io/rpc", "explorer": "https://arbiscan.io/tx/"},
+            "rpc": "https://arb1.arbitrum.io/rpc", "explorer": "https://arbiscan.io/tx/",
+            "confirmations": 20},
     8453: {"name": "base", "label": "Base", "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-           "rpc": "https://mainnet.base.org", "explorer": "https://basescan.org/tx/"},
+           "rpc": "https://mainnet.base.org", "explorer": "https://basescan.org/tx/",
+           "confirmations": 5},
 }
 TESTNETS = {
     421614: {"name": "arbitrum-sepolia", "label": "Arbitrum Sepolia", "usdc": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
-             "rpc": "https://sepolia-rollup.arbitrum.io/rpc", "explorer": "https://sepolia.arbiscan.io/tx/"},
+             "rpc": "https://sepolia-rollup.arbitrum.io/rpc", "explorer": "https://sepolia.arbiscan.io/tx/",
+             "confirmations": 20},
     84532: {"name": "base-sepolia", "label": "Base Sepolia", "usdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-            "rpc": "https://sepolia.base.org", "explorer": "https://sepolia.basescan.org/tx/"},
+            "rpc": "https://sepolia.base.org", "explorer": "https://sepolia.basescan.org/tx/",
+            "confirmations": 5},
     31337: {"name": "anvil", "label": "Anvil (local test)", "usdc": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
-            "rpc": "http://127.0.0.1:8545", "explorer": ""},
+            "rpc": "http://127.0.0.1:8545", "explorer": "", "confirmations": 1},
 }
 DEFAULT_CHAINS = (42161, 8453)
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -55,6 +59,12 @@ def info(chainid: int, testnets: bool = False) -> dict:
 
 def usdc(chainid: int, testnets: bool = False) -> str:
     return info(chainid, testnets)["usdc"].lower()
+
+
+def confirmations(chainid: int, testnets: bool = False) -> int:
+    """Blocks a payment must be under before the watcher admits (Arbitrum 20 = about 5 s,
+    Base 5 = about 10 s)."""
+    return int(info(chainid, testnets).get("confirmations", 2))
 
 
 def label(chainid) -> str:

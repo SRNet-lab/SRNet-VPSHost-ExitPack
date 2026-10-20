@@ -25,18 +25,25 @@ Building the router from source takes 20 to 60 minutes.
 
 1. The buyer runs `srnet buy --seller <id> --hours N` (or presses Buy in the Exits tab).
 2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
-   contract, and an exact amount (the hourly price times N plus a few millionths of a USDC, so
-   each open quote has its own amount). The quote is bound to the buyer's `.sesh` address and
-   expires after about 15 minutes. One payment is capped at 20 USDC by default.
+   contract, and an exact amount (the hourly price times N plus a few millionths of a USDC,
+   usually under one cent, so no two quotes in 7 days share an amount). The quote is bound to
+   the buyer's `.sesh` address and expires after about 15 minutes. One payment is capped at
+   20 USDC by default, and the price is at least 0.01 USDC an hour.
 3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
 4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
    The seller's watcher checks that transaction on chain itself (read-only) and admits the
-   buyer for the quoted hours. A transaction can only be used once.
+   buyer for the quoted hours once it is a few blocks deep (Arbitrum 20, Base 5, a few seconds).
+   The block time has to fall inside the quote's 15 minutes. A transaction can only be used once.
 5. About 10 minutes before the time runs out the client warns. Nothing renews by itself;
    to keep going, buy again.
 
-If the amount or the chain is wrong, nothing is matched and the client says so plainly
-("No matching payment yet. Send exactly ..."). Payments are final.
+If the amount or the chain is wrong, nothing is matched and the client says so plainly.
+Payments are final.
+
+A payment made in time is never lost because someone came back late or an RPC was down. The
+seller takes the report for 8 days and keeps checking while its RPC is down. If the client
+couldn't read the chain, it says so and tells you not to pay again; `srnet paid --tx 0x...`
+reports a hash you already have.
 
 ## Buyer: install the add-on
 
@@ -162,6 +169,13 @@ router the seller also uses to reach the board, listens only on that router's tu
 and takes small, signed requests at a limited rate. It never holds a key that can move
 funds. The watcher (`srnet-seller-watcher`) checks each reported payment on chain before it
 admits anyone.
+
+The desk runs as its own user (`srnet-claim`). It holds the quote key, but it can't read the
+watcher's admission key or its record of used payments. Limits per connection and overall
+(requests a minute, quotes an hour, open quotes, 3 transaction hashes per quote, 10 second
+socket timeouts) keep one requester from wearing it down. Open quotes are counted per buyer
+key and per connection, never by the `.sesh` address a request names, so nobody can use up
+someone else's limit.
 
 ## Old SRNet balance
 

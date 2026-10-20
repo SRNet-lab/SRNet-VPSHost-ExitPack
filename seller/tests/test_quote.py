@@ -81,12 +81,33 @@ class Quotes(unittest.TestCase):
 
     def test_unique_amount_skips_taken(self):
         seq = iter([5, 5, 7])
-        amt, pid = Q.unique_amount(100, {6}, rng=lambda n: next(seq))
+        amt, pid = Q.unique_amount(100, {106}, rng=lambda n: next(seq))
         self.assertEqual((amt, pid), (108, 8))
-        amt, pid = Q.unique_amount(100, set(range(1, Q.PAY_ID_MAX)), rng=lambda n: 0)
-        self.assertEqual(pid, Q.PAY_ID_MAX)
-        with self.assertRaises(Q.QuoteError):
-            Q.unique_amount(100, set(range(1, Q.PAY_ID_MAX + 1)))
+        with self.assertRaises(Q.QuoteError) as e:
+            Q.unique_amount(100, set(range(101, 102 + int(Q.POOL_BUSY * Q.PAY_ID_MAX))))
+        self.assertIn("busy", str(e.exception))
+
+    def test_unique_amount_tracks_full_amounts_across_prices(self):
+        """1h at 1.00 with id 5000 and 1h at 1.004 with id 1000 are the same amount; never hand it out twice."""
+        taken = {1_000_000 + 5000}
+        amt, _ = Q.unique_amount(1_004_000, taken, rng=lambda n: 999)
+        self.assertNotEqual(amt, 1_005_000)
+        self.assertNotIn(amt, taken)
+
+    def test_unique_amount_stays_small_until_busy(self):
+        widths = []
+        Q.unique_amount(0, set(), rng=lambda n: widths.append(n) or 0)
+        self.assertEqual(widths[-1], Q.PAY_ID_SMALL)        # < 1 cent normally
+        half = set(range(1, Q.PAY_ID_SMALL // 2 + 2))
+        Q.unique_amount(0, half, rng=lambda n: widths.append(n) or n - 1)
+        self.assertEqual(widths[-1], Q.PAY_ID_MAX)          # wider only when the small range fills
+        amt, pid = Q.unique_amount(0, half, rng=lambda n: n - 1)
+        self.assertTrue(Q.PAY_ID_SMALL < pid <= Q.PAY_ID_MAX and amt not in half)
+
+    def test_buyer_accepts_wide_ids(self):
+        doc, _ = self.quote()
+        self.assertIsNone(Q.quote_error(doc, listing=self.s.listing, req=self.req, cap=20_000_000,
+                                        now=doc["quote"]["issued"]))
 
     def test_seller_cap(self):
         with self.assertRaises(Q.QuoteError):

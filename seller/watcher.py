@@ -6,21 +6,28 @@ report the tx hash. claimd.py drops each report into STATE/spool/. For each one 
 the transaction receipt from that chain and admits the buyer only if all of these hold:
 
   - the quote is ours and was issued for this buyer (buyer key signature, bound .sesh address);
-  - the tx succeeded and has enough confirmations;
+  - the tx succeeded and has enough confirmations (per chain: Arbitrum 20 blocks, Base 5);
   - it contains a Transfer of the official USDC (chains.py) to our payout address of exactly
     the quoted amount;
-  - its block time is inside the quote window (issued .. expires, with a little clock slack);
+  - its block time is inside the quote window (issued - 30 s .. expires + 120 s);
   - neither the tx nor the quote has been used before.
 
 The buyer is then admitted for the quoted hours, added on top of any time they still have
 (admission tid q-<quote id>). Admissions carry their own expiry, so nothing has to be revoked
-when time runs out. A report whose tx isn't mined yet is retried until 15 minutes after the
-quote expires, then refused as no_matching_payment. Results go to STATE/status/<quote id>.json,
-which the buyer polls through claimd.
+when time runs out.
+
+A report is only ever refused on a definite answer from the chain (failed tx, wrong token,
+address or amount, block time outside the window) or when its quote is older than
+quote.KEEP_QUOTES_S. If the RPC is down, the watcher keeps retrying, backing off per report
+(10 s, 1 min, then every 5 min). A tx the chain doesn't know yet is retried for a day after
+the report arrived. Results go to STATE/status/<quote id>.json, which the buyer polls through
+claimd; while the chain can't be read, the status says so ("waiting", "chain_unavailable").
 
   watcher.py --dir STATE --seller <exit>.sesh --issuer-key issuer.key --store admissions.json \
-             [--rpc 42161=https://... --rpc 8453=https://...] [--confirmations 2] [--testnets]
-  watcher.py stop --dir STATE --store admissions.json --client <buyer>.sesh   # end a buyer's time now
+             [--rpc 42161=https://... --rpc 8453=https://...] [--confirmations N] [--testnets]
+             [--state watcher-state.json]
+  watcher.py stop --dir STATE --store admissions.json --client <buyer>.sesh [--state F]  # end a buyer's time now
+              (stop the service first: the running watcher keeps its own copy of the state)
 
 Chain access is plain read-only JSON-RPC (evm.py). The watcher never holds a wallet key.
 """
@@ -40,7 +47,8 @@ import evm  # noqa: E402
 import quote as Q  # noqa: E402
 
 HOUR = 3600
-PAID_GRACE_S = 900
+NOT_MINED_S = 86400              # retry a tx the chain doesn't know for this long after it was reported
+BACKOFF_S = (10, 60, 300)        # per-report retry delays while waiting
 HERE = Path(__file__).resolve().parent
 # Repo layouts: ../contrib/exit-lease; installed layout: admission.py next to this file.
 DEFAULT_ADMISSION = next((c for c in (HERE.parent / "contrib" / "exit-lease" / "admission.py",
@@ -73,38 +81,41 @@ class RpcChains:
 
 class Watcher:
     def __init__(self, chains, *, state_dir: str | Path, seller_sesh: str, issuer_key: str, store: str,
-                 confirmations: int = 2, testnets: bool = False, admission=None, clock=time.time):
+                 confirmations: int | None = None, testnets: bool = False, admission=None, clock=time.time,
+                 state_file: str | Path | None = None):
         if not Q.SESH_RE.match(seller_sesh):
             raise ValueError("bad seller .sesh")
         self.chains, self.dir, self.seller = chains, Path(state_dir), seller_sesh
         for sub in ("quotes", "spool", "status", "spool/done", "spool/rejected"):
             (self.dir / sub).mkdir(parents=True, exist_ok=True)
         self.key, self.store = issuer_key, store
-        self.conf, self.testnets, self.clock = max(1, int(confirmations)), testnets, clock
+        self.conf = None if confirmations is None else max(1, int(confirmations))
+        self.testnets, self.clock = testnets, clock
         self.adm = admission or load_admission()
-        self.state_path = self.dir / "watcher-state.json"
+        # Used payments live outside the claims dir when the installer says so, where the
+        # network-facing claim desk can't reach them.
+        self.state_path = Path(state_file) if state_file else self.dir / "watcher-state.json"
         self.state = self._load()
 
-    # state: {"used_tx": {tx: quote_id}, "done": {quote_id: tx}, "clients": {sesh: {"end", "tids"}}}
+    # state: {"used_tx": {tx: quote_id}, "done": {quote_id: tx}, "clients": {sesh: {"end", "tids"}},
+    #         "retry": {spool file name: {"first", "next", "n"}}}
     def _load(self) -> dict:
         try:
             st = json.loads(self.state_path.read_text())
         except FileNotFoundError:
             st = {}
-        for k in ("used_tx", "done", "clients"):
+        for k in ("used_tx", "done", "clients", "retry"):
             st.setdefault(k, {})
         return st
 
     def _save(self) -> None:
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, sort_keys=True, indent=1))
-        os.replace(tmp, self.state_path)
+        write_durable(self.state_path, json.dumps(self.state, sort_keys=True, indent=1))
 
     def _status(self, qid: str, **st) -> None:
-        p = self.dir / "status" / f"{qid}.json"
-        tmp = p.with_name(f".{p.name}.tmp")
-        tmp.write_text(json.dumps({**st, "t": int(self.clock())}, sort_keys=True))
-        os.replace(tmp, p)
+        write_durable(self.dir / "status" / f"{qid}.json", json.dumps({**st, "t": int(self.clock())}, sort_keys=True))
+
+    def confirmations(self, chainid: int) -> int:
+        return self.conf if self.conf is not None else C.confirmations(chainid, self.testnets)
 
     def _quote(self, qid: str) -> dict | None:
         if not Q.ID_RE.match(qid or ""):
@@ -114,9 +125,10 @@ class Watcher:
         except (OSError, ValueError, KeyError):
             return None
 
-    def handle(self, notice: dict) -> tuple[str, str]:
-        """('admit'|'reject'|'wait', detail) for one paid notice."""
+    def handle(self, notice: dict, first_seen: int | None = None) -> tuple[str, str]:
+        """('admit'|'reject'|'wait', detail) for one paid notice. first_seen: when it was reported."""
         now = int(self.clock())
+        first_seen = now if first_seen is None else int(first_seen)
         qid = notice.get("quote_id") if isinstance(notice, dict) else None
         q = self._quote(qid) if isinstance(qid, str) else None
         if not q:
@@ -133,18 +145,23 @@ class Watcher:
             return "reject", "quote_already_paid"
         if tx in self.state["used_tx"]:
             return "reject", "payment_already_used"
-        late = now > q["expires"] + PAID_GRACE_S
+        if now - q["issued"] > Q.KEEP_QUOTES_S:
+            return "reject", "quote_too_old"
         try:
             rpc = self.chains.get(q["chainid"])
             rc = rpc.receipt(tx)
-            head = rpc.block_number() if rc else None
-            btime = rpc.block_time(int(rc["blockNumber"], 16)) if rc else None
+            if rc:
+                head = rpc.block_number()
+                bn = int(rc["blockNumber"], 16)
+                btime = rpc.block_time(bn)
         except (evm.RpcError, KeyError, TypeError, ValueError) as e:
-            return ("reject", "no_matching_payment") if late else ("wait", f"chain_unavailable: {e}")
+            return "wait", f"chain_unavailable: {e}"
         if not rc:
-            return ("reject", "no_matching_payment") if late else ("wait", "not_mined_yet")
-        if head - int(rc["blockNumber"], 16) + 1 < self.conf:
-            return ("reject", "no_matching_payment") if late else ("wait", "waiting_for_confirmations")
+            if now - first_seen > NOT_MINED_S:
+                return "reject", "no_matching_payment: the chain does not know that transaction"
+            return "wait", "not_mined_yet"
+        if head - bn + 1 < self.confirmations(q["chainid"]):
+            return "wait", "waiting_for_confirmations"
         why = Q.payment_error(q, evm.receipt_transfers(rc), btime, evm.receipt_ok(rc), self.testnets)
         if why:
             return "reject", f"no_matching_payment: {why}"
@@ -169,21 +186,38 @@ class Watcher:
     def poll_spool(self) -> list[tuple[str, str, str]]:
         out = []
         spool = self.dir / "spool"
+        now = int(self.clock())
+        retry = self.state["retry"]
+        dirty = False
         for f in sorted(spool.glob("*.json")):
+            r = retry.get(f.name)
+            if r and now < r["next"]:
+                continue
             try:
                 notice = json.loads(f.read_text())
-                verdict, why = self.handle(notice)
+                verdict, why = self.handle(notice, first_seen=r["first"] if r else now)
             except (OSError, ValueError) as e:
                 notice, verdict, why = {}, "reject", f"unreadable: {e.__class__.__name__}"
             out.append((f.name, verdict, why))
+            qid = notice.get("quote_id") if isinstance(notice, dict) else None
             if verdict == "wait":
+                r = r or {"first": now, "n": 0}
+                r["next"] = now + BACKOFF_S[min(r["n"], len(BACKOFF_S) - 1)]
+                r["n"] += 1
+                retry[f.name] = r
+                dirty = True
+                if isinstance(qid, str) and qid not in self.state["done"]:
+                    self._status(qid, status="waiting", note=why.partition(":")[0], tx=notice.get("tx"))
                 continue
+            if retry.pop(f.name, None) is not None:
+                dirty = True
             dest = spool / ("done" if verdict == "admit" else "rejected")
             f.replace(dest / f.name)
             (dest / (f.name + ".result")).write_text(why + "\n")
-            qid = notice.get("quote_id") if isinstance(notice, dict) else None
             if verdict == "reject" and isinstance(qid, str) and self._quote(qid) and qid not in self.state["done"]:
                 self._status(qid, status="rejected", reason=why, tx=notice.get("tx"))
+        if dirty:
+            self._save()
         return out
 
     def tidy(self) -> int:
@@ -193,7 +227,10 @@ class Watcher:
         gone = [s for s, c in self.state["clients"].items() if int(c["end"]) <= now]
         for s in gone:
             del self.state["clients"][s]
-        if gone:
+        stale = [k for k in self.state["retry"] if not (self.dir / "spool" / k).exists()]
+        for k in stale:
+            del self.state["retry"][k]
+        if gone or stale:
             self._save()
         return n
 
@@ -205,6 +242,25 @@ class Watcher:
         n = sum(1 for t in c["tids"] if st.revoke(t))
         self._save()
         return n
+
+
+def write_durable(path: Path, text: str) -> None:
+    """Write via a temp file that is fsynced before it replaces path."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def parse_rpcs(items: list[str]) -> dict:
@@ -224,12 +280,14 @@ def main(argv=None) -> int:
         ap.add_argument("--dir", required=True)
         ap.add_argument("--store", required=True)
         ap.add_argument("--client", required=True)
+        ap.add_argument("--state", help="watcher state file (default STATE/watcher-state.json)")
         a = ap.parse_args(argv[1:])
-        st = json.loads((Path(a.dir) / "watcher-state.json").read_text())
+        sp = Path(a.state) if a.state else Path(a.dir) / "watcher-state.json"
+        st = json.loads(sp.read_text())
         c = st["clients"].pop(a.client, None)
         adm = load_admission()
         n = sum(1 for t in (c or {}).get("tids", []) if adm.Store(a.store).revoke(t))
-        (Path(a.dir) / "watcher-state.json").write_text(json.dumps(st, sort_keys=True, indent=1))
+        write_durable(sp, json.dumps(st, sort_keys=True, indent=1))
         print(f"revoked {n} admission(s) for {a.client}")
         return 0
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -239,13 +297,16 @@ def main(argv=None) -> int:
     ap.add_argument("--store", required=True)
     ap.add_argument("--rpc", action="append", default=[], metavar="CHAINID=URL",
                     help="RPC per chain (default: the public endpoints in chains.py)")
-    ap.add_argument("--confirmations", type=int, default=2)
+    ap.add_argument("--confirmations", type=int, default=None,
+                    help="blocks to wait for on every chain (default per chain: Arbitrum 20, Base 5)")
     ap.add_argument("--testnets", action="store_true")
     ap.add_argument("--interval", type=int, default=10)
+    ap.add_argument("--state", help="watcher state file: used payments (default STATE/watcher-state.json)")
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args(argv)
     w = Watcher(RpcChains(parse_rpcs(a.rpc), a.testnets), state_dir=a.dir, seller_sesh=a.seller,
-                issuer_key=a.issuer_key, store=a.store, confirmations=a.confirmations, testnets=a.testnets)
+                issuer_key=a.issuer_key, store=a.store, confirmations=a.confirmations, testnets=a.testnets,
+                state_file=a.state)
     n = 0
     while True:
         for name, verdict, why in w.poll_spool():

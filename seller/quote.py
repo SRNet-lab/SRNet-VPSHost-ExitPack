@@ -3,8 +3,9 @@
 1. The buyer asks the seller's claim endpoint for a quote (request below), over Session Router.
 2. The seller answers with a signed quote: payout address, chain, the official USDC address, an
    exact amount and an expiry (about 15 minutes). The amount is the price for the hours asked
-   plus a few millionths of a dollar (1..9999 base units) that no other open quote for this
-   seller on that chain uses, so the last digits work as a payment ID.
+   plus a few millionths of a dollar that no other quote for this seller on that chain has used
+   in the last 7 days, so the last digits work as a payment ID. Normally that is under one cent
+   (1..9999 base units); only when many quotes are out does it grow, up to 0.099999 USDC.
 3. The buyer pays exactly that amount from any wallet, then sends a "paid" notice with the tx
    hash, signed by the per-install buyer key named in the quote request.
 4. The seller's watcher checks the payment on chain and opens the lease for the quoted hours.
@@ -39,8 +40,14 @@ QUOTE_DOMAIN = "srnet-exit-quote/v1"
 PAID_DOMAIN = "srnet-exit-paid/v1"
 QUOTE_TTL_S = 900
 MAX_QUOTE_TTL_S = 1800
-PAY_ID_MAX = 9999           # unique part of the amount, in USDC base units (< 1 cent)
-BLOCK_SKEW_S = 120          # block time may sit this far outside the quote window
+PAY_ID_SMALL = 9999         # unique part of the amount, in USDC base units: normally < 1 cent
+PAY_ID_MAX = 99_999         # ... and never more than 0.099999 USDC
+POOL_BUSY = 0.9             # refuse new quotes when this share of the amounts for a price is taken
+RESERVE_S = 7 * 86400       # an amount is never quoted again within this long (paid or not)
+KEEP_QUOTES_S = RESERVE_S + 1800 + 86400  # quote files (and paid notices for them) are kept this long
+EARLY_SKEW_S = 30           # block time may sit this far before the quote was issued
+LATE_SKEW_S = 120           # ... and this far after it expired
+CLOCK_SKEW_S = 120          # buyer side: allowed difference between our clock and the seller's
 SESH_RE = re.compile(r"^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}\.sesh$")
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 ID_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -95,22 +102,29 @@ def request_error(req, seller: str, accept: list[int], max_hours: int, testnets:
 
 # ---------------------------------------------------------------- seller side: quote
 def unique_amount(base: int, taken: set[int], rng=secrets.randbelow) -> tuple[int, int]:
-    """(amount, pay_id): base + a pay id in 1..PAY_ID_MAX that no open quote uses."""
-    free = PAY_ID_MAX - len(taken)
-    if free <= 0:
-        raise QuoteError("too many open quotes; try again in a few minutes")
+    """(amount, pay_id): base + a pay id that makes the full amount differ from every amount in
+    taken (all amounts quoted on this chain in the last RESERVE_S seconds).
+
+    The pay id is drawn from 1..PAY_ID_SMALL while that range is at most half used, then from a
+    10x wider range, up to PAY_ID_MAX."""
+    used = {a - base for a in taken if base < a <= base + PAY_ID_MAX}
+    if len(used) >= POOL_BUSY * PAY_ID_MAX:
+        raise QuoteError("busy: too many recent quotes; try again later")
+    width = PAY_ID_SMALL
+    while width < PAY_ID_MAX and sum(1 for p in used if p <= width) * 2 > width:
+        width = min(PAY_ID_MAX, width * 10 + 9)
     for _ in range(64):
-        pid = 1 + rng(PAY_ID_MAX)
-        if pid not in taken:
+        pid = 1 + rng(width)
+        if pid not in used:
             return base + pid, pid
-    pid = next(p for p in range(1, PAY_ID_MAX + 1) if p not in taken)
+    pid = next(p for p in range(1, PAY_ID_MAX + 1) if p not in used)
     return base + pid, pid
 
 
 def make_quote(key: Ed25519PrivateKey, req: dict, *, payout: str, price_per_hour: int, taken: set[int],
                cap: int | None = None, ttl: int = QUOTE_TTL_S, now: int | None = None, testnets: bool = False,
                rng=secrets.randbelow) -> tuple[dict, int]:
-    """Signed quote for an accepted request; returns (doc, pay_id)."""
+    """Signed quote for an accepted request; returns (doc, pay_id). taken: full amounts in use."""
     if not C.ADDR_RE.match(payout) or int(payout, 16) == 0:
         raise QuoteError("seller has no payout address")
     now = int(time.time()) if now is None else int(now)
@@ -160,9 +174,9 @@ def quote_error(doc, *, listing: dict, req: dict, cap: int, now: int | None = No
     if q["amount"] > cap:
         return (f"{C.fmt_usdc(q['amount'])} USDC is over your limit of {C.fmt_usdc(cap)} per payment "
                 "(raise it with --max-usdc or \"max_payment_usdc\" in config.json)")
-    if not (now - BLOCK_SKEW_S <= q["issued"] <= now + BLOCK_SKEW_S) or q["expires"] <= now \
+    if not (now - CLOCK_SKEW_S <= q["issued"] <= now + CLOCK_SKEW_S) or q["expires"] <= now \
             or q["expires"] - q["issued"] > MAX_QUOTE_TTL_S:
-        return "the quote is expired or has bad times"
+        return "the quote is expired or has bad times (check your computer's clock)"
     return None
 
 
@@ -197,8 +211,9 @@ def paid_error(paid, quote: dict) -> str | None:
 
 # ---------------------------------------------------------------- matching a payment
 def payment_error(quote: dict, transfers: list[dict], block_time: int, status_ok: bool,
-                  testnets: bool = False, skew: int = BLOCK_SKEW_S) -> str | None:
-    """None if one of the tx's USDC transfers pays this quote exactly, inside its window.
+                  testnets: bool = False) -> str | None:
+    """None if one of the tx's USDC transfers pays this quote exactly, inside its window
+    (issued - EARLY_SKEW_S .. expires + LATE_SKEW_S, by block time).
 
     transfers: [{"token", "from", "to", "value"}] decoded from the receipt's Transfer logs."""
     if not status_ok:
@@ -210,9 +225,9 @@ def payment_error(quote: dict, transfers: list[dict], block_time: int, status_ok
     if not any(int(t["value"]) == int(quote["amount"]) for t in mine):
         got = ", ".join(C.fmt_usdc(t["value"]) for t in mine)
         return f"amount mismatch: the quote asks for exactly {C.fmt_usdc(quote['amount'])} USDC, the tx paid {got}"
-    if block_time < quote["issued"] - skew:
+    if block_time < quote["issued"] - EARLY_SKEW_S:
         return "the payment is older than the quote"
-    if block_time > quote["expires"] + skew:
+    if block_time > quote["expires"] + LATE_SKEW_S:
         return "the payment arrived after the quote expired"
     return None
 
