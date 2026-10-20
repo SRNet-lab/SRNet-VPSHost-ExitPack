@@ -17,6 +17,7 @@ import http.client
 import json
 import os
 import secrets
+import signal
 import sys
 import threading
 import time
@@ -206,6 +207,10 @@ def run(st, port: int = 0, browser: bool = True) -> int:
     print(f"srnet-exits ui: {url}\n(local only; this address works only for this run; Ctrl-C to stop)", flush=True)
     if browser:
         threading.Thread(target=lambda: (time.sleep(0.5), webbrowser.open(url)), daemon=True).start()
+    if threading.current_thread() is threading.main_thread():
+        def _term(*_):
+            raise SystemExit(143)   # so the finally below removes ui.json (uninstall and kill send TERM)
+        signal.signal(signal.SIGTERM, _term)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

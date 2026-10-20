@@ -458,6 +458,24 @@ class PageRun(unittest.TestCase):
         p.symlink_to(real)
         self.assertIsNone(page.running(self.st))
 
+    def test_term_removes_ui_json(self):
+        import signal
+        import time
+        env = dict(os.environ, SRNET_HOME=str(self.st.root), PYTHONPATH=os.pathsep.join(sys.path))
+        p = subprocess.Popen([sys.executable, "-m", "srnet_exits", "ui", "--no-browser"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        info = self.st.root / "ui.json"
+        for _ in range(250):
+            if info.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(info.exists())
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(10), 143)
+        p.stdout.close()
+        p.stderr.close()
+        self.assertFalse(info.exists())
+
     def test_nothing_recorded_means_a_new_page(self):
         from srnet_exits import page
         self.assertIsNone(page.running(self.st))
