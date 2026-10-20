@@ -13,7 +13,8 @@ python3 contrib/legacy-cashout/cashout.py send             # asks for the passph
 
 `send` takes out both the unused balance and any seller earnings. Your wallet pays the network
 fee, so it needs a little ETH on Arbitrum One first (a few cents is enough); the script tells you
-if it's short. The money goes back to the same wallet. To move it on from there, import the
+if it's short. Each call is tried first as a dry run, and the fee comes from a gas estimate, so a
+call the contract would refuse costs nothing. The money goes back to the same wallet. To move it on from there, import the
 keystore file into a wallet app that reads JSON keystores.
 
 Set `SRNET_ARB_RPC` to use your own Arbitrum One RPC.
