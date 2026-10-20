@@ -8,11 +8,13 @@ Run an SRNet exit on a fresh server.
 - A public IPv4 address with udp/1193 reachable
 - 2+ vCPU and 4 GB RAM (or swap) for a source build, which takes 20 to 60
   minutes. The release install uses a prebuilt router and needs less.
-- A payout wallet address. Only the address; the pack never needs a private key.
+- A payout wallet address that can receive USDC on Arbitrum One and Base. Only the address;
+  the pack never needs a private key.
 - An hourly price in USDC
 
-Defaults to Arbitrum One (42161), contract `0x7E0d01B7dd916BdAB96B0971ab92D160E1664431`,
-RPC https://arb1.arbitrum.io/rpc. Real USDC; the contract is unaudited, keep amounts small.
+Buyers pay USDC straight to your payout address on Arbitrum One or Base (both by default;
+`--chain arbitrum` or `--chain base` for one). The watcher reads the chain through public RPCs
+unless you pass `--rpc CHAINID=URL`. Real USDC; keep amounts small.
 
 ## Install from a clone
 
@@ -60,7 +62,9 @@ boot. Progress goes to the serial console and
 - ufw: incoming traffic denied except SSH and udp/1193.
 - systemd services, each under its own user:
   - `srnet-seller-exit`: the router, with only `CAP_NET_ADMIN`
-  - `srnet-seller-watcher`: turns paid leases into hourly admissions; holds no wallet key
+  - `srnet-seller-claimd`: the claim desk; gives signed quotes and takes payment notices
+  - `srnet-seller-watcher`: checks reported payments on chain and admits the buyer for the
+    paid hours; holds no wallet key
   - `srnet-seller-listing.timer`: re-signs the listing every hour
   - `srnet-seller-submit.service`: client-only router used to reach the board
 - A new exit identity key and a signed listing at
@@ -84,14 +88,8 @@ srnet-seller listing
 srnet-seller logs
 ```
 
-Payouts:
-
-```sh
-/opt/srnet-seller/pack/payout.py claim --rpc URL --contract 0x... --lease N --keystore ~/wallet.json
-```
-
-`payout.py` signs with a keystore, a hardware wallet (`--ledger`) or an
-interactive prompt. It does not store keys.
+Payments land in your payout wallet directly; there is nothing to claim. Each admitted
+payment is logged by the watcher (`journalctl -u srnet-seller-watcher`).
 
 ## Uninstall
 
@@ -106,16 +104,17 @@ Run `seller/install.sh --help` for the full list. The common ones:
 
 ```
 --source | --prebuilt [URL] | --binary PATH
---contract 0xADDR        default: the SRNetBalance contract on Arbitrum One
---chainid N              42161 (Arbitrum One, the only supported chain)
---rpc URL                default https://arb1.arbitrum.io/rpc on 42161
+--chain NAME             arbitrum, base (repeatable; default both)
+--rpc CHAINID=URL        your own RPC for a chain (default: public RPCs)
+--cap-usdc N             largest single payment you will quote (default 20)
+--max-hours N            most hours one quote can buy
 --country XX             ISO 3166-1 alpha-2; default: detected from the public IPv4
                          (two geo-IP services must agree, else --country is required)
 --region NAME            optional finer detail
 --max-mbit N             total cap on the exit, default 100, 0 disables
 --speed-cap-mbps N       per-buyer cap each way, default 10, 0 = unlimited (shown in the listing)
 --listen-port N          default 1193
---board-submit-url URL   default on 42161: the SRNet board; none = local only
+--board-submit-url URL   default: the SRNet board; none = local only
 --no-firewall
 --dry-run --root DIR     write files under DIR and log system commands instead of running them
 ```

@@ -33,10 +33,11 @@ signed, for the wrong seller or client, or expired, nobody is admitted. Unsigned
 
 ## Connect order
 
-The client calls `startLease` for one prepaid hour, then MapExit, then waits
-for EXIT_CAPABLE. Payment is final once the lease starts. If mapping fails the
-client unmaps and stops renewing, so a failed exit costs at most the prepaid
-hour.
+The client connects only inside paid time: the seller's watcher has checked the
+payment on chain and written an admission for the buyer's `.sesh` address until
+the end of the paid hours. The client then calls MapExit and waits for
+EXIT_CAPABLE. If mapping fails, the client unmaps. Payments are final; nothing
+renews by itself.
 
 ## DNS
 

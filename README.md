@@ -1,12 +1,17 @@
 # SRNet VPS Host Exit Pack
 
-Patches, build scripts and a seller installer for running a paid, lease-gated
-Session Router exit on Ubuntu 24.04.
+Everything for SRNet exits in one place:
 
-This is beta software. It works with the SRNetBalance contract on Arbitrum One (42161), which
-holds real USDC and has not been audited, so start with small amounts. Other chain ids are
-refused. Buyers connect with the SRNet client,
-[SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop).
+- **Seller pack** (`seller/`): patches, build scripts and an installer for running a paid,
+  lease-gated Session Router exit on Ubuntu 24.04.
+- **Buyer add-on** (`client/`, the `srnet-exits` package): plugs into the SRNet client
+  ([SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop)) and adds `srnet exits`,
+  `srnet buy`, `srnet connect` and the Exits tab.
+- **Board** (`board/`): the signed list of exits that buyers browse.
+
+Buyers pay sellers directly in USDC on Arbitrum One or Base, from any wallet. There is no
+contract, no balance to top up and no middleman: the seller's payout address gets the payment,
+and the buyer pays the network fee. This is beta software; keep amounts small.
 
 SRNet is an independent project. It is not affiliated with or endorsed by the Session Foundation
 or the Session Technology Foundation.
@@ -16,14 +21,35 @@ pinned `bootstrap.sh`, made with `scripts/make-release.sh`) go on
 [GitHub Releases](https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack/releases) when published.
 Building the router from source takes 20 to 60 minutes.
 
-## Contract
+## How paying works
 
-SRNetBalance is deployed on Arbitrum One (42161) at `0x7E0d01B7dd916BdAB96B0971ab92D160E1664431`
-(tx `0xfb514a4f94049d1679b0c10ed3983be07b21151774b8a14257efa1432584637c`, block 514036941; source
-verified on Sourcify). The installer uses it by default, so no `--contract` is needed. The
-contract is unaudited; keep amounts small.
+1. The buyer runs `srnet buy --seller <id> --hours N` (or presses Buy in the Exits tab).
+2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
+   contract, and an exact amount (the hourly price times N plus a few millionths of a USDC, so
+   each open quote has its own amount). The quote is bound to the buyer's `.sesh` address and
+   expires after about 15 minutes. One payment is capped at 20 USDC by default.
+3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
+4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
+   The seller's watcher checks that transaction on chain itself (read-only) and admits the
+   buyer for the quoted hours. A transaction can only be used once.
+5. About 10 minutes before the time runs out the client warns. Nothing renews by itself;
+   to keep going, buy again.
 
-## Install
+If the amount or the chain is wrong, nothing is matched and the client says so plainly
+("No matching payment yet. Send exactly ..."). Payments are final.
+
+## Buyer: install the add-on
+
+The add-on goes into the same Python environment as the SRNet client:
+
+```sh
+~/SRNet-Desktop/install.sh --with-exits
+```
+
+or, by hand, `<the client's python> -m pip install "srnet-exits @ git+https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack"`.
+`srnet doctor` shows whether it is loaded. Details: [client/README.md](client/README.md).
+
+## Seller: install
 
 On a fresh Ubuntu 24.04 x86_64 server, as root:
 
@@ -104,7 +130,9 @@ board/              signed seller board: operator CLI, server, deploy script
 contrib/exit-lease/ admission issuer and exit-lease-verify
 scripts/            build and release scripts
 docker/             pinned container build
-seller/             installer, payment watcher, claim endpoint, listing, payout helper
+seller/             installer, quotes, claim desk, payment watcher, listing
+client/             the buyer add-on for the SRNet client (srnet-exits)
+contrib/legacy-cashout/  take out USDC left in the old SRNet balance (until 2027-01-18)
 cloud-init/         user-data for installs without SSH
 ```
 
@@ -114,7 +142,7 @@ cloud-init/         user-data for installs without SSH
 scripts/build-release.sh --version v0.1.0            # container build, or --dist DIR to reuse one
 scripts/make-release.sh --version v0.1.0 \
   --router-tarball release/v0.1.0/session-router-v0.1.0-linux-x86_64.tar.gz \
-  [--contract 0x...] [--board-submit-url URL]
+  [--board-submit-url URL]
 ```
 
 `build-release.sh` builds the pinned upstream commit with `patches/` in the
@@ -126,14 +154,20 @@ pinned container and packs `session-router`, `exit-lease-verify` and
 inside it, downloads the tarball from GitHub Releases, checks both hashes and
 builds from source if anything is missing or does not match.
 
-## Lease claims
+## Claim desk
 
-Buyers send their signed lease claim to the seller's claim endpoint
-(`claim_url` in the listing). It runs on the small client-only router the
-seller also uses to reach the board, listens only on that router's tun
-address, and accepts small, well-formed, signed claims at a limited rate. The
-watcher checks each claim against the chain before it admits anyone. Claims
-dropped into `/opt/srnet-seller/spool` by hand also work.
+The claim desk (`srnet-seller-claimd`) answers `/claim/quote`, `/claim/paid` and
+`/claim/status/<id>` at the `claim_url` in the listing. It runs on the small client-only
+router the seller also uses to reach the board, listens only on that router's tun address,
+and takes small, signed requests at a limited rate. It never holds a key that can move
+funds. The watcher (`srnet-seller-watcher`) checks each reported payment on chain before it
+admits anyone.
+
+## Old SRNet balance
+
+Payments used to go through an SRNet balance on Arbitrum One. That is gone. If you still have
+USDC there, `contrib/legacy-cashout/` sends it back to your wallet; see its
+[README](contrib/legacy-cashout/README.md). It stays in this repository until 2027-01-18.
 
 ## Operating an exit
 
@@ -149,12 +183,17 @@ tunnel DNS).
 
 ## Related repositories
 
-- [SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop): the SRNet client buyers use to
-  find, pay for and connect to exits.
+- [SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop): the SRNet client. With this
+  add-on installed, buyers find, pay for and connect to exits from it.
 - [Session-Router-SRNet](https://github.com/SRNet-lab/Session-Router-SRNet): the Session Router
   build the client runs, with exit mapping added.
 
 ## License
 
 `patches/` and `contrib/exit-lease/verify_main.cpp` are GPL-3.0, like upstream
-Session Router. Everything else is Apache-2.0. See [LICENSE](LICENSE).
+Session Router. See [LICENSE](LICENSE) for the rest.
+
+## Donations
+
+If SRNet is useful to you, donations are welcome at
+`0xec4fEECa354C7eabbe8957a23c361Aa365E3b377` (USDC or ETH on Arbitrum One or Base).

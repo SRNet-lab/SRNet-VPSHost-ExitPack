@@ -26,10 +26,13 @@ expired board, a lower seq than they've seen, or the same seq with different con
 
 ## Listings
 
-- No approval step. A listing with a valid seller signature, the Arbitrum One chain id and the
-  SRNetBalance contract address, sane fields and a non-zero payout goes live at the next `tick`.
-  Changes to any field (payout, vendor_id, country, price, ...) go live the same way; they are
-  logged in `audit.jsonl`.
+- No approval step. A v3 listing with a valid seller signature, supported chains (Arbitrum One,
+  Base), USDC, a quote key, a claim address, sane fields and a non-zero payout goes live at the
+  next `tick`. Changes to any field (payout, chains, country, price, ...) go live the same way;
+  they are logged in `audit.jsonl`.
+- Listings from before direct payments (v2) stay on the board for two weeks after it is
+  upgraded. Clients show them as "seller needs to update" and can't buy from them. After that
+  they are left out.
 - `ban <seller> --reason TEXT` is the only manual control: banned sellers are dropped and their
   submissions refused. `unban` lifts it.
 - `country` is ISO 3166-1 alpha-2 (`unknown` if absent); `region` is optional detail.
