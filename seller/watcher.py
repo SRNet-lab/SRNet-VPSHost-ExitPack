@@ -34,6 +34,14 @@ claimd; while the chain can't be read, the status says so ("waiting", "chain_una
              [--state watcher-state.json]
   watcher.py stop --dir STATE --store admissions.json --client <buyer>.sesh [--state F]  # end a buyer's time now
               (stop the service first: the running watcher keeps its own copy of the state)
+  watcher.py held --state F                  # paid quotes waiting for the seller (see below)
+  watcher.py admit --state F --quote <id>    # admit one of them (works while the service runs)
+
+A quote that is signed by our quote key, pays our payout address in official USDC on a chain we
+take and adds up, but whose price or hours match no listing the watcher knows of (for example
+the price was changed by hand while the watcher was stopped), is never refused: once the
+payment checks out on chain it is parked in STATE/spool/held/, the buyer sees "waiting,
+needs_seller", and the log names the quote and the command to admit it.
 
 Chain access is plain read-only JSON-RPC (evm.py). The watcher never holds a wallet key.
 """
@@ -57,6 +65,8 @@ HOUR = 3600
 NOT_MINED_S = 86400              # retry a tx the chain doesn't know for this long after it was reported
 BACKOFF_S = (10, 60, 300)        # per-report retry delays while waiting
 LISTING_SKEW_S = 300             # a quote may be issued this long after its listing was replaced
+LISTING_LOG_S = 300              # repeat "can't use the listing yet" at most this often
+LISTING_HISTORY = 10             # earlier listings the watcher remembers
 HERE = Path(__file__).resolve().parent
 # Repo layouts: ../contrib/exit-lease; installed layout: admission.py next to this file.
 DEFAULT_ADMISSION = next((c for c in (HERE.parent / "contrib" / "exit-lease" / "admission.py",
@@ -106,31 +116,42 @@ class Watcher:
         self.state = self._load()
         self.listing_path = Path(listing)
         self._listing_seen: tuple | None = None
+        self._listing_log: tuple[str, float] | None = None
+        self.admit_dir = self.state_path.parent / "admit"
         self._note_listing()
 
     def _note_listing(self) -> None:
-        """Look at the listing now, so a later price change keeps the old terms in the history."""
+        """Look at the listing now, so a later price change keeps the old terms in the history.
+        A broken listing is logged when the problem changes, and otherwise every few minutes."""
         try:
             self.listings()
+            self._listing_log = None
         except (OSError, ValueError, KeyError, TypeError, C.ChainError) as e:
-            print(f"watcher: can't use the listing yet: {e}", file=sys.stderr, flush=True)
+            msg, t = str(e), self.clock()
+            last = self._listing_log
+            if last is None or last[0] != msg or t - last[1] >= LISTING_LOG_S:
+                print(f"watcher: can't use the listing yet: {msg}", file=sys.stderr, flush=True)
+                self._listing_log = (msg, t)
 
     # state: {"used_tx": {tx: quote_id}, "done": {quote_id: tx}, "clients": {sesh: {"end", "tids"}},
     #         "retry": {spool file name: {"first", "next", "n"}},
-    #         "listings": [{"terms": quote.listing_terms(), "until": time it was replaced | None}]}
+    #         "listings": [{"terms": quote.listing_terms(), "until": time it was replaced | None}],
+    #         "needs_seller": {quote_id: {"tx", "why", "at", "spool"}}}  (paid, waiting for `admit`)
     def _load(self) -> dict:
         try:
             st = json.loads(self.state_path.read_text())
         except FileNotFoundError:
             st = {}
-        for k in ("used_tx", "done", "clients", "retry"):
+        for k in ("used_tx", "done", "clients", "retry", "needs_seller"):
             st.setdefault(k, {})
         st.setdefault("listings", [])
         return st
 
     def _read_listing(self, path: Path) -> dict:
-        doc = json.loads(path.read_text())
-        if not L.verify(doc):
+        return self._read_listing_doc(json.loads(path.read_text()))
+
+    def _read_listing_doc(self, doc) -> dict:
+        if not isinstance(doc, dict) or not L.verify(doc):
             raise ValueError("listing signature is invalid")
         body = doc["listing"]
         why = L.listing_error(body, self.testnets)
@@ -144,21 +165,16 @@ class Watcher:
         """Terms of the current listing and of earlier ones (with the time they were replaced).
         Raises ValueError if the current listing can't be read or doesn't verify."""
         now = int(self.clock()) if now is None else int(now)
-        st = self.listing_path.stat()
-        seen = (st.st_mtime_ns, st.st_size)
+        raw = self.listing_path.read_bytes()      # small; read every poll so no change is missed
+        seen = (len(raw), hash(raw))
         hist = self.state.setdefault("listings", [])
         if seen != self._listing_seen or not hist:
-            terms = self._read_listing(self.listing_path)
+            terms = self._read_listing_doc(json.loads(raw))
             dirty = False
-            prev = self.listing_path.with_name("previous.json")
-            if prev.exists():  # the installer keeps the listing it replaced here
-                try:
-                    pt = self._read_listing(prev)
-                    if pt != terms and not any(h["terms"] == pt for h in hist):
-                        hist.insert(0, {"terms": pt, "until": int(prev.stat().st_mtime)})
-                        dirty = True
-                except (OSError, ValueError, KeyError, TypeError, C.ChainError):
-                    pass
+            for pt, until in self._previous():
+                if pt != terms and not any(h["terms"] == pt for h in hist):
+                    hist.insert(0, {"terms": pt, "until": until})
+                    dirty = True
             cur = next((h for h in hist if h["until"] is None), None)
             if cur is None or cur["terms"] != terms:
                 if cur is not None:
@@ -167,6 +183,10 @@ class Watcher:
                 hist.append({"terms": terms, "until": None})
                 dirty = True
             keep = [h for h in hist if h["until"] is None or h["until"] >= now - Q.KEEP_QUOTES_S]
+            old = sorted((h for h in keep if h["until"] is not None), key=lambda h: h["until"])
+            if len(old) > LISTING_HISTORY:
+                drop = old[:-LISTING_HISTORY]
+                keep = [h for h in keep if not any(h is d for d in drop)]
             if len(keep) != len(hist):
                 hist[:] = keep
                 dirty = True
@@ -175,11 +195,42 @@ class Watcher:
             self._listing_seen = seen
         return hist
 
+    def _previous(self) -> list[tuple[dict, int]]:
+        """(terms, replaced_at) for each earlier listing the installer kept in previous.json
+        (listing.retire). The time comes from inside the file, not its mtime."""
+        prev = self.listing_path.with_name("previous.json")
+        try:
+            doc = json.loads(prev.read_text())
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as e:
+            print(f"watcher: ignoring {prev.name}: {e.__class__.__name__}", file=sys.stderr, flush=True)
+            return []
+        items = doc.get("history") if isinstance(doc, dict) else None
+        out = []
+        for h in items if isinstance(items, list) else []:
+            try:
+                t = h["replaced_at"]
+                if not isinstance(t, int) or isinstance(t, bool):
+                    continue
+                out.append((self._read_listing_doc(h["doc"]), t))
+            except (ValueError, KeyError, TypeError, C.ChainError):
+                continue
+        return out
+
     def terms_error(self, doc, now: int) -> str | None:
         """None if some listing that was current when the quote was issued could have made it."""
+        return self.terms_check(doc, now)[0]
+
+    def terms_check(self, doc, now: int) -> tuple[str | None, bool]:
+        """(None, False) if some listing that was current when the quote was issued could have
+        made it. Otherwise (why, soft): soft means the quote is signed by one of our quote keys,
+        pays our payout in official USDC on a chain we take and adds up on its own price, and
+        only its price or hours match no listing we know of (say the price was changed by hand
+        while the watcher was stopped). The seller decides those by hand (`admit`)."""
         q = doc["quote"]
         if not isinstance(q.get("issued"), int) or isinstance(q.get("issued"), bool):
-            return "bad quote times"
+            return "bad quote times", False
         hist = self.listings(now)
         why = "no listing"
         for h in reversed(hist):
@@ -187,8 +238,9 @@ class Watcher:
                 continue
             why = Q.terms_error(doc, h["terms"], self.testnets)
             if not why:
-                return None
-        return why
+                return None, False
+        soft = any(Q.terms_error(doc, h["terms"], self.testnets, price=False) is None for h in hist)
+        return why, soft
 
     def _save(self) -> None:
         write_durable(self.state_path, json.dumps(self.state, sort_keys=True, indent=1))
@@ -224,11 +276,11 @@ class Watcher:
         if q.get("seller") != self.seller:
             return "reject", "quote_for_other_seller"
         try:
-            why = self.terms_error(doc, now)
+            terms_why, soft = self.terms_check(doc, now)
         except (OSError, ValueError, KeyError, TypeError, C.ChainError) as e:
             return "wait", f"listing_unavailable: {e}"
-        if why:
-            return "reject", f"quote_does_not_match_listing: {why}"
+        if terms_why and not soft:
+            return "reject", f"quote_does_not_match_listing: {terms_why}"
         why = Q.paid_error(notice, q)
         if why:
             return "reject", "bad_buyer_signature"
@@ -259,6 +311,10 @@ class Watcher:
         why = Q.payment_error(q, evm.receipt_transfers(rc), btime, evm.receipt_ok(rc), self.testnets)
         if why:
             return "reject", f"no_matching_payment: {why}"
+        held = self.state.setdefault("needs_seller", {})
+        if terms_why and not (held.get(qid, {}).get("tx") == tx and held[qid].get("ok")):
+            return "hold", f"needs_seller: {terms_why}"
+        held.pop(qid, None)
         return "admit", self._admit(q, tx, now)
 
     def _admit(self, q: dict, tx: str, now: int) -> str:
@@ -284,6 +340,7 @@ class Watcher:
         retry = self.state["retry"]
         dirty = False
         self._note_listing()
+        self._take_admits()
         for f in sorted(spool.glob("*.json")):
             r = retry.get(f.name)
             if r and now < r["next"]:
@@ -295,6 +352,11 @@ class Watcher:
                 notice, verdict, why = {}, "reject", f"unreadable: {e.__class__.__name__}"
             out.append((f.name, verdict, why))
             qid = notice.get("quote_id") if isinstance(notice, dict) else None
+            if verdict == "hold":
+                self._hold(f, notice, why, now)
+                retry.pop(f.name, None)
+                dirty = True
+                continue
             if verdict == "wait":
                 r = r or {"first": now, "n": 0}
                 r["next"] = now + BACKOFF_S[min(r["n"], len(BACKOFF_S) - 1)]
@@ -309,11 +371,55 @@ class Watcher:
             dest = spool / ("done" if verdict == "admit" else "rejected")
             f.replace(dest / f.name)
             (dest / (f.name + ".result")).write_text(why + "\n")
+            if isinstance(qid, str) and self.state.setdefault("needs_seller", {}).get(qid, {}).get("spool") == f.name:
+                self.state.setdefault("needs_seller", {}).pop(qid)
+                dirty = True
             if verdict == "reject" and isinstance(qid, str) and self._quote(qid) and qid not in self.state["done"]:
                 self._status(qid, status="rejected", reason=why, tx=notice.get("tx"))
         if dirty:
             self._save()
         return out
+
+    def _hold(self, f: Path, notice: dict, why: str, now: int) -> None:
+        """A paid quote the seller has to look at: park the report and say how to admit it."""
+        qid, q = notice["quote_id"], self._quote(notice["quote_id"])
+        held = self.dir / "spool" / "held"
+        held.mkdir(exist_ok=True)
+        f.replace(held / f.name)
+        self.state.setdefault("needs_seller", {})[qid] = {"tx": notice["tx"], "why": why, "at": now, "spool": f.name}
+        self._save()
+        self._status(qid, status="waiting", note="needs_seller", tx=notice["tx"])
+        print(f"watcher: quote {qid} was paid ({C.fmt_usdc(q['amount'])} USDC for {q['hours']} h at "
+              f"{C.fmt_usdc(q['price_per_hour'])} USDC/h, "
+              f"tx {notice['tx']} on chain {q['chainid']}), but its terms match no listing I know of "
+              f"({why.partition(': ')[2]}). If you did sell at that price, admit the buyer with: "
+              f"srnet-seller admit {qid}", file=sys.stderr, flush=True)
+
+    def held(self) -> dict:
+        return dict(self.state.setdefault("needs_seller", {}))
+
+    def _take_admits(self) -> None:
+        """Pick up `watcher.py admit` requests (files in admit/) for held quotes."""
+        try:
+            reqs = sorted(p for p in self.admit_dir.iterdir() if p.is_file())
+        except FileNotFoundError:
+            return
+        for p in reqs:
+            qid = p.name
+            p.unlink(missing_ok=True)
+            h = self.state.setdefault("needs_seller", {}).get(qid) if Q.ID_RE.match(qid) else None
+            if not h:
+                print(f"watcher: admit {qid}: no paid quote is waiting for you under that id", file=sys.stderr, flush=True)
+                continue
+            src = self.dir / "spool" / "held" / h["spool"]
+            try:
+                src.replace(self.dir / "spool" / h["spool"])   # back in the queue; handle() admits it
+            except FileNotFoundError:
+                print(f"watcher: admit {qid}: the held report is gone; ask the buyer to report the payment again",
+                      file=sys.stderr, flush=True)
+            h["ok"] = True
+            self._save()
+            print(f"watcher: admit {qid}: approved by the seller, checking the payment once more", file=sys.stderr, flush=True)
 
     def tidy(self) -> int:
         """Drop expired admissions and buyers whose time is over."""
@@ -370,6 +476,32 @@ def parse_rpcs(items: list[str]) -> dict:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] in (["admit"], ["held"]):
+        ap = argparse.ArgumentParser(prog=f"watcher.py {argv[0]}")
+        ap.add_argument("--state", required=True, help="the watcher state file (the installer's watch/watcher-state.json)")
+        if argv[0] == "admit":
+            ap.add_argument("--quote", required=True, help="quote id from the watcher's log line")
+        a = ap.parse_args(argv[1:])
+        sp = Path(a.state)
+        try:
+            held = json.loads(sp.read_text()).get("needs_seller", {})
+        except (OSError, ValueError):
+            held = {}
+        if argv[0] == "held":
+            for qid, h in sorted(held.items(), key=lambda kv: kv[1].get("at", 0)):
+                print(f"{qid}  tx {h.get('tx')}  {h.get('why')}")
+            if not held:
+                print("no paid quotes are waiting for you")
+            return 0
+        if not Q.ID_RE.match(a.quote):
+            raise SystemExit("not a quote id")
+        d = sp.parent / "admit"
+        d.mkdir(exist_ok=True)
+        (d / a.quote).write_text("")
+        note = "" if a.quote in held else " (it isn't in the held list yet; the watcher will say if it finds nothing)"
+        print(f"asked the watcher to admit quote {a.quote}{note}. It re-checks the payment on chain first; "
+              f"see srnet-seller logs.")
+        return 0
     if argv[:1] == ["stop"]:
         ap = argparse.ArgumentParser(prog="watcher.py stop")
         ap.add_argument("--dir", required=True)

@@ -259,6 +259,67 @@ class V3Fields(unittest.TestCase):
             L.refresh(key, d / "l.json")
 
 
+class RetireTest(unittest.TestCase):
+    """previous.json: earlier listings with the time they were replaced, kept by the installer."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.key = Ed25519PrivateKey.generate()
+        self.listing = self.d / "listing.json"
+
+    def put(self, price):
+        doc = L.make(self.key, price_per_hour_usdc=price, max_hours=24, payout="0x" + "aa" * 20, chains=[42161],
+                     token="USDC", quote_key="11" * 32, claim_url=CLAIM, country="US", policy=["tcp/443"])
+        self.listing.write_text(json.dumps(doc))
+        return doc
+
+    def history(self):
+        return json.loads((self.d / "previous.json").read_text())["history"]
+
+    def test_keeps_time_inside_and_a_short_history(self):
+        self.assertFalse(L.retire(self.listing, now=1))          # nothing there yet
+        for i in range(L.HISTORY_KEEP + 3):
+            self.put(f"1.{10 + i}")
+            self.assertTrue(L.retire(self.listing, now=1000 + i))
+        h = self.history()
+        self.assertEqual(len(h), L.HISTORY_KEEP)
+        self.assertEqual([x["replaced_at"] for x in h], list(range(1003, 1008)))
+        self.assertEqual(h[-1]["doc"]["listing"]["price_per_hour_usdc"], "1.17")
+        self.assertTrue(all(L.verify(x["doc"]) for x in h))
+
+    def test_same_offer_is_kept_once_with_the_latest_time(self):
+        self.put("1.00")
+        L.retire(self.listing, now=10)
+        self.put("1.00")                                         # re-signed, same offer
+        L.retire(self.listing, now=20)
+        self.assertEqual([x["replaced_at"] for x in self.history()], [20])
+
+    def test_bad_listing_or_history_is_not_kept(self):
+        self.listing.write_text("{")
+        self.assertFalse(L.retire(self.listing, now=1))
+        doc = self.put("1.00")
+        (self.d / "previous.json").write_text(json.dumps({"v": 1, "history": [
+            {"replaced_at": 5, "doc": dict(doc, sig="00" * 64)}, {"replaced_at": "x", "doc": doc}, "junk"]}))
+        self.assertTrue(L.retire(self.listing, now=9))
+        self.assertEqual([x["replaced_at"] for x in self.history()], [9])
+
+    def test_make_replace_keeps_the_old_one(self):
+        import contextlib
+        import io
+        idf = self.d / "id.key"
+        idf.write_text(self.key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                              serialization.NoEncryption()).hex())
+        args = ["make", "--identity", str(idf), "--payout", "0x" + "Aa" * 20, "--quote-key-file", quote_key_file(),
+                "--claim-url", CLAIM, "--country", "US", "--replace", str(self.listing)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            L.main(args + ["--price-per-hour-usdc", "1.00"])
+            self.assertFalse((self.d / "previous.json").exists())
+            L.main(args + ["--price-per-hour-usdc", "2.00"])
+            L.main(["retire", "--listing", str(self.listing)])
+        self.assertEqual(json.loads(self.listing.read_text())["listing"]["price_per_hour_usdc"], "2.00")
+        self.assertEqual([x["doc"]["listing"]["price_per_hour_usdc"] for x in self.history()], ["1.00", "2.00"])
+
+
 class DnsField(unittest.TestCase):
     def test_valid_dns_private_ipv4_only(self):
         import listing as LL

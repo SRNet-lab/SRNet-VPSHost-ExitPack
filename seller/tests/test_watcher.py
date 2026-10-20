@@ -1,9 +1,13 @@
 """watcher.py: verify a reported payment on chain, then admit the bound buyer for the quoted hours."""
+import io
 import json
+import os
 import unittest
+from unittest import mock
 
 from fixtures import A, C, CLIENT, OTHER, PAYOUT, Q, T0, FakeChains, Seller, buyer_key, tx
 import claimd as D
+import listing as L
 import watcher as W
 
 HOUR = 3600
@@ -328,27 +332,126 @@ class WatcherTest(unittest.TestCase):
         self.pay(q_new, 2, when=T0 + 90)
         self.assertEqual(self.report(q_old, 1)[0][1], "admit")
         self.assertEqual(self.report(q_new, 2)[0][1], "admit")
-        # a "1.00" quote dated after the change is refused, even if signed with the quote key
+        # a "1.00" quote dated after the change is not admitted on its own: the seller decides
         q3 = self.quote(hours=1)
         forged = self.tamper(q3, amount=1_000_500, price_per_hour=1_000_000,
                              issued=self.clock.t + W.LISTING_SKEW_S + 1,
                              expires=self.clock.t + W.LISTING_SKEW_S + 600)
         self.pay(forged, 3, when=forged["issued"] + 10)
-        self.assertIn("quote_does_not_match_listing", self.report(forged, 3)[0][2])
+        out = self.report(forged, 3)
+        self.assertEqual(out[0][1], "hold")
+        self.assertTrue(out[0][2].startswith("needs_seller: amount does not match"), out)
+        self.assertNotIn(f"q-{forged['id']}", [r["tid"] for r in self.admitted()])
+
+    def fresh_watcher(self, name="fresh-state.json"):
+        self.w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path,
+                           issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2, admission=A,
+                           clock=self.clock, state_file=self.s.d / name)
+        return self.w
 
     def test_previous_listing_from_the_installer_is_honoured(self):
         q_old = self.quote(hours=1)             # at 1.00, the watcher never saw this listing
+        self.clock.t += 60
+        self.assertTrue(L.retire(self.s.listing_path, now=self.clock.t))   # what install.sh does
         prev = self.s.listing_path.with_name("previous.json")
-        prev.write_text(json.dumps(self.s.listing_doc))
-        import os
-        os.utime(prev, (T0 + 60, T0 + 60))      # when the installer replaced it
+        os.utime(prev, (T0 - 86400, T0 - 86400))  # copied or restored: the mtime doesn't matter
         self.s.relist("3.00")
-        w = W.Watcher(self.chains, state_dir=self.s.state, seller_sesh=self.s.sesh, listing=self.s.listing_path,
-                      issuer_key=str(self.s.issuer), store=str(self.s.store), confirmations=2, admission=A,
-                      clock=self.clock, state_file=self.s.d / "fresh-state.json")
-        self.w = w
+        self.fresh_watcher()
         self.pay(q_old, 1)
         self.assertEqual(self.report(q_old, 1)[0][1], "admit")
+        self.assertIn({"terms": Q.listing_terms(json.loads(prev.read_text())["history"][0]["doc"]["listing"]),
+                       "until": T0 + 60}, self.w.state["listings"])
+
+    def test_old_style_previous_json_is_ignored(self):
+        q_old = self.quote(hours=1)
+        self.s.listing_path.with_name("previous.json").write_text(json.dumps(self.s.listing_doc))
+        self.s.relist("3.00")
+        self.fresh_watcher()
+        self.pay(q_old, 1)
+        self.assertEqual(self.report(q_old, 1)[0][1], "hold")   # no time in it: the seller decides
+
+    # ------------------------------------------------------------ R3-1: unknown old price
+    def test_price_changed_by_hand_holds_for_the_seller_then_admit(self):
+        q_old = self.quote(hours=2)             # at 1.00
+        self.s.relist("2.00")                   # by hand, no previous.json, watcher never saw 1.00
+        self.fresh_watcher()
+        self.pay(q_old, 1)
+        err = io.StringIO()
+        with mock.patch.object(W.sys, "stderr", err):
+            out = self.report(q_old, 1)
+        self.assertEqual(out[0][1], "hold")
+        self.assertIn(f"srnet-seller admit {q_old['id']}", err.getvalue())
+        self.assertEqual(self.admitted(), [])
+        st = self.status(q_old)
+        self.assertEqual((st["status"], st["note"]), ("waiting", "needs_seller"))
+        self.assertEqual(self.desk.status(q_old["id"])[1]["status"], "waiting")
+        self.assertEqual(list((self.s.state / "spool").glob("*.json")), [])
+        self.assertEqual(len(list((self.s.state / "spool" / "held").glob("*.json"))), 1)
+        self.assertEqual(self.w.poll_spool(), [])          # parked, not retried
+        # the seller lists and admits it with the CLI while the watcher runs
+        buf = io.StringIO()
+        with mock.patch.object(W.sys, "stdout", buf):
+            W.main(["held", "--state", str(self.w.state_path)])
+            W.main(["admit", "--state", str(self.w.state_path), "--quote", q_old["id"]])
+        self.assertIn(q_old["id"], buf.getvalue())
+        with mock.patch.object(W.sys, "stderr", io.StringIO()):
+            out = self.w.poll_spool()
+        self.assertEqual(out[0][1:], ("admit", f"q-{q_old['id']}"))
+        rec, = self.admitted()
+        self.assertEqual(rec["exp"], T0 + 2 * HOUR)
+        self.assertEqual(self.w.state["needs_seller"], {})
+        self.assertEqual(list(self.w.admit_dir.iterdir()), [])
+
+    def test_held_quote_still_needs_the_right_payment(self):
+        q_old = self.quote(hours=1)
+        self.s.relist("2.00")
+        self.fresh_watcher()
+        self.pay(q_old, 1, value=q_old["amount"] - 1)
+        out = self.report(q_old, 1)
+        self.assertEqual(out[0][1], "reject")
+        self.assertTrue(out[0][2].startswith("no_matching_payment"))
+        self.assertEqual(self.w.state["needs_seller"], {})
+
+    def test_admit_of_an_unknown_quote_does_nothing(self):
+        q = self.quote()
+        with mock.patch.object(W.sys, "stdout", io.StringIO()):
+            W.main(["admit", "--state", str(self.w.state_path), "--quote", q["id"]])
+        err = io.StringIO()
+        with mock.patch.object(W.sys, "stderr", err):
+            self.assertEqual(self.w.poll_spool(), [])
+        self.assertIn("no paid quote is waiting", err.getvalue())
+        self.assertEqual(self.admitted(), [])
+        with self.assertRaises(SystemExit):
+            W.main(["admit", "--state", str(self.w.state_path), "--quote", "../x"])
+
+    def test_desk_with_the_quote_key_still_cant_admit_alone(self):
+        q = self.quote(hours=1)
+        cheap = self.tamper(q, price_per_hour=1, hours=999, amount=1_000)
+        self.pay(cheap, 1)
+        self.assertEqual(self.report(cheap, 1)[0][1], "hold")
+        self.assertEqual(self.admitted(), [])
+
+    def test_listing_history_is_short(self):
+        for i in range(W.LISTING_HISTORY + 4):
+            self.clock.t += 60
+            self.s.relist(f"1.{10 + i}")
+            self.w.poll_spool()
+        self.assertEqual(len(self.w.state["listings"]), W.LISTING_HISTORY + 1)
+
+    def test_broken_listing_logged_once_per_few_minutes(self):
+        self.s.listing_path.write_text("{")
+        err = io.StringIO()
+        with mock.patch.object(W.sys, "stderr", err):
+            for _ in range(20):
+                self.w.poll_spool()
+                self.clock.t += 10
+            self.assertEqual(err.getvalue().count("can't use the listing yet"), 1)
+            self.clock.t += W.LISTING_LOG_S
+            self.w.poll_spool()
+            self.assertEqual(err.getvalue().count("can't use the listing yet"), 2)
+            self.s.listing_path.write_text("[]")      # a different problem is logged at once
+            self.w.poll_spool()
+            self.assertEqual(err.getvalue().count("can't use the listing yet"), 3)
 
     def test_missing_or_bad_listing_waits_instead_of_rejecting(self):
         q = self.quote()

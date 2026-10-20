@@ -178,6 +178,17 @@ watcher's admission key, its RPC settings or its record of used payments. The wa
 take the desk's word for a quote either: it reads the signed listing itself and checks every
 quote's payout address, chain, token, price and hours against it before it looks at the chain.
 
+To change the price or max hours, re-run `seller/install.sh` with the new
+`--price-per-hour-usdc` or `--max-hours`. Don't edit `listing.json` by hand. The installer
+keeps the last few listings, with the time each was replaced, in `listing/previous.json`, so
+quotes made just before the change still count. If a paid quote matches no listing the
+watcher knows (say the price was changed some other way), the buyer is not refused: the
+payment is checked on chain, the buyer sees "the seller has to confirm it", and the
+watcher's log names the quote. `srnet-seller held` lists those quotes and
+`srnet-seller admit <quote id>` admits one after the watcher checks the payment again. A
+quote that pays another address, uses another token or isn't signed by the quote key is
+still refused.
+
 Limits per connection and overall (requests a minute, quotes an hour, open quotes, 3
 transaction hashes per quote, 10 second socket timeouts) keep one requester from wearing the
 desk down. Open quotes are counted per buyer key and per connection, never by the `.sesh`

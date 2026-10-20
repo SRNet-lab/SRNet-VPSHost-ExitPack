@@ -339,6 +339,16 @@ class Pay(Flow):
         self.assertIn("can't read the chain", out["message"])
         self.assertIn("Don't pay again", out["message"])
 
+    def test_seller_has_to_confirm_by_hand_is_explained_at_once(self):
+        from unittest import mock
+        rec = self.buy()
+        tx = self.pay_quote(rec)
+        with mock.patch.object(self.buyer, "status", return_value={"status": "waiting", "note": "needs_seller"}):
+            out = self.buyer.watch(rec, tx=tx, poll_s=5)
+        self.assertEqual((out["status"], out["note"]), ("waiting", "needs_seller"))
+        self.assertIn("confirm it by hand", out["message"])
+        self.assertIn("Don't pay again", out["message"])
+
 
 class Renew(Flow):
     def test_buy_again_extends_the_lease(self):

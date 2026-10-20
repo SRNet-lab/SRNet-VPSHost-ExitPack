@@ -306,6 +306,50 @@ def refresh(key: Ed25519PrivateKey, path: str | Path) -> dict:
     return doc
 
 
+HISTORY_KEEP = 5   # earlier listings kept in previous.json
+
+
+def _offer(body: dict) -> tuple:
+    return (body.get("seller"), str(body.get("payout", "")).lower(), tuple(sorted(body.get("chains") or [])),
+            body.get("price_per_hour_usdc"), body.get("max_hours"), body.get("quote_key"))
+
+
+def retire(path: str | Path, history: str | Path | None = None, now: int | None = None) -> bool:
+    """Record the listing at `path` in previous.json (next to it unless `history` is given),
+    with the time it is being replaced, before a new listing goes in its place. The watcher
+    reads this, so a quote made under the old price or max hours still counts. Keeps the
+    newest HISTORY_KEEP different offers. Returns False if there was no valid listing to keep.
+
+    previous.json: {"v": 1, "history": [{"replaced_at": unix time, "doc": signed listing}, ...]}
+    The time is stored in the file on purpose: a copied or restored file keeps it."""
+    path = Path(path)
+    hist_path = Path(history) if history else path.with_name("previous.json")
+    now = int(time.time()) if now is None else int(now)
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(doc, dict) or not verify(doc):
+        return False
+    try:
+        old = json.loads(hist_path.read_text())
+        items = old.get("history") if isinstance(old, dict) else None
+        items = [h for h in items if isinstance(h, dict) and isinstance(h.get("doc"), dict)
+                 and isinstance(h.get("replaced_at"), int) and verify(h["doc"])] if isinstance(items, list) else []
+    except (OSError, ValueError):
+        items = []
+    offer = _offer(doc["listing"])
+    items = [h for h in items if _offer(h["doc"]["listing"]) != offer]
+    items.append({"replaced_at": now, "doc": doc})
+    items = items[-HISTORY_KEEP:]
+    fd, tmp = tempfile.mkstemp(dir=hist_path.parent, prefix=".previous-")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps({"v": 1, "history": items}, indent=1) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, hist_path)
+    return True
+
+
 def submit(doc: dict, url: str) -> str:
     """POST the listing to a board. .sesh hosts are resolved via the local router (seshdns)."""
     if not url.startswith(("http://", "https://")):
@@ -337,6 +381,11 @@ def main(argv=None) -> int:
     m.add_argument("--dns", default="", help="exit resolver address buyers use through the tunnel, e.g. 10.195.0.53")
     m.add_argument("--speed-cap-mbps", type=int, default=None, help="per-buyer cap, Mbit/s; 0 = unlimited")
     m.add_argument("--exit-version", default=None, help="default: the pack VERSION file")
+    m.add_argument("--replace", metavar="LISTING", help="write the new listing to this file instead of stdout, "
+                   "keeping the old one in previous.json next to it (default: print it)")
+    t = sub.add_parser("retire", help="keep the current listing in previous.json before replacing it")
+    t.add_argument("--listing", required=True)
+    t.add_argument("--history", help="default: previous.json next to the listing")
     v = sub.add_parser("verify")
     v.add_argument("file")
     r = sub.add_parser("refresh")
@@ -390,7 +439,21 @@ def main(argv=None) -> int:
         why = listing_error(doc["listing"], a.testnets)
         if why and not (a.draft and why == "bad or zero payout"):
             ap.error(why)
+        if a.replace:
+            dest = Path(a.replace)
+            if dest.exists():
+                retire(dest)
+            fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".listing-")
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(doc, indent=1) + "\n")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dest)
+            print(f"wrote {dest}")
+            return 0
         print(json.dumps(doc, indent=1))
+        return 0
+    if a.cmd == "retire":
+        print("kept the old listing in previous.json" if retire(a.listing, a.history) else "no valid listing to keep")
         return 0
     ok = verify(json.loads(Path(a.file).read_text()))
     print("valid" if ok else "INVALID")

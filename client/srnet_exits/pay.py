@@ -292,6 +292,10 @@ class Buyer:
                 out = {"status": "waiting"}
             if out.get("status") in ("admitted", "rejected", "expired"):
                 return out
+            if out.get("note") == "needs_seller":
+                return {"status": "waiting", "note": "needs_seller", "message":
+                        "your payment arrived, but the seller has to confirm it by hand (the quote's price "
+                        "is not one their exit knows any more). Don't pay again; check later with `srnet paid`"}
             if self.clock() > confirm_by:
                 msg = "the seller has not confirmed yet; check again with `srnet paid` in a few minutes"
                 if out.get("note") == "chain_unavailable":

@@ -87,10 +87,18 @@ srnet-seller status
 srnet-seller health     # binary, keys, firewall, NAT, DNS drop, exit resolver, listing age
 srnet-seller listing
 srnet-seller logs
+srnet-seller held       # paid quotes waiting for you (their price matches no listing)
+srnet-seller admit <quote id>
 ```
 
 Payments land in your payout wallet directly; there is nothing to claim. Each admitted
 payment is logged by the watcher (`journalctl -u srnet-seller-watcher`).
+
+To change the price, re-run the installer with the new `--price-per-hour-usdc` (and the
+other flags you used). Don't edit `listing.json` by hand: the installer keeps the old
+listing in `listing/previous.json` so quotes made just before the change still count. If a
+paid quote ever matches no listing, the watcher holds it, logs the quote id, and waits for
+`srnet-seller admit <quote id>`.
 
 ## Uninstall
 

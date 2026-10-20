@@ -410,15 +410,18 @@ install -m 755 "$0" "$P/pack/install.sh"
 [ -f "$HERE/build-session-router.sh" ] && install -m 755 "$HERE/build-session-router.sh" "$P/pack/"
 cat > "$R/usr/local/sbin/srnet-seller" <<SH
 #!/bin/sh
-# srnet-seller status|health|listing|logs|uninstall [--purge]
+# srnet-seller status|health|listing|logs|held|admit <quote id>|uninstall [--purge]
 set -e
 case "\${1:-status}" in
   status) systemctl --no-pager status srnet-seller-exit srnet-seller-watcher srnet-seller-nat || true;;
   health) exec $PREFIX/pack/install.sh --health;;
   listing) exec cat $PREFIX/listing/listing.json;;
   logs) exec journalctl -u srnet-seller-exit -u srnet-seller-watcher -n 200 --no-pager;;
+  held) exec runuser -u $WATCH_USER -- python3 $PREFIX/pack/watcher.py held --state $PREFIX/watch/watcher-state.json;;
+  admit) [ -n "\${2:-}" ] || { echo "usage: srnet-seller admit <quote id>" >&2; exit 2; }
+    exec runuser -u $WATCH_USER -- python3 $PREFIX/pack/watcher.py admit --state $PREFIX/watch/watcher-state.json --quote "\$2";;
   uninstall) shift; exec $PREFIX/pack/install.sh --uninstall "\$@";;
-  *) echo "usage: srnet-seller status|health|listing|logs|uninstall [--purge]" >&2; exit 2;;
+  *) echo "usage: srnet-seller status|health|listing|logs|held|admit <quote id>|uninstall [--purge]" >&2; exit 2;;
 esac
 SH
 chmod 755 "$R/usr/local/sbin/srnet-seller"
@@ -584,8 +587,9 @@ python3 "$P/pack/listing.py" make --identity "$P/config/exit.key" --price-per-ho
   $CHAIN_ARGS $TESTNET_FLAG --quote-key-file "$P/config/quote.key" \
   --country "$COUNTRY" --region "$REGION" --speed-cap-mbps "$SPEED_CAP" --policy tcp/443 --policy tcp/80 --claim-url "http://$CLAIM_SESH/claim" \
   ${DNS_ADV:+--dns "$DNS_ADV"} > "$P/listing/listing.json.new"
-# Keep the listing this one replaces: the watcher still honours quotes made under it.
-[ -f "$P/listing/listing.json" ] && cp "$P/listing/listing.json" "$P/listing/previous.json" && chmod 644 "$P/listing/previous.json"
+# Keep the listing being replaced (with the time, stored in the file) so the watcher still
+# honours quotes made under the old price or max hours.
+[ -f "$P/listing/listing.json" ] && python3 "$P/pack/listing.py" retire --listing "$P/listing/listing.json" >/dev/null
 mv "$P/listing/listing.json.new" "$P/listing/listing.json"
 chmod 644 "$P/listing/listing.json"
 ln -sfn ../listing/listing.json "$P/config/listing.json"
