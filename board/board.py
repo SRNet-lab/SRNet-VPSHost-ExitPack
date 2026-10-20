@@ -71,7 +71,9 @@ def check_listing(body: dict, st: dict | None = None, now: float | None = None) 
     why = L.listing_error(body, testnets=bool((st or {}).get("testnets")))
     if why == L.NEEDS_UPDATE and st is not None:
         now = time.time() if now is None else now
-        return None if now < legacy_until(st, now) else "old v2 listing, grace period over"
+        if now >= legacy_until(st, now):
+            return "old v2 listing, grace period over"
+        return L.old_listing_error(body)
     return why
 
 

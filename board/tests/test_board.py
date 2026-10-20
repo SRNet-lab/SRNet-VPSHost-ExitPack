@@ -42,13 +42,14 @@ def listing(keypath, price="1.00", payout="0x" + "aa" * 20, **extra):
                   policy=["tcp/443"], **extra)
 
 
-def legacy_v2(keypath, issued=None):
+def legacy_v2(keypath, issued=None, **extra):
     """An old contract-era listing."""
     key = L.load_identity(keypath)
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     body = {"v": 2, "seller": L.sesh_of(pub), "issued": int(time.time() if issued is None else issued),
             "price_per_hour_usdc": "1.00", "max_hours": 168, "payout": "0x" + "aa" * 20,
             "vendor_id": "0x" + "bb" * 32, "chainid": 42161, "contract": "0x" + "7e" * 20, "policy": ["tcp/443"]}
+    body.update(extra)
     return {"listing": body, "sig": key.sign(L.canonical(body)).hex()}
 
 
@@ -113,7 +114,8 @@ class AdminFlowTest(Base):
                  ({"claim_url": "http://example.com/claim"}, "bad claim_url"),
                  ({"payout": "0x" + "00" * 20}, "bad or zero payout"),
                  ({"payout": "0xnope"}, "bad or zero payout"),
-                 ({"price_per_hour_usdc": "0"}, "bad price_per_hour_usdc"),
+                 ({"price_per_hour_usdc": "0"}, "price_per_hour_usdc must be at least 0.01"),
+                 ({"price_per_hour_usdc": "0.005"}, "price_per_hour_usdc must be at least 0.01"),
                  ({"max_hours": 0}, "bad max_hours")]
         for i, (over, why) in enumerate(cases):
             body = {"price_per_hour_usdc": "1.00", "max_hours": 168, "payout": "0x" + "aa" * 20,
@@ -500,6 +502,18 @@ class LegacyListingTest(Base):
         self.assertEqual(res, "rejected:old v2 listing, grace period over")
         st["sellers"][self.s1]["doc"] = legacy_v2(self.s1key, late)
         self.assertEqual(admin.build_body(st, late + 1, 24)["listings"], [])
+
+    def test_v2_fields_still_checked_during_grace(self):
+        t0 = time.time()
+        st = admin._load(self.state)
+        for bad, why in ((dict(country="usa"), "bad country"), (dict(region="x" * 65), "bad region"),
+                         (dict(dns="8.8.8.8"), "bad dns"), (dict(speed_cap_mbps="fast"), "bad speed_cap_mbps"),
+                         (dict(exit_version="<script>"), "bad exit_version"), (dict(policy=["x" * 40]), "bad policy"),
+                         (dict(price_per_hour_usdc="free"), "bad price_per_hour_usdc"),
+                         (dict(max_hours=0), "bad max_hours")):
+            self.assertEqual(admin.submit_doc(self.state, st, legacy_v2(self.s1key, t0, **bad), now=t0),
+                             f"rejected:{why}", bad)
+        self.assertEqual(admin.submit_doc(self.state, st, legacy_v2(self.s1key, t0, country="DE"), now=t0), "live")
 
     def test_v2_flagged_needs_update(self):
         self.assertEqual(L.listing_error(legacy_v2(self.s1key)["listing"]), L.NEEDS_UPDATE)

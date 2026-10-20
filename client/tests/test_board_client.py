@@ -195,6 +195,16 @@ class BoardClientTest(unittest.TestCase):
         self.assertNotIn(self.s2[:12], out)
         self.assertIn(self.s1[:12], out)
 
+    def test_malformed_old_listing_is_not_shown(self):
+        now = time.time()
+        good = old_listing_at(self.s2key, now)
+        bad = json.loads(json.dumps(good["listing"]))
+        bad["region"] = "x" * 500
+        with mock.patch.object(cb, "OLD_LISTINGS_SHOWN_UNTIL", now + 86400):
+            rows = cb.rows([{"listing": bad, "sig": ""}, good], now)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["region"], "eu")
+
     def test_board_fetch_uses_the_client_sesh_dns(self):
         seen = []
         with mock.patch.object(cb, "fetch", lambda *a, **k: seen.append(k.get("dns")) or ([], {

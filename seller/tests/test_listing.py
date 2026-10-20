@@ -241,6 +241,13 @@ class V3Fields(unittest.TestCase):
         nq = dict(b); del nq["quote_key"]
         self.assertEqual(L.listing_error(nq), "missing quote_key")
 
+    def test_min_price_one_cent(self):
+        b = self.make()
+        self.assertIsNone(L.listing_error({**b, "price_per_hour_usdc": "0.01"}))
+        for p in ("0.009999", "0.000001", "0"):
+            self.assertEqual(L.listing_error({**b, "price_per_hour_usdc": p}), "price_per_hour_usdc must be at least 0.01")
+        self.assertEqual(L.listing_error({**b, "price_per_hour_usdc": "1.0000001"}), "bad price_per_hour_usdc")
+
     def test_refresh_refuses_v2(self):
         d = Path(tempfile.mkdtemp())
         key = L.load_identity(self.f)

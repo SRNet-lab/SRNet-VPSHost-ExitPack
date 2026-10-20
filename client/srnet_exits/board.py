@@ -114,7 +114,7 @@ def rows(listings: list[dict], now: float, testnets: bool = False) -> list[dict]
     for d in sorted(listings, key=lambda d: d["listing"]["seller"]):
         b = d["listing"]
         st = state_of(d, testnets)
-        if st == LST.NEEDS_UPDATE and now >= OLD_LISTINGS_SHOWN_UNTIL:
+        if st == LST.NEEDS_UPDATE and (now >= OLD_LISTINGS_SHOWN_UNTIL or LST.old_listing_error(b)):
             continue
         out.append({"seller": b["seller"], "region": b.get("region") or "", "country": LST.country_text(b),
                     "price": str(b.get("price_per_hour_usdc", "")), "max_hours": b.get("max_hours"),

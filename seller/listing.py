@@ -49,6 +49,7 @@ import re
 import sys
 import tempfile
 import time
+from decimal import Decimal
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -79,6 +80,7 @@ ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 PRICE_RE = re.compile(r"^[0-9]{1,6}(\.[0-9]{1,6})?$")
 LISTING_VERSION = 3
+MIN_PRICE_UNITS = 10_000      # 0.01 USDC per hour
 NEEDS_UPDATE = "seller needs to update"
 
 
@@ -117,10 +119,17 @@ def listing_error(body, testnets: bool = False) -> str | None:
     if not (isinstance(body["claim_url"], str) and CLAIM_URL_RE.match(body["claim_url"])):
         return "bad claim_url"
     pr, mh = body["price_per_hour_usdc"], body["max_hours"]
-    if not (isinstance(pr, str) and PRICE_RE.match(pr) and float(pr) > 0):
+    if not (isinstance(pr, str) and PRICE_RE.match(pr)):
         return "bad price_per_hour_usdc"
+    if int(Decimal(pr) * C.USDC_UNIT) < MIN_PRICE_UNITS:
+        return "price_per_hour_usdc must be at least 0.01"
     if not (_int(mh) and 1 <= mh <= 999):
         return "bad max_hours"
+    return display_error(body)
+
+
+def display_error(body: dict) -> str | None:
+    """Checks on the fields a board shows (any listing version, old ones included)."""
     if "exit_version" in body and not (isinstance(body["exit_version"], str)
                                        and EXIT_VERSION_RE.match(body["exit_version"])):
         return "bad exit_version"
@@ -136,6 +145,20 @@ def listing_error(body, testnets: bool = False) -> str | None:
                                  and all(isinstance(p, str) and len(p) <= 32 for p in body["policy"])):
         return "bad policy"
     return None
+
+
+def old_listing_error(body: dict) -> str | None:
+    """Old (v1/v2) listings kept on a board during the update grace: shape of what is shown."""
+    for f in ("seller", "issued"):
+        if f not in body:
+            return f"missing {f}"
+    if body.get("v") == 2:
+        pr, mh = body.get("price_per_hour_usdc"), body.get("max_hours")
+        if not (isinstance(pr, str) and PRICE_RE.match(pr)):
+            return "bad price_per_hour_usdc"
+        if not (_int(mh) and 1 <= mh <= 999):
+            return "bad max_hours"
+    return display_error(body)
 
 
 def valid_dns(v) -> bool:
