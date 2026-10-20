@@ -27,7 +27,7 @@ echo "== building test image (network only for package download)"
 $C build --network host -q -t "$IMG" "$CTX" >/dev/null
 
 echo "== phase A: dry-run tests + cloud-init schema"
-$C run --rm --network none -v "$ROOT:/src:ro" "$IMG" bash -ec '
+$C run --rm --network none --cap-add NET_ADMIN -v "$ROOT:/src:ro" "$IMG" bash -ec '
 cp -a /src /w && cd /w
 P=$( [ -d seller ] && echo seller || echo seller-pack )
 find . -name __pycache__ -prune -exec rm -rf {} +

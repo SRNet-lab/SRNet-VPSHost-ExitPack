@@ -482,7 +482,8 @@ class WatcherTest(unittest.TestCase):
 
     def test_admit_refuses_another_user_and_survives_a_stuck_request(self):
         q = self.hold_one()
-        with mock.patch.object(W.os, "geteuid", return_value=0), self.assertRaises(SystemExit) as e:
+        other = self.w.state_path.parent.stat().st_uid + 1     # say root, when the files are srnet-watch's
+        with mock.patch.object(W.os, "geteuid", return_value=other), self.assertRaises(SystemExit) as e:
             W.main(["admit", "--state", str(self.w.state_path), "--quote", q["id"]])
         self.assertIn("watcher's user", str(e.exception))
         self.assertFalse((self.w.admit_dir / q["id"]).exists())

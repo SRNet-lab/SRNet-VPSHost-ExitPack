@@ -142,7 +142,8 @@ grep -q 'dport 53 drop' "$T/r4/commands.log" || fail "no DNS drop"
 grep -q '169.254.0.0/16' "$T/r4/commands.log" || fail "metadata range not blocked"
 grep -q 'masquerade' "$T/r4/commands.log" || fail "no NAT"
 grep -qE 'chain (fwd|in|nat) ' "$T/r4/$U/config/nat.nft" && fail "nft chain name is a reserved word"
-if command -v nft >/dev/null && [ "$(id -u)" = 0 ]; then nft -c -f "$T/r4/$U/config/nat.nft" >/dev/null || fail "nat.nft does not parse"; fi
+# nft -c still needs netlink (CAP_NET_ADMIN); skip where that is not allowed (unprivileged container)
+if command -v nft >/dev/null && [ "$(id -u)" = 0 ] && nft list tables >/dev/null 2>&1; then nft -c -f "$T/r4/$U/config/nat.nft" >/dev/null || fail "nat.nft does not parse"; fi
 grep -q 'route allow in on sr-tun-seller out on eth0 proto tcp to any port 80,443' "$T/r4/commands.log" || fail "no fwd rule"
 grep -q 'net.ipv4.ip_forward=1' "$T/r4/etc/sysctl.d/90-srnet-seller.conf" || fail "sysctl"
 grep -q 'enable --now srnet-seller-watcher' "$T/r4/commands.log" || fail "watcher not enabled with payout"
@@ -180,7 +181,8 @@ grep -q '10.195.0.53' "$T/r4n/$U/config/nat.nft" && fail "--no-dns: nft dns rule
 python3 -c "import json,sys;assert 'dns' not in json.load(open(sys.argv[1]))['listing']" "$T/r4n/$U/listing/listing.json" || fail "--no-dns: listing dns"
 [ -f "$T/r2/etc/unbound/srnet-seller-dns.conf" ] && fail "exit off: resolver config written"
 python3 -c "import json,sys;assert 'dns' not in json.load(open(sys.argv[1]))['listing']" "$T/r2/$U/listing/listing.json" || fail "exit off: listing dns"
-if command -v nft >/dev/null && [ "$(id -u)" = 0 ]; then nft -c -f "$N" >/dev/null || fail "nat.nft with dns does not parse"; fi
+# nft -c still needs netlink (CAP_NET_ADMIN); skip where that is not allowed (unprivileged container)
+if command -v nft >/dev/null && [ "$(id -u)" = 0 ] && nft list tables >/dev/null 2>&1; then nft -c -f "$N" >/dev/null || fail "nat.nft with dns does not parse"; fi
 ok
 # 8b. per-buyer speed cap: default 10 Mbit/s each way (1250 kB/s) in nat.nft and the listing; 0 = none
 N4="$T/r4/$U/config/nat.nft"
