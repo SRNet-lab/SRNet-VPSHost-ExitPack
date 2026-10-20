@@ -39,6 +39,7 @@ class _Base(unittest.TestCase):
     def run_cli(self, home, *extra):
         cli = self.cli
         self.dns_calls = getattr(self, "dns_calls", [])
+        self.inbound_calls = getattr(self, "inbound_calls", [])
         if getattr(self, "dns_cur", None) is None:
             self.dns_cur = dict(self.STOCK)
 
@@ -61,7 +62,9 @@ class _Base(unittest.TestCase):
              mock.patch.object(cli, "load_listings", getattr(self, "board", lambda *a, **k: [])), \
              mock.patch.object(cli, "_rpc", FakeRpc), \
              mock.patch.object(cli.reminder, "start", lambda *a: None), \
-             mock.patch.object(cli, "guess_wan", lambda: "eth0"), \
+             mock.patch.object(cli, "guess_wan", lambda *a: "eth0"), \
+             mock.patch.object(cli.inbound, "up", lambda wan: self.inbound_calls.append(("up", wan))), \
+             mock.patch.object(cli.inbound, "down", lambda: self.inbound_calls.append(("down",))), \
              mock.patch.object(cli, "own_sesh", lambda: ME):
             return cli.main(["--home", str(home), *extra])
 
@@ -123,6 +126,7 @@ class Connect(_Base):
                 return {"result": []}
         home = self.home()
         with mock.patch.object(self.cli, "_rpc", NotCapable), \
+                mock.patch.object(self.cli.inbound, "up", lambda wan: None), \
                 mock.patch("srnet_exits.backend.LiveBackend.wait_capable", lambda *a: False), \
                 mock.patch("sys.stdout", _io.StringIO()):
             rc = self.cli.main(["--home", str(home), "connect", SELLER, "--no-killswitch", "--system-dns"])
@@ -137,6 +141,46 @@ class Connect(_Base):
         self.assertIn("sudo apt install nftables", err.getvalue())
         self.assertIn("--no-killswitch", err.getvalue())
         self.assertEqual(FakeRpc.calls, [], "nothing is mapped when the kill switch cannot be armed")
+
+
+class InboundSessions(_Base):
+    """connect must not cut SSH/RDP sessions to this machine's own public IP."""
+
+    def test_inbound_routing_goes_up_before_the_tunnel_and_down_at_disconnect(self):
+        home = self.home()
+        seen = []
+        orig_map = FakeRpc.map_exit
+
+        def map_exit(rpc, seller, full_tunnel=True):
+            seen.append(list(self.inbound_calls))
+            return orig_map(rpc, seller, full_tunnel)
+        with mock.patch.object(FakeRpc, "map_exit", map_exit), mock.patch("sys.stdout", _io.StringIO()):
+            self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch", "--system-dns"), 0)
+        self.assertEqual(seen, [[("up", "eth0")]], "inbound routing must be in place before map_exit")
+        with mock.patch("sys.stdout", _io.StringIO()):
+            self.assertEqual(self.run_cli(home, "disconnect"), 0)
+        self.assertEqual(self.inbound_calls[-1], ("down",))
+
+    def test_connect_refuses_when_inbound_routing_fails(self):
+        home = self.home()
+        err = _io.StringIO()
+
+        def boom(wan):
+            raise self.cli.inbound.InboundError("no default route on eth0")
+        with mock.patch.object(self.cli.inbound, "up", boom), mock.patch("sys.stderr", err), \
+                mock.patch("sys.stdout", _io.StringIO()), \
+                mock.patch.object(self.cli, "_rpc", FakeRpc), mock.patch.object(self.cli, "guess_wan", lambda *a: "eth0"):
+            rc = self.cli.main(["--home", str(home), "connect", SELLER, "--no-killswitch", "--system-dns"])
+        self.assertEqual(rc, 1)
+        self.assertIn("cut your SSH/RDP session", err.getvalue())
+        self.assertEqual(FakeRpc.calls, [], "nothing is mapped")
+
+    def test_guess_wan_skips_the_tunnel(self):
+        outs = {"show": "default dev sr-tun0 scope link\ndefault via 10.0.0.1 dev ens3 proto dhcp\n",
+                "get": "1.1.1.1 dev sr-tun0 src 172.16.0.1\n"}
+        with mock.patch.object(self.cli.subprocess, "check_output",
+                               lambda cmd, **k: outs["show" if "show" in cmd else "get"]):
+            self.assertEqual(self.cli.guess_wan("sr-tun0"), "ens3")
 
 
 class TunnelDNS(_Base):
@@ -206,7 +250,8 @@ class TunnelDNS(_Base):
                 mock.patch.object(self.cli.killswitch, "find_nft", lambda: "/usr/sbin/nft"):
             self.run_cli(home, "status")
         j = json.loads(out.getvalue())
-        self.assertEqual(j["killswitch"], "unknown (needs sudo to check)")
+        self.assertTrue(j["killswitch"].startswith("unknown (checking needs root"))
+        self.assertNotIn("sudo srnet", j["killswitch"])
         self.assertIn("through the exit", j["dns"])
         self.assertEqual(j["leases"][0]["seller"], SELLER)
 

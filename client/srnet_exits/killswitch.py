@@ -1,7 +1,8 @@
 """nftables kill switch: block clearnet egress except the overlay UDP + tunnel.
 
-When armed, only traffic via the TUN (exit path) and UDP on the WAN interface
-(needed by the overlay) is allowed out. That UDP allow is broad: QUIC/WebRTC
+When armed, only traffic via the TUN (exit path), UDP on the WAN interface
+(needed by the overlay) and replies to connections that came in on the WAN (SSH/RDP to this
+machine, see inbound.py) are allowed out. That UDP allow is broad: QUIC/WebRTC
 traffic can still reach the internet directly. Explicitly drops DNS (udp/tcp 53) on every path
 except the TUN so a blanket UDP allow for the overlay cannot leak queries to
 the ISP resolver. Uses the inet family so IPv4 and IPv6
@@ -20,7 +21,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from . import priv
+from . import inbound, priv
 
 DEFAULT_TUN = "sr-tun0"  # the interface Session Router creates (ip link: sr-tun0)
 
@@ -104,7 +105,11 @@ class KillSwitch:
             f"add table {self.table} {self.name}",
             f"add chain {self.table} {self.name} output {{ type filter hook output priority 0; policy drop; }}",
             f'add rule {self.table} {self.name} output oifname "lo" accept',
-            f"add rule {self.table} {self.name} output ct state established,related accept",
+            # replies on connections that were started from outside on the WAN (SSH/RDP to this
+            # machine's own IP); inbound.py marks them and routes them back out the WAN. Connections
+            # this machine starts itself never carry the mark, so they cannot use this rule.
+            f'add rule {self.table} {self.name} output oifname "{wan_if}" ct mark {inbound.MARK:#x} '
+            f"ct state established,related accept",
             f'add rule {self.table} {self.name} output oifname "{self.tun}" accept',
             f"add rule {self.table} {self.name} output udp dport 53 drop",
             f"add rule {self.table} {self.name} output tcp dport 53 drop",

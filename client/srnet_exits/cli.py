@@ -24,7 +24,7 @@ from pathlib import Path
 
 import chains as C  # noqa: E402
 
-from . import board as boardmod, config, listings, killswitch, pay, reminder, tunneldns, warning
+from . import board as boardmod, config, inbound, listings, killswitch, pay, reminder, tunneldns, warning
 from .backend import LiveBackend
 
 
@@ -65,7 +65,8 @@ def _left(sec: int) -> str:
 
 
 def _hhmm(t: int) -> str:
-    return time.strftime("%H:%M", time.localtime(t))
+    """This machine's local time with its zone (say 14:33 CDT), never bare UTC."""
+    return time.strftime("%H:%M %Z", time.localtime(t)).strip()
 
 
 def qr_text(data: str) -> str:
@@ -146,8 +147,9 @@ def _finish(b: pay.Buyer, rec: dict, out: dict, st) -> int:
     if s == "admitted":
         lease = pay.active_lease(st, rec["seller"]) or {}
         end = int(lease.get("end") or out.get("lease_end") or 0)
-        print(f"paid: exit time with this seller runs until {_hhmm(end)} ({_left(end - time.time())} from now)")
+        print(f"paid: the seller confirmed your exit time ({_left(end - time.time())})")
         print(f"connect: srnet connect {rec['seller']}")
+        print(f"You're in: exit time until {_hhmm(end)}")
         try:
             reminder.start(st.root, rec["seller"])
         except OSError:
@@ -247,7 +249,18 @@ def cmd_connect(args, st) -> int:
                 print(f"cannot read the resolver settings of {tun}: {e} (is Session Router running?)", file=sys.stderr)
                 return 1
     ks = killswitch.KillSwitch(tun=tun, overlay_udp_port=int(cfg.get("overlay_udp_port", 1090)))
-    wan = args.wan_if or cfg.get("wan_if") or guess_wan()
+    wan = args.wan_if or cfg.get("wan_if") or guess_wan(tun)
+    # first, while the main table still has only the WAN routes: replies to connections that come
+    # in on the WAN (SSH/RDP to this machine's public IP) keep going back out the WAN
+    try:
+        inbound.up(wan)
+        print(f"inbound sessions on {wan} (SSH, RDP, ...) keep working; everything this machine starts "
+              "goes through the exit")
+    except Exception as e:
+        print(f"could not keep inbound sessions on {wan} working: {e}", file=sys.stderr)
+        print("not connecting: on a remote machine this would cut your SSH/RDP session. "
+              "Pass --wan-if IFACE if the WAN interface is wrong.", file=sys.stderr)
+        return 1
     armed = False
     if args.no_killswitch:
         print("kill switch: OFF (--no-killswitch): if the tunnel drops, traffic goes out your normal connection")
@@ -261,6 +274,7 @@ def cmd_connect(args, st) -> int:
             if not args.allow_no_ks:
                 print("not connecting without the kill switch. Fix the above, or connect knowingly "
                       f"without it: srnet connect {args.seller} --no-killswitch", file=sys.stderr)
+                _inbound_down(quiet=True)
                 return 1
             print("continuing WITHOUT the kill switch (--allow-no-ks)", file=sys.stderr)
     b = LiveBackend(_rpc(args.rpc_endpoint or cfg.get("omq") or config.OMQ), st)
@@ -371,20 +385,35 @@ def dns_down(st, quiet: bool = False) -> bool:
     return ok
 
 
-def guess_wan() -> str:
+def _inbound_down(quiet: bool = False) -> None:
     try:
-        out = subprocess.check_output(["ip", "-o", "route", "get", "1.1.1.1"], text=True)
-        parts = out.split()
-        if "dev" in parts:
-            return parts[parts.index("dev") + 1]
-    except Exception:
-        pass
+        inbound.down()
+    except Exception as e:
+        if not quiet:
+            print(f"note: could not remove the inbound-session routing (harmless, gone at reboot): {e}",
+                  file=sys.stderr)
+
+
+def guess_wan(tun: str = killswitch.DEFAULT_TUN) -> str:
+    """The interface of the default route that is not the tunnel (also right while connected)."""
+    for cmd in (["ip", "-o", "route", "show", "default"], ["ip", "-o", "route", "get", "1.1.1.1"]):
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if "dev" in parts:
+                dev = parts[parts.index("dev") + 1]
+                if dev != tun:
+                    return dev
     return "eth0"
 
 
 def ks_word(v):
     if v is None:
-        return "unknown (needs sudo to check)" if killswitch.find_nft() else "unavailable (nftables not installed)"
+        return ("unknown (checking needs root; srnet connect/disconnect ask sudo themselves; to look: "
+                "sudo nft list table inet srnet_ks)" if killswitch.find_nft() else "unavailable (nftables not installed)")
     return "armed" if v else "off"
 
 
@@ -417,6 +446,13 @@ def status_info(st, cfg: dict, endpoint: str | None = None, rpc_probe: bool = Tr
             info["list_exits"] = _rpc(endpoint or cfg.get("omq") or config.OMQ).list_exits()
         except Exception as e:
             info["list_exits_error"] = str(e)
+        conn = info.get("connected") or {}
+        mapped = (info.get("list_exits") or {}).get("result")
+        if conn and isinstance(mapped, list) and not mapped:
+            # say after a reboot: the record is still here, the tunnel is not (nothing of it survives)
+            info["connected_note"] = (f"not actually connected: Session Router has no exit mapped (say after a "
+                                      f"reboot). Reconnect: srnet connect {conn.get('seller')}  or clear this "
+                                      "record: srnet disconnect")
     return info
 
 
@@ -455,6 +491,9 @@ def cmd_disconnect(args, st) -> int:
                 print(f"kill switch NOT removed: {e}", file=sys.stderr)
             else:
                 print(f"note: could not check for a leftover kill switch: {e}", file=sys.stderr)
+    # after the tunnel routes are gone: the WAN reply routing is not needed any more
+    if not args.keep_killswitch:
+        _inbound_down()
     st.data["connected"] = None
     st.save()
     out = {"ok": ks_ok, "unmapped": seller}

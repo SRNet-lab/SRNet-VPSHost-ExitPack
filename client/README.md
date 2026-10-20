@@ -89,7 +89,13 @@ tunnel (`.sesh` stays on Session Router). `disconnect` puts your DNS settings ba
 they were. It refuses exits that run no resolver unless you pass `--system-dns`, and refuses to
 run without the kill switch unless you pass `--no-killswitch`. As a normal user `nft` runs
 through sudo; the Exits tab can only connect if sudo needs no password, otherwise run
-`srnet connect` in a terminal.
+`srnet connect` in a terminal (as yourself, not `sudo srnet`).
+
+On a remote machine (a VPS you reach over SSH or RDP), connecting keeps those sessions working:
+connections that come in on your normal interface are marked, and their replies go back out that
+interface (an `ip rule` on a fwmark to a small table with your normal routes). Everything the
+machine starts itself, DNS included, still goes only through the tunnel. `disconnect` removes
+this again, and none of it (kill switch, routes, rules) survives a reboot.
 
 ## Tests
 

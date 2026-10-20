@@ -2,6 +2,7 @@
 the kill switch rules, and buying from an exit without its own resolver."""
 import io as _io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -76,6 +77,69 @@ class KillSwitch(unittest.TestCase):
         self.assertTrue(any('oifname "sr-tun0"' in s for s in scripts))
         ks.disarm()
         self.assertTrue(any("delete" in s for s in scripts))
+
+    def test_wan_lets_out_only_replies_to_inbound_connections(self):
+        from srnet_exits import inbound
+        ks = killswitch.KillSwitch(name="srnet_ks_test")
+        scripts = []
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+        ks._nft_f = lambda script, check=True: scripts.append(script) or R()
+        ks._nft = lambda *a, check=True: R()
+        ks.arm("eth0")
+        rules = [l for l in scripts[0].splitlines() if "established" in l]
+        self.assertEqual(len(rules), 1, rules)
+        self.assertIn('oifname "eth0"', rules[0])
+        self.assertIn(f"ct mark {inbound.MARK:#x}", rules[0])
+        # it comes before the DNS drop, the overlay UDP allow and the policy drop does the rest
+        lines = scripts[0].splitlines()
+        self.assertLess(lines.index(rules[0]), next(i for i, l in enumerate(lines) if "dport 53 drop" in l))
+
+
+class Inbound(unittest.TestCase):
+    def test_nft_script_marks_inbound_and_fwmarks_only_replies(self):
+        from srnet_exits import inbound
+        s = inbound.nft_script("enp1s0")
+        self.assertIn('pre iifname "enp1s0" ct direction original ct mark set 0x5352', s)
+        self.assertIn("type route hook output", s)
+        self.assertIn("ct mark 0x5352 ct direction reply meta mark set 0x5352", s)
+        self.assertNotIn("oifname", s)   # nothing that this machine starts gets the mark
+        with self.assertRaises(ValueError):
+            inbound.nft_script('eth0"; flush ruleset; "')
+
+    def test_route_cmds_copy_the_wan_routes_into_the_mark_table(self):
+        from srnet_exits import inbound
+        v4 = [{"dst": "default", "gateway": "45.77.216.1", "prefsrc": "45.77.217.74"},
+              {"dst": "45.77.216.0/23", "prefsrc": "45.77.217.74"},
+              {"dst": "1.2.3.4; reboot", "gateway": "x"}]
+        v6 = [{"dst": "default", "gateway": "fe80::1"}]
+        c = inbound.route_cmds("enp1s0", v4, v6)
+        self.assertIn("-4 route replace default via 45.77.216.1 dev enp1s0 src 45.77.217.74 table 5352", c)
+        self.assertIn("-4 route replace 45.77.216.0/23 dev enp1s0 src 45.77.217.74 table 5352", c)
+        self.assertIn("-6 route replace default via fe80::1 dev enp1s0 table 5352", c)
+        self.assertIn("-4 rule add fwmark 0x5352 lookup 5352 priority 5352", c)
+        self.assertIn("-6 rule add fwmark 0x5352 lookup 5352 priority 5352", c)
+        self.assertFalse(any("reboot" in x for x in c))
+        # old state is cleared first, so a second connect does not stack rules
+        self.assertLess(c.index("-4 rule del priority 5352"), c.index("-4 rule add fwmark 0x5352 lookup 5352 priority 5352"))
+
+    def test_up_refuses_without_a_wan_default_route(self):
+        from srnet_exits import inbound
+        from unittest import mock
+        with mock.patch.object(inbound, "_routes", lambda fam, wan: []):
+            with self.assertRaises(inbound.InboundError):
+                inbound.up("eth0")
+
+    @unittest.skipUnless(os.geteuid() == 0 and killswitch.find_nft(), "needs root and nft")
+    def test_scripts_parse(self):
+        import subprocess
+        from srnet_exits import inbound
+        if subprocess.run([killswitch.find_nft(), "list", "tables"], capture_output=True).returncode:
+            self.skipTest("nft cannot talk to netlink here")
+        r = subprocess.run([killswitch.find_nft(), "-c", "-f", "-"], input=inbound.nft_script("eth0"),
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 @unittest.skipUnless(helpers.HAVE_CORE, "srnet-client (the SRNet core) not found")

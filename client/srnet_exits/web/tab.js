@@ -132,7 +132,7 @@
       else if (r.state === "seen" || r.state === "confirming") say("Payment seen" + (r.tx ? " (" + r.tx.slice(0, 12) + "…)" : "") + ". Waiting for the seller to confirm…");
       else {
         clearInterval(polls[id]); delete polls[id];
-        if (r.state === "admitted") { say("Paid. Exit time runs until " + (r.lease_end ? hhmm(r.lease_end) : "?") + ". Press Connect above."); log("paid: quote " + id); }
+        if (r.state === "admitted") { say("You're in: exit time until " + (r.lease_end ? hhmm(r.lease_end) : "?") + ". Press Connect above."); log("paid: quote " + id); }
         else { say(r.message || ("Quote " + r.state)); log("quote " + id + ": " + (r.message || r.state)); }
         status();
       }

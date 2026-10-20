@@ -193,7 +193,7 @@ class EndToEnd(unittest.TestCase):
         self.chain.pay("0x" + "ab" * 32, q["payout"], q["amount"])
         rc, out, err = self.client("paid", "--quote", q["id"])
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("paid: exit time with this seller runs until", out)
+        self.assertIn("You're in: exit time until ", out)
         st = json.loads((self.home / "state.json").read_text())
         lease = st["exits"]["leases"][self.s.sesh]
         self.assertAlmostEqual(lease["end"] - time.time(), 2 * 3600, delta=300)
