@@ -283,14 +283,14 @@ class WatcherTest(unittest.TestCase):
             W.parse_rpcs(["8453"])
 
 
-    # ------------------------------------------------------------ R2-1: seller clock a bit fast
+    # ------------------------------------------------------------ seller clock a bit fast
     def test_payment_soon_after_a_fast_clocked_quote_counts(self):
         q = self.quote()
         self.pay(q, 1, when=q["issued"] - 200)    # seller clock 200 s fast, buyer paid at once
         self.assertEqual(self.report(q, 1)[0][1], "admit")
         self.assertEqual(Q.EARLY_SKEW_S, 300)
 
-    # ------------------------------------------------------------ R2-3: quote files are not trusted
+    # ------------------------------------------------------------ quote files are not trusted
     def tamper(self, q, **kw):
         """What a taken-over claim desk could do: rewrite a quote file and sign it with quote.key."""
         body = dict(q, **kw)
@@ -370,7 +370,7 @@ class WatcherTest(unittest.TestCase):
         self.pay(q_old, 1)
         self.assertEqual(self.report(q_old, 1)[0][1], "hold")   # no time in it: the seller decides
 
-    # ------------------------------------------------------------ R3-1: unknown old price
+    # ------------------------------------------------------------ unknown old price
     def test_price_changed_by_hand_holds_for_the_seller_then_admit(self):
         q_old = self.quote(hours=2)             # at 1.00
         self.s.relist("2.00")                   # by hand, no previous.json, watcher never saw 1.00

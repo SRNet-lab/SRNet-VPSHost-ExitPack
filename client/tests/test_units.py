@@ -421,11 +421,29 @@ class Inbound(unittest.TestCase):
                  {"priority": 5354, "fwmark": "0x2000000", "table": "5354"},
                  {"priority": 0, "table": "local"}]
         self.assertEqual(inbound.our_rules(rules, []), [("-4", 5353, "5353", "0x2000000/0x2000000")])
+        # same bit and mask, but not one of our slots: someone else's, never removed
+        foreign = [{"priority": 100, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "100"},
+                   {"priority": 5352, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "5353"},
+                   {"priority": 5368, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "5368"},
+                   {"priority": 5352, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "vpn"}]
+        self.assertEqual(inbound.our_rules(foreign, foreign), [])
         # the exact rule of earlier versions (connected before an update) is cleaned up, nothing near it
         legacy = [{"priority": 5352, "fwmark": "0x5352", "table": "5352"},
                   {"priority": 5352, "fwmark": "0x5352", "table": "100"},
                   {"priority": 5000, "fwmark": "0x5352", "table": "5352"}]
         self.assertEqual(inbound.our_rules([], legacy), [("-6", 5352, "5352", "0x5352")])
+
+    def test_rules_are_read_with_numeric_tables(self):
+        from srnet_exits import inbound
+        from unittest import mock
+        seen = []
+        with mock.patch.object(inbound, "_ipj", lambda *a: seen.append(a) or []), \
+                mock.patch.object(inbound.priv, "run", lambda *a, **k: type("R", (), {"returncode": 1})()), \
+                mock.patch("srnet_exits.killswitch.find_nft", lambda: None):
+            inbound.down()
+        rule_calls = [a for a in seen if "rule" in a]
+        self.assertTrue(rule_calls)
+        self.assertTrue(all(a[0] == "-N" for a in rule_calls), rule_calls)
 
     def test_down_removes_only_our_rule_and_restores_src_valid_mark(self):
         from srnet_exits import inbound
@@ -443,7 +461,7 @@ class Inbound(unittest.TestCase):
             calls.append((cmd, input))
             return R(0)
         with mock.patch.object(inbound.priv, "run", run), \
-                mock.patch.object(inbound, "_ipj", lambda fam, *a: rules[fam] if a[0] == "rule" else []), \
+                mock.patch.object(inbound, "_ipj", lambda *a: rules[a[1]] if a[:1] == ("-N",) and a[2] == "rule" else []), \
                 mock.patch("srnet_exits.killswitch.find_nft", lambda: "/usr/sbin/nft"):
             inbound.down()
         flat = [" ".join(c[0]) + " | " + (c[1] or "") for c in calls]

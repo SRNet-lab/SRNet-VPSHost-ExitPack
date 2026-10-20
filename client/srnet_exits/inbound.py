@@ -79,6 +79,7 @@ def nft_script(wan: str, svm_was_0: bool = False) -> str:
 
 
 def _ipj(*args: str) -> list[dict]:
+    """`ip -j ...` as JSON. Rule listings pass -N, so named tables (rt_tables) show as numbers."""
     try:
         out = subprocess.check_output(["ip", "-j", *args], text=True, stderr=subprocess.DEVNULL)
         return json.loads(out or "[]")
@@ -97,7 +98,11 @@ def _fwspec(rule: dict) -> str | None:
     """The fwmark argument to delete this rule with, if this module added it (else None)."""
     fw, mask = str(rule.get("fwmark", "")), str(rule.get("fwmask", ""))
     try:
-        if int(fw, 16) == MARK and mask and int(mask, 16) == MARK:
+        # ours: our bit and mask, at a priority equal to its table, inside our slot range. A rule
+        # someone else made with the same bit (say at priority 100, table 100) is left alone.
+        prio, table = int(rule.get("priority", -1)), str(rule.get("table", ""))
+        if (int(fw, 16) == MARK and mask and int(mask, 16) == MARK and table == str(prio)
+                and FIRST_SLOT <= prio < FIRST_SLOT + SLOTS):
             return f"{M}/{M}"
         # left by an earlier version (say connected before an update): exactly that rule only
         if (int(fw, 16) == LEGACY and (not mask or int(mask, 16) == 0xFFFFFFFF)
@@ -194,7 +199,7 @@ def up(wan: str) -> None:
     if not nft:
         raise InboundError("nftables is not installed (no `nft` command). Install it: sudo apt install nftables")
     down()  # leftovers of an earlier connect (only ours)
-    slot = pick_slot(_ipj("-4", "rule", "show"), _ipj("-6", "rule", "show"), _table_used)
+    slot = pick_slot(_ipj("-N", "-4", "rule", "show"), _ipj("-N", "-6", "rule", "show"), _table_used)
     if slot is None:
         raise InboundError(f"ip rule priorities / routing tables {FIRST_SLOT}-{FIRST_SLOT + SLOTS - 1} are all "
                            "in use by other software; free one of them (ip rule; ip route show table N)")
@@ -223,7 +228,7 @@ def down() -> None:
             priv.run(["sysctl", "-qw", "net.ipv4.conf.all.src_valid_mark=0"], check=False, what=WHAT)
         priv.run([nft, "delete", "table", "inet", NFT_TABLE], check=False, what=WHAT)
     lines = []
-    for fam, prio, table, fw in our_rules(_ipj("-4", "rule", "show"), _ipj("-6", "rule", "show")):
+    for fam, prio, table, fw in our_rules(_ipj("-N", "-4", "rule", "show"), _ipj("-N", "-6", "rule", "show")):
         if not table.isdigit():
             continue
         lines.append(f"{fam} rule del priority {prio} fwmark {fw} lookup {table}")

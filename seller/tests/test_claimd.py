@@ -190,7 +190,7 @@ class DeskTest(unittest.TestCase):
             desk.quote(self.req())
 
 
-    # ------------------------------------------------------------ signed requests (R2-2)
+    # ------------------------------------------------------------ signed requests
     def test_requests_in_someone_elses_name_are_refused(self):
         _, victim = buyer_key()
         thief, _ = buyer_key()
@@ -259,7 +259,7 @@ class DeskTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 D.main(base + ["--quotes-per-hour", "0"])
 
-    # ------------------------------------------------------------ damaged index (R2-4)
+    # ------------------------------------------------------------ damaged index
     def test_damaged_index_is_moved_aside_and_rebuilt_with_reports(self):
         ids = []
         for i in range(3):
