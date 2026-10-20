@@ -97,6 +97,37 @@ class KillSwitch(unittest.TestCase):
         self.assertLess(lines.index(rules[0]), next(i for i, l in enumerate(lines) if "dport 53 drop" in l))
 
 
+class RouterCfg(unittest.TestCase):
+    def ini(self, text):
+        d = Path(tempfile.mkdtemp()) / "client.ini"
+        d.write_text(text)
+        return d
+
+    def test_stock_config_has_both_problems(self):
+        from srnet_exits import routercfg
+        p = self.ini("[router]\n[network]\n#keyfile=\n#blackhole-routes=true\n[dns]\nbind=127.3.2.1:53\n")
+        probs = routercfg.problems(p)
+        self.assertEqual(len(probs), 2)
+        self.assertTrue(any("persistent key" in x for x in probs))
+        self.assertTrue(any("blackhole-routes" in x for x in probs))
+
+    def test_fixed_config_is_ok(self):
+        from srnet_exits import routercfg
+        p = self.ini("[network]\nkeyfile=/var/lib/session-router/client/client.key\nblackhole-routes=false\n"
+                     "# comment\n[dns]\n")
+        self.assertEqual(routercfg.problems(p), [])
+
+    def test_unreadable_config_is_not_a_problem_here(self):
+        from srnet_exits import routercfg
+        self.assertIsNone(routercfg.read("/nonexistent/client.ini"))
+        self.assertEqual(routercfg.problems("/nonexistent/client.ini"), [])
+
+    def test_fix_command_is_what_the_readme_says(self):
+        from srnet_exits import routercfg
+        self.assertIn("blackhole-routes=false", routercfg.FIX)
+        self.assertIn("session-router-config -k", routercfg.FIX)
+
+
 class Inbound(unittest.TestCase):
     def test_nft_script_marks_inbound_and_fwmarks_only_replies(self):
         from srnet_exits import inbound

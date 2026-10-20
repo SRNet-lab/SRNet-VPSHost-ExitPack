@@ -97,6 +97,12 @@ interface (an `ip rule` on a fwmark to a small table with your normal routes). E
 machine starts itself, DNS included, still goes only through the tunnel. `disconnect` removes
 this again, and none of it (kill switch, routes, rules) survives a reboot.
 
+Session Router needs two client settings for exits, set once (SRNet-Desktop README, Install,
+step 5): a persistent key (`keyfile=`; paid time belongs to your `.sesh` address, which otherwise
+changes at every restart) and `blackhole-routes=false` (otherwise the router blackholes all traffic
+while an exit is mapped). `srnet buy` / `srnet connect` refuse until they are set; `srnet doctor`
+shows them.
+
 ## Tests
 
 ```sh

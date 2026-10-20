@@ -43,6 +43,14 @@ class ExitsAddon:
         line(True if nft else False, "nft (kill switch)",
              nft or "not found: srnet connect refuses to run without its kill switch. "
                     "Install: sudo apt install nftables  (or connect knowingly with --no-killswitch)")
+        from . import routercfg
+        rc = routercfg.read(cfg.get("router_ini") or routercfg.DEFAULT_INI)
+        if rc is None:
+            line(None, "Session Router settings for exits", f"could not read {routercfg.DEFAULT_INI}")
+        else:
+            probs = routercfg.problems(cfg.get("router_ini") or routercfg.DEFAULT_INI)
+            line(not probs or False, "Session Router settings for exits (persistent key, no blackhole routes)",
+                 "ok" if not probs else "; ".join(probs) + ". Fix: README, Install, step 5")
         rs = tunneldns.resolved_active()
         line(True if rs else False, "systemd-resolved (sends DNS to the exit's resolver while connected)",
              "active" if rs else "not running: srnet connect refuses, since DNS would leak outside the exit")

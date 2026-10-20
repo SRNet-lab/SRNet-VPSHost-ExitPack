@@ -63,6 +63,7 @@ class _Base(unittest.TestCase):
              mock.patch.object(cli, "_rpc", FakeRpc), \
              mock.patch.object(cli.reminder, "start", lambda *a: None), \
              mock.patch.object(cli, "guess_wan", lambda *a: "eth0"), \
+             mock.patch.object(cli.routercfg, "problems", getattr(self, "router_problems", lambda path: [])), \
              mock.patch.object(cli.inbound, "up", lambda wan: self.inbound_calls.append(("up", wan))), \
              mock.patch.object(cli.inbound, "down", lambda: self.inbound_calls.append(("down",))), \
              mock.patch.object(cli, "own_sesh", lambda: ME):
@@ -174,6 +175,24 @@ class InboundSessions(_Base):
         self.assertEqual(rc, 1)
         self.assertIn("cut your SSH/RDP session", err.getvalue())
         self.assertEqual(FakeRpc.calls, [], "nothing is mapped")
+
+    def test_connect_refuses_with_router_blackhole_routes_on(self):
+        home = self.home()
+        self.router_problems = lambda path: ["Session Router's blackhole-routes is on: while connected ..."]
+        err = _io.StringIO()
+        with mock.patch("sys.stderr", err), mock.patch("sys.stdout", _io.StringIO()):
+            self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch", "--system-dns"), 1)
+        self.assertIn("blackhole-routes=false", err.getvalue())
+        self.assertEqual(FakeRpc.calls, [])
+        self.assertEqual(self.inbound_calls, [], "nothing touched before the check")
+
+    def test_buy_refuses_without_a_persistent_router_key(self):
+        home = self.home()
+        self.router_problems = lambda path: ["Session Router has no persistent key (keyfile= in [network]) ..."]
+        err = _io.StringIO()
+        with mock.patch("sys.stderr", err), mock.patch("sys.stdout", _io.StringIO()):
+            self.assertEqual(self.run_cli(home, "buy", SELLER, "--hours", "1", "--client-sesh", ME), 1)
+        self.assertIn("session-router-config -k", err.getvalue())
 
     def test_guess_wan_skips_the_tunnel(self):
         outs = {"show": "default dev sr-tun0 scope link\ndefault via 10.0.0.1 dev ens3 proto dhcp\n",

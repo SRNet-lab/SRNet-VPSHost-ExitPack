@@ -24,7 +24,7 @@ from pathlib import Path
 
 import chains as C  # noqa: E402
 
-from . import board as boardmod, config, inbound, listings, killswitch, pay, reminder, tunneldns, warning
+from . import board as boardmod, config, inbound, listings, killswitch, pay, reminder, routercfg, tunneldns, warning
 from .backend import LiveBackend
 
 
@@ -167,6 +167,8 @@ def cmd_buy(args, st) -> int:
         print("which seller? srnet buy --seller <id> --hours N (see: srnet exits)", file=sys.stderr)
         return 2
     warning.ensure_ack(st.root)
+    if not _router_ok(config.load(st.root), need=("persistent key",)):
+        return 1
     client_sesh = args.client_sesh or own_sesh()
     if not client_sesh:
         print("could not read your .sesh address from Session Router (is .sesh DNS working? run srnet doctor); "
@@ -230,6 +232,8 @@ def cmd_connect(args, st) -> int:
               file=sys.stderr)
         return 1
     print(f"paid time left: {_left(lease['end'] - time.time())} (until {_hhmm(lease['end'])})")
+    if not args.mock and not _router_ok(cfg):
+        return 1
     tun = cfg.get("tun", killswitch.DEFAULT_TUN)
     dns_saved = dns_ip = None
     if not args.system_dns:
@@ -383,6 +387,18 @@ def dns_down(st, quiet: bool = False) -> bool:
         st.data["tunnel_dns"] = None
         st.save()
     return ok
+
+
+def _router_ok(cfg: dict, need=("persistent key", "blackhole-routes")) -> bool:
+    """Refuse (with the one-time fix) when Session Router's client.ini would break exits."""
+    probs = [p for p in routercfg.problems(cfg.get("router_ini") or routercfg.DEFAULT_INI)
+             if any(n in p for n in need)]
+    if not probs:
+        return True
+    for p in probs:
+        print(p + ".", file=sys.stderr)
+    print("Fix it once (README, Install, step 5), then try again:\n" + routercfg.FIX, file=sys.stderr)
+    return False
 
 
 def _inbound_down(quiet: bool = False) -> None:
