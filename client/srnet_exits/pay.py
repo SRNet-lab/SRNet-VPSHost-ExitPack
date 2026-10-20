@@ -20,7 +20,7 @@ import quote as Q  # noqa: E402
 
 from . import claim, config, watch as W
 
-PAID_GRACE_S = 900       # the seller still takes a payment notice this long after the quote expires
+PAID_GRACE_S = 900       # this computer watches the chain this long after the quote expires
 REMIND_S = 600           # warn this long before a lease ends
 
 
@@ -59,6 +59,29 @@ def no_match_text(q: dict, near: list[int] | None = None, other_chain: int | Non
         msg += (f" The seller received {seen} USDC, but this quote needs exactly {amt}; "
                 "a different amount can't be matched to you.")
     return msg
+
+
+def expired_text(q: dict, near: list[int] | None = None, other_chain: int | None = None) -> str:
+    """No payment was seen and the quote has expired: don't invite a payment to it now."""
+    amt = C.fmt_usdc(q["amount"])
+    msg = (f"No payment of exactly {amt} USDC on {C.label(q['chainid'])} to {q['payout']} arrived "
+           "before this quote expired. Don't pay this quote now; a late payment can't be matched. "
+           "If you did pay it, run `srnet paid --tx 0x...` with your transaction hash. "
+           "Otherwise get a new quote with `srnet buy`.")
+    if other_chain:
+        msg += (f" A payment of that amount arrived on {C.label(other_chain)}, but this quote is for "
+                f"{C.label(q['chainid'])}; it can't be matched. Ask the seller directly about it.")
+    elif near:
+        seen = ", ".join(C.fmt_usdc(v) for v in near[:3])
+        msg += f" The seller received {seen} USDC, but this quote needs exactly {amt}."
+    return msg
+
+
+def unreadable_text(q: dict, err: str = "") -> str:
+    """The last chain reads failed: we don't know whether a payment arrived."""
+    return (f"Couldn't read {C.label(q['chainid'])} (the RPC didn't answer{': ' + err if err else ''}), so this "
+            "computer can't tell whether you paid. Don't pay again. If you paid, run "
+            "`srnet paid --tx 0x...` with your transaction hash; the seller checks it on chain.")
 
 
 def reason_text(q: dict, reason: str) -> str:
@@ -137,14 +160,16 @@ class Buyer:
                 "uri": C.eip681(q["chainid"], q["payout"], q["amount"], self.testnets),
                 "tx_link": C.tx_link(q["chainid"], "")}
 
-    def find(self, qid: str | None = None, seller: str | None = None) -> dict:
+    def find(self, qid: str | None = None, seller: str | None = None, with_expired: bool = False) -> dict:
+        """A quote by id, else the newest open one (with_expired: also expired ones, for --tx)."""
         qs = _ex(self.st)["quotes"]
         if qid:
             rec = qs.get(qid)
             if not rec:
                 raise BuyError(f"no quote {qid} on this computer")
             return rec
-        live = [r for r in qs.values() if r["state"] in ("open", "reported")
+        ok = ("open", "reported", "expired") if with_expired else ("open", "reported")
+        live = [r for r in qs.values() if r["state"] in ok
                 and (seller is None or r["seller"] == seller)]
         if not live:
             raise BuyError("no open quote; run `srnet buy --seller <id> --hours N` first")
@@ -217,6 +242,11 @@ class Buyer:
         if tx is None and rec.get("tx"):
             tx = rec["tx"]
         while tx is None:
+            if self.clock() > deadline and rec.get("scan_error"):
+                rec["state"] = "expired"
+                rec["reason"] = unreadable_text(q, rec["scan_error"])
+                self.st.save()
+                return {"status": "unknown", "message": rec["reason"]}
             if self.clock() > deadline:
                 other = None
                 try:
@@ -228,13 +258,15 @@ class Buyer:
                 except evm.RpcError:
                     pass
                 rec["state"] = "expired"
-                rec["reason"] = no_match_text(q, rec.get("near"), other)
+                rec["reason"] = expired_text(q, rec.get("near"), other)
                 self.st.save()
                 return {"status": "expired", "message": rec["reason"]}
             try:
                 hit = self.scan_once(rec)
+                rec.pop("scan_error", None)
             except evm.RpcError as e:
                 on_event("rpc_error", str(e))
+                rec["scan_error"] = str(e)[:200] or "no answer"
                 hit = None
             self.st.save()
             if hit:
@@ -243,6 +275,7 @@ class Buyer:
                 break
             on_event("waiting", {"near": rec.get("near") or [], "left": int(q["expires"] - self.clock())})
             self.sleep(poll_s)
+        confirm_by = max(deadline, self.clock()) + 600   # a late report still gets its full wait
         if rec["state"] == "open":
             out = self.report(rec, tx)
             on_event("reported", tx)
@@ -256,9 +289,12 @@ class Buyer:
                 out = {"status": "waiting"}
             if out.get("status") in ("admitted", "rejected", "expired"):
                 return out
-            if self.clock() > deadline + 600:
-                return {"status": "waiting", "message": "the seller has not confirmed yet; check again with "
-                                                       "`srnet paid` in a few minutes"}
+            if self.clock() > confirm_by:
+                msg = "the seller has not confirmed yet; check again with `srnet paid` in a few minutes"
+                if out.get("note") == "chain_unavailable":
+                    msg = ("the seller can't read the chain right now; your report is saved there and is "
+                           "checked again by itself. Don't pay again; check later with `srnet paid`")
+                return {"status": "waiting", "message": msg}
             on_event("confirming", out)
             self.sleep(poll_s)
 

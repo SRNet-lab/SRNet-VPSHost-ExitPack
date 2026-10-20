@@ -14,7 +14,6 @@ F = helpers.seller_fixtures()
 import admission as A  # noqa: E402
 import chains as C  # noqa: E402
 import claimd as D  # noqa: E402
-import listing as L  # noqa: E402
 import quote as Q  # noqa: E402
 import watcher as Wt  # noqa: E402
 
@@ -208,8 +207,9 @@ class Pay(Flow):
         self.pay_quote(rec, value=1_000_000)
         out = self.watch(rec)
         self.assertEqual(out["status"], "expired")
-        self.assertIn("No matching payment yet", out["message"])
-        self.assertIn(f"Send exactly {C.fmt_usdc(q['amount'])} USDC on Arbitrum", out["message"])
+        self.assertIn(f"No payment of exactly {C.fmt_usdc(q['amount'])} USDC on Arbitrum", out["message"])
+        self.assertIn("Don't pay this quote now", out["message"])
+        self.assertNotIn("Send exactly", out["message"])
         self.assertIn("The seller received 1.00 USDC", out["message"])
         self.assertEqual(self.admitted(), [])
 
@@ -218,7 +218,7 @@ class Pay(Flow):
         self.pay_quote(rec, chain=8453)
         out = self.watch(rec)
         self.assertEqual(out["status"], "expired")
-        self.assertIn("No matching payment yet", out["message"])
+        self.assertIn("arrived before this quote expired", out["message"])
         self.assertIn("arrived on Base", out["message"])
         self.assertEqual(self.admitted(), [])
 
@@ -260,12 +260,56 @@ class Pay(Flow):
         self.assertEqual(code, 403)
 
     def test_expired_quote_is_not_honoured(self):
+        """A payment made after the quote expired is refused by block time, whenever it's reported."""
         rec = self.buy()
         self.clock.t += 16 * 60 + pay.PAID_GRACE_S + 5
         self.pay_quote(rec)
-        with self.assertRaises(pay.BuyError) as e:
-            self.buyer.report(rec, F.tx(1))
-        self.assertIn("expired", str(e.exception))
+        self.assertEqual(self.buyer.report(rec, F.tx(1))["status"], "received")
+        self.watcher.poll_spool()
+        out = self.buyer.status(rec)
+        self.assertEqual(out["status"], "rejected")
+        self.assertIn("after the quote expired", out["message"])
+
+    def test_late_report_of_an_in_time_payment_is_admitted(self):
+        """Paid at minute 14, closed the terminal, `srnet paid --tx` an hour later: still admitted."""
+        rec = self.buy()
+        self.clock.t += 14 * 60
+        tx = self.pay_quote(rec)
+        self.clock.t += 3600
+        rec["state"] = "expired"
+        self.assertIs(self.buyer.find(with_expired=True), rec)
+        with self.assertRaises(pay.BuyError):
+            self.buyer.find()
+        rec["state"] = "open"
+        self.assertEqual(self.buyer.watch(rec, tx=tx, poll_s=5)["status"], "admitted")
+
+    def test_rpc_errors_at_the_deadline_do_not_invite_a_second_payment(self):
+        rec = self.buy()
+        self.chains[42161].down = True
+        out = self.watch(rec)
+        self.assertEqual(out["status"], "unknown")
+        self.assertIn("Couldn't read Arbitrum One", out["message"])
+        self.assertIn("Don't pay again", out["message"])
+        self.assertIn("srnet paid --tx", out["message"])
+        self.assertNotIn("No payment of exactly", out["message"])
+
+    def test_one_good_scan_clears_an_earlier_rpc_error(self):
+        rec = self.buy()
+        self.chains[42161].down = True
+        with self.assertRaises(F.evm.RpcError):
+            self.buyer.scan_once(rec)
+        rec["scan_error"] = "connection refused"
+        self.chains[42161].down = False
+        self.assertIn("No payment of exactly", self.watch(rec)["message"])
+
+    def test_seller_side_chain_outage_is_explained(self):
+        rec = self.buy()
+        tx = self.pay_quote(rec)
+        self.watcher.chains = type("Down", (), {"get": lambda _, cid: (_ for _ in ()).throw(F.evm.RpcError("down"))})()
+        out = self.buyer.watch(rec, tx=tx, poll_s=5)
+        self.assertEqual(out["status"], "waiting")
+        self.assertIn("can't read the chain", out["message"])
+        self.assertIn("Don't pay again", out["message"])
 
 
 class Renew(Flow):

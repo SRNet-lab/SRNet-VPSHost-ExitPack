@@ -63,9 +63,12 @@ renews by itself: run `srnet buy` again to add time.
 Good to know:
 
 - A quote is good for about 15 minutes. If you close the terminal, `srnet paid` picks up the
-  latest open quote; `srnet paid --tx 0x...` uses a transaction hash you already have.
-- Wrong amount or wrong chain: nothing is matched, and the client says "No matching payment
-  yet" with what to send. A payment can't be moved to another quote; ask the seller directly.
+  latest open quote; `srnet paid --tx 0x...` uses a transaction hash you already have. The
+  seller takes that report for 8 days, so a payment made in time still counts if you report
+  it later.
+- If the client couldn't read the chain, it says so: don't pay again, use `srnet paid --tx`.
+- Wrong amount or wrong chain: nothing is matched, and the client says so. A payment can't be
+  moved to another quote; ask the seller directly.
 - Payments are final. One payment is limited to 20 USDC by default. Change it with
   `--max-usdc` or `"exits": {"max_payment_usdc": "40"}` in `~/.srnet/config.json`.
   Sellers have their own limit too.

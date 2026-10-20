@@ -128,6 +128,8 @@ def _events(kind, data):
         print(f"payment seen: {data['tx']} (block {data['block']}); telling the seller", file=sys.stderr)
     elif kind == "reported":
         print("seller notified; waiting for it to confirm", file=sys.stderr)
+    elif kind == "confirming" and (data or {}).get("note") == "chain_unavailable":
+        print("  the seller can't read the chain right now; it keeps checking by itself", file=sys.stderr)
     elif kind in ("rpc_error", "desk_error"):
         print(f"  note: {data}", file=sys.stderr)
 
@@ -195,7 +197,7 @@ def cmd_buy(args, st) -> int:
 def cmd_paid(args, st) -> int:
     b = pay.Buyer(st)
     try:
-        rec = b.find(args.quote, args.seller)
+        rec = b.find(args.quote, args.seller, with_expired=bool(args.tx))
         if rec["state"] == "admitted":
             return _finish(b, rec, {"status": "admitted"}, st)
         if rec["state"] in ("rejected", "expired") and not args.tx:
@@ -505,7 +507,12 @@ def register(sub) -> dict:
 
 def main(argv=None) -> int:
     """`srnet-exits`: the same commands without the rest of the SRNet client."""
-    from srnet.state import State
+    try:
+        from srnet.state import State
+    except ImportError:
+        print("srnet-exits needs the SRNet client in the same Python environment: install SRNet-Desktop, "
+              "then ./install.sh --with-exits", file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(prog="srnet-exits", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", help="state dir (default ~/.srnet or $SRNET_HOME)")
