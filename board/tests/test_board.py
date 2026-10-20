@@ -114,8 +114,8 @@ class AdminFlowTest(Base):
                  ({"claim_url": "http://example.com/claim"}, "bad claim_url"),
                  ({"payout": "0x" + "00" * 20}, "bad or zero payout"),
                  ({"payout": "0xnope"}, "bad or zero payout"),
-                 ({"price_per_hour_usdc": "0"}, "price_per_hour_usdc must be at least 0.01"),
-                 ({"price_per_hour_usdc": "0.005"}, "price_per_hour_usdc must be at least 0.01"),
+                 ({"price_per_hour_usdc": "0"}, "price_per_hour_usdc must be at least 0.10"),
+                 ({"price_per_hour_usdc": "0.05"}, "price_per_hour_usdc must be at least 0.10"),
                  ({"max_hours": 0}, "bad max_hours")]
         for i, (over, why) in enumerate(cases):
             body = {"price_per_hour_usdc": "1.00", "max_hours": 168, "payout": "0x" + "aa" * 20,

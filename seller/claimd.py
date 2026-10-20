@@ -83,7 +83,7 @@ REPLAY_KEEP_S = 2 * Q.REQUEST_SKEW_S + 60  # request signatures are remembered t
 # global rate, even if every quote in the 7-day hold were for one and the same purchase, that
 # pool can't fill. A higher --quotes-per-hour than SAFE_QUOTES_PER_HOUR can make the desk answer
 # "busy" for a popular cheap purchase until amounts free up (no payment is at risk).
-SAFE_QUOTES_PER_HOUR = int(Q.POOL_BUSY * Q.EXTRA_MIN * 3600 // (RESERVE_S + Q.MAX_QUOTE_TTL_S))
+SAFE_QUOTES_PER_HOUR = int(Q.POOL_BUSY * Q.extra_cap(L.MIN_PRICE_UNITS) * 3600 // (RESERVE_S + Q.MAX_QUOTE_TTL_S))
 assert QUOTES_GLOBAL[0] <= SAFE_QUOTES_PER_HOUR
 
 

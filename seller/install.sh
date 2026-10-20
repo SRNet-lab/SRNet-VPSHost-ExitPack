@@ -246,7 +246,7 @@ MAINNET=0; for c in $CHAIN_IDS; do case $c in 42161|8453) MAINNET=1;; esac; done
 [[ "$MAX_HOURS" =~ ^[1-9][0-9]{0,2}$ ]] || die "bad --max-hours (whole hours, 1..999)"
 [[ "$PRICE" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --price-per-hour-usdc"
 MIN_RATE=$(python3 -c "from decimal import Decimal as D;import sys;print(int(D(sys.argv[1])*1000000))" "$PRICE")
-[ "$MIN_RATE" -ge 10000 ] || die "--price-per-hour-usdc must be at least 0.01"
+[ "$MIN_RATE" -ge 100000 ] || die "--price-per-hour-usdc must be at least 0.10"
 [[ "$CAP_USDC" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "bad --cap-usdc"
 [[ "$QUOTES_PER_HOUR" =~ ^[1-9][0-9]{0,4}$ ]] || die "bad --quotes-per-hour (a whole number, at least 1)"
 RPC_ARGS=""

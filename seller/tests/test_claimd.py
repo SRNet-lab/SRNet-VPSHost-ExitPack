@@ -221,7 +221,8 @@ class DeskTest(unittest.TestCase):
     def test_global_quote_limit_default_150_and_configurable(self):
         self.assertEqual(D.QUOTES_GLOBAL, (150, 3600))
         # the default can't fill the smallest amount pool inside the 7-day hold
-        self.assertLess(D.QUOTES_GLOBAL[0] * (Q.RESERVE_S + Q.MAX_QUOTE_TTL_S) / 3600, Q.POOL_BUSY * Q.EXTRA_MIN)
+        self.assertLess(D.QUOTES_GLOBAL[0] * (Q.RESERVE_S + Q.MAX_QUOTE_TTL_S) / 3600,
+                        Q.POOL_BUSY * Q.extra_cap(D.L.MIN_PRICE_UNITS))     # cheapest listing, 1 hour
         self.assertGreaterEqual(D.SAFE_QUOTES_PER_HOUR, D.QUOTES_GLOBAL[0])
         d = D.Desk(self.s.state, self.s.quote_key, self.s.listing_path, clock=self.clock, quotes_per_hour=2)
         self.assertEqual(d.quote(self.req(key=buyer_key()[0]), src="a")[0], 200)

@@ -10,7 +10,7 @@ Run an SRNet exit on a fresh server.
   minutes. The release install uses a prebuilt router and needs less.
 - A payout wallet address that can receive USDC on Arbitrum One and Base. Only the address;
   the pack never needs a private key.
-- An hourly price in USDC
+- An hourly price in USDC (at least 0.10)
 
 Buyers pay USDC straight to your payout address on Arbitrum One or Base (both by default;
 `--chain arbitrum` or `--chain base` for one). The watcher reads the chain through public RPCs

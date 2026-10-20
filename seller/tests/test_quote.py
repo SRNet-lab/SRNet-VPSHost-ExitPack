@@ -110,6 +110,16 @@ class Quotes(unittest.TestCase):
         Q.unique_amount(base, most, rng=lambda n: widths.append(n) or n - 1)
         self.assertEqual(widths[-1], Q.PAY_ID_MAX)
 
+    def test_extra_is_never_more_than_half_the_price(self):
+        import listing as L
+        for b in (2, 10_000, 50_000, 80_000, L.MIN_PRICE_UNITS, 150_000, 10**6, 10**8):
+            self.assertLessEqual(Q.extra_cap(b), b // 2 or 1, b)
+        self.assertEqual(Q.extra_cap(50_000), 25_000)
+        self.assertEqual(Q.extra_cap(L.MIN_PRICE_UNITS), Q.EXTRA_MIN)   # the 0.10 minimum keeps the full 0.05
+        for _ in range(200):
+            amt, pid = Q.unique_amount(10_000, set())
+            self.assertTrue(0 < pid <= 5_000 and amt == 10_000 + pid)
+
     def test_extra_is_capped_at_five_cents_or_five_percent(self):
         self.assertEqual(Q.extra_cap(500_000), 50_000)      # 0.50: 0.05 USDC
         self.assertEqual(Q.extra_cap(1_000_000), 50_000)    # 1.00: 5% is the same 0.05

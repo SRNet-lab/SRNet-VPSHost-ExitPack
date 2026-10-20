@@ -80,7 +80,7 @@ ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 PRICE_RE = re.compile(r"^[0-9]{1,6}(\.[0-9]{1,6})?$")
 LISTING_VERSION = 3
-MIN_PRICE_UNITS = 10_000      # 0.01 USDC per hour
+MIN_PRICE_UNITS = 100_000     # 0.10 USDC per hour (keeps the payment-ID pool big enough, quote.extra_cap)
 NEEDS_UPDATE = "seller needs to update"
 
 
@@ -122,7 +122,7 @@ def listing_error(body, testnets: bool = False) -> str | None:
     if not (isinstance(pr, str) and PRICE_RE.match(pr)):
         return "bad price_per_hour_usdc"
     if int(Decimal(pr) * C.USDC_UNIT) < MIN_PRICE_UNITS:
-        return "price_per_hour_usdc must be at least 0.01"
+        return "price_per_hour_usdc must be at least 0.10"
     if not (_int(mh) and 1 <= mh <= 999):
         return "bad max_hours"
     return display_error(body)
