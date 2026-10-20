@@ -7,8 +7,9 @@ X-Token of this run.
 
 Each run makes a new token, writes {"port", "token", "pid"} to ~/.srnet/ui.json (mode 0600) and opens
 http://127.0.0.1:PORT/#t=TOKEN. page.js moves the token from the address into sessionStorage. A second
-`srnet-exits ui` reuses the running page only if ui.json is this user's and the page there answers
-`hello` with that token (and proves it knows it); otherwise it starts a new page on a free port.
+`srnet-exits ui` reuses the running page only if ui.json is this user's, its pid still runs, and the
+page there answers `hello` with an HMAC of a fresh nonce under that token (the token itself is never
+sent); otherwise it starts a new page on a free port.
 """
 from __future__ import annotations
 
@@ -65,10 +66,12 @@ def make_handler(be: ui.Backend, port_ref: list, token: str):
             origin = self.headers.get("Origin")
             return origin is None or origin in {"http://" + h for h in ok}
 
+        def _core_ok(self) -> bool:
+            return self._host_ok() and self.headers.get("X-Core") == "1"
+
         def _api_ok(self) -> bool:
             given = self.headers.get("X-Token") or ""
-            return (self._host_ok() and self.headers.get("X-Core") == "1"
-                    and hmac.compare_digest(given.encode("utf-8", "replace"), token.encode()))
+            return self._core_ok() and hmac.compare_digest(given.encode("utf-8", "replace"), token.encode())
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
@@ -86,7 +89,10 @@ def make_handler(be: ui.Backend, port_ref: list, token: str):
             return self._send(404, b"not found\n", "text/plain")
 
         def do_POST(self):
-            if not self._api_ok():
+            # hello needs no token: the caller checks that we know it (an HMAC over its nonce), so
+            # the token is never sent to whatever answers on the port
+            hello = self.path == PREFIX + "hello"
+            if not (self._core_ok() if hello else self._api_ok()):
                 return self._json(403, {"ok": False, "err": "forbidden"})
             if (self.headers.get("Content-Type") or "").split(";")[0] != "application/json":
                 return self._json(415, {"ok": False, "err": "json only"})
@@ -102,9 +108,11 @@ def make_handler(be: ui.Backend, port_ref: list, token: str):
                     raise ValueError
             except ValueError:
                 return self._json(400, {"ok": False, "err": "bad json"})
-            if self.path == PREFIX + "hello":
-                return self._json(200, {"ok": True, "app": "srnet-exits", "pid": os.getpid(),
-                                        "proof": _proof(token, str(req.get("nonce", "")))})
+            if hello:
+                nonce = req.get("nonce")
+                if not (isinstance(nonce, str) and 16 <= len(nonce) <= 128):
+                    return self._json(400, {"ok": False, "err": "nonce"})
+                return self._json(200, {"ok": True, "proof": _proof(token, nonce)})
             fn = ui.CALLS.get(self.path[len(PREFIX):]) if self.path.startswith(PREFIX) else None
             if not fn:
                 return self._json(404, {"ok": False, "err": "not found"})
@@ -140,14 +148,14 @@ def _proof(token: str, nonce: str) -> str:
 
 
 def _hello(port: int, token: str) -> bool:
-    """True only if the page on port knows token: it must send back an HMAC of a fresh nonce, so
-    another program that took over the port after our page stopped can't pass as it."""
+    """True only if the page on port knows token: it must send back an HMAC of a fresh nonce. Only
+    the nonce is sent, never the token, so another program that took over the port after our page
+    stopped learns nothing it could answer with."""
     nonce = secrets.token_hex(16)
     try:
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         c.request("POST", PREFIX + "hello", body=json.dumps({"nonce": nonce}).encode(),
-                  headers={"Host": f"127.0.0.1:{port}", "X-Core": "1", "X-Token": token,
-                           "Content-Type": "application/json"})
+                  headers={"Host": f"127.0.0.1:{port}", "X-Core": "1", "Content-Type": "application/json"})
         r = c.getresponse()
         j = json.loads(r.read(4096) or b"{}") if r.status == 200 else {}
         ok = isinstance(j, dict) and hmac.compare_digest(str(j.get("proof", "")).encode("utf-8", "replace"),
@@ -158,15 +166,30 @@ def _hello(port: int, token: str) -> bool:
         return False
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:   # gone, or (EPERM) the number now belongs to another user
+        return False
+
+
 def running(st):
-    """(port, token) of a page this user already runs, checked with a hello; else None."""
+    """(port, token) of a page this user already runs, checked with a hello; else None. A ui.json
+    whose pid is no longer running is deleted."""
     p = _info_path(st)
     try:
         if p.is_symlink() or p.stat().st_uid != os.getuid():
             return None
         info = json.loads(p.read_text())
-        port, token = int(info["port"]), str(info["token"])
+        port, token, pid = int(info["port"]), str(info["token"]), int(info["pid"])
     except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if pid <= 0 or not _alive(pid):
+        try:
+            p.unlink()
+        except OSError:
+            pass
         return None
     if not 0 < port < 65536 or not token:
         return None
@@ -209,8 +232,10 @@ def run(st, port: int = 0, browser: bool = True) -> int:
         threading.Thread(target=lambda: (time.sleep(0.5), webbrowser.open(url)), daemon=True).start()
     if threading.current_thread() is threading.main_thread():
         def _term(*_):
-            raise SystemExit(143)   # so the finally below removes ui.json (uninstall and kill send TERM)
-        signal.signal(signal.SIGTERM, _term)
+            raise SystemExit(143)   # so the finally below removes ui.json (uninstall and kill send TERM,
+        signal.signal(signal.SIGTERM, _term)   # closing the terminal sends HUP)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _term)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

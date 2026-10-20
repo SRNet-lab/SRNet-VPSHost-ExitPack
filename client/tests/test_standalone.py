@@ -314,10 +314,22 @@ class Page(unittest.TestCase):
             h = dict(x) if t is None else dict(x, **{"X-Token": t})
             code = self.req("POST", "/api/addon/exits/settings", {"max_payment_usdc": "999.00"}, h, token=False)[0]
             self.assertEqual(code, 403, t)
-            self.assertEqual(self.req("POST", "/api/addon/exits/hello", {}, h, token=False)[0], 403, t)
         after = json.loads(self.req("POST", "/api/addon/exits/settings", {}, x)[1])
         self.assertEqual(before, after)
-        self.assertEqual(self.req("POST", "/api/addon/exits/hello", {}, x)[0], 200)
+
+    def test_hello_needs_no_token_and_never_shows_it(self):
+        from srnet_exits import page
+        nonce = "ab" * 16
+        code, body, _ = self.req("POST", "/api/addon/exits/hello", {"nonce": nonce}, {"X-Core": "1"}, token=False)
+        self.assertEqual(code, 200)
+        self.assertNotIn(self.srv.token.encode(), body)
+        self.assertEqual(json.loads(body), {"ok": True, "proof": page._proof(self.srv.token, nonce)})
+        # still needs X-Core and the loopback Host, and a real nonce
+        self.assertEqual(self.req("POST", "/api/addon/exits/hello", {"nonce": nonce}, None, token=False)[0], 403)
+        self.assertEqual(self.req("POST", "/api/addon/exits/hello", {"nonce": nonce},
+                                  {"X-Core": "1", "Host": "evil.example"}, token=False)[0], 403)
+        self.assertEqual(self.req("POST", "/api/addon/exits/hello", {}, {"X-Core": "1"}, token=False)[0], 400)
+        self.assertEqual(self.req("POST", "/api/addon/exits/hello", {"nonce": "x"}, {"X-Core": "1"}, token=False)[0], 400)
 
     def test_qr_needs_the_token(self):
         from srnet_exits import ui
@@ -425,12 +437,19 @@ class PageRun(unittest.TestCase):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         from srnet_exits import page
 
+        seen = []
+
         class Fake(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
             def do_POST(self):
-                b = json.dumps({"ok": True, "app": "srnet-exits", "proof": "0" * 64}).encode()
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((dict(self.headers), raw))
+                nonce = json.loads(raw or b"{}").get("nonce", "")
+                tok = self.headers.get("X-Token") or ""
+                # the old attack: answer with an HMAC made from a token the client sent along
+                b = json.dumps({"ok": True, "proof": page._proof(tok, nonce)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(b)))
                 self.end_headers()
@@ -441,8 +460,14 @@ class PageRun(unittest.TestCase):
         self.addCleanup(fake.server_close)
         self.addCleanup(fake.shutdown)
         fport = fake.server_address[1]
-        (self.st.root / "ui.json").write_text(json.dumps({"port": fport, "token": "t" * 43, "pid": 1}))
+        saved = "t" * 43
+        # our page stopped without cleaning up (HUP, kill -9, crash); its pid is still in use here
+        (self.st.root / "ui.json").write_text(json.dumps({"port": fport, "token": saved, "pid": os.getpid()}))
         self.assertIsNone(page.running(self.st))
+        self.assertTrue(seen)
+        for hdr, raw in seen:
+            self.assertNotIn("X-Token", hdr)
+            self.assertNotIn(saved, json.dumps(hdr) + raw.decode())
         srv, _, out = self.start()
         self.assertNotEqual(srv.server_address[1], fport)
         self.assertNotIn("already running", out.getvalue())
@@ -459,6 +484,9 @@ class PageRun(unittest.TestCase):
         self.assertIsNone(page.running(self.st))
 
     def test_term_removes_ui_json(self):
+        self._signal_removes_ui_json("SIGTERM", 143)
+
+    def _signal_removes_ui_json(self, name, code):
         import signal
         import time
         env = dict(os.environ, SRNET_HOME=str(self.st.root), PYTHONPATH=os.pathsep.join(sys.path))
@@ -470,11 +498,27 @@ class PageRun(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertTrue(info.exists())
-        p.send_signal(signal.SIGTERM)
-        self.assertEqual(p.wait(10), 143)
+        p.send_signal(getattr(signal, name))
+        self.assertEqual(p.wait(10), code)
         p.stdout.close()
         p.stderr.close()
         self.assertFalse(info.exists())
+
+    def test_stale_ui_json_is_deleted(self):
+        from srnet_exits import page
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        p = self.st.root / "ui.json"
+        p.write_text(json.dumps({"port": 1, "token": "t" * 43, "pid": dead.pid}))
+        with mock.patch.object(page, "_hello", side_effect=AssertionError("asked a dead page")):
+            self.assertIsNone(page.running(self.st))
+        self.assertFalse(p.exists())
+        srv, _, out = self.start()
+        self.assertNotIn("already running", out.getvalue())
+        self.assertEqual(json.loads(p.read_text())["token"], srv.token)
+
+    def test_hup_removes_ui_json(self):
+        self._signal_removes_ui_json("SIGHUP", 143)
 
     def test_nothing_recorded_means_a_new_page(self):
         from srnet_exits import page
