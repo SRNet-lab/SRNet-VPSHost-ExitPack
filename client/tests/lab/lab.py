@@ -1,4 +1,4 @@
-"""Netns lab for inbound.py + the kill switch (cases: full rpfilter metrics foreign container).
+"""Netns lab for inbound.py + the kill switch (cases: full rpfilter metrics foreign legacy container).
 
 Runs inside `unshare -rn` after setup.sh: this netns is the client (eth0 = WAN 10.0.0.2/24 +
 2001:db8::2/64, sr-tun0 = a veth standing in for the tunnel); the remote netns (pid in argv[1])
@@ -268,6 +268,16 @@ elif CASE == "foreign":
         print("info conntrack table not readable here; mark bits checked by the unit tests")
     inbound.down()
     tunnel_routes(False)
+
+elif CASE == "legacy":
+    # connected with an earlier version (whole-mark rule 0x5352), then updated and disconnected
+    sh("ip rule add fwmark 0x5352 lookup 5352 priority 5352; ip route add default via 10.0.0.1 table 5352; "
+       "ip rule add fwmark 0x5352 lookup 100 priority 5000")
+    inbound.down()
+    rules = sh("ip rule")
+    check("lookup 5352" not in rules and sh("ip route show table 5352").strip() == "",
+          "the earlier version's rule and table are removed", rules)
+    check("lookup 100" in rules, "a similar rule that is not exactly ours stays", rules)
 
 elif CASE == "container":
     # a "container" netns behind a bridge-like veth, port 8080 on eth0 published to it (DNAT)

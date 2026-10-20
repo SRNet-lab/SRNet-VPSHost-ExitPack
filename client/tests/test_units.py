@@ -420,7 +420,12 @@ class Inbound(unittest.TestCase):
                  {"priority": 5353, "fwmark": "0x2000000", "fwmask": "0x2000000", "table": "5353"},
                  {"priority": 5354, "fwmark": "0x2000000", "table": "5354"},
                  {"priority": 0, "table": "local"}]
-        self.assertEqual(inbound.our_rules(rules, []), [("-4", 5353, "5353")])
+        self.assertEqual(inbound.our_rules(rules, []), [("-4", 5353, "5353", "0x2000000/0x2000000")])
+        # the exact rule of earlier versions (connected before an update) is cleaned up, nothing near it
+        legacy = [{"priority": 5352, "fwmark": "0x5352", "table": "5352"},
+                  {"priority": 5352, "fwmark": "0x5352", "table": "100"},
+                  {"priority": 5000, "fwmark": "0x5352", "table": "5352"}]
+        self.assertEqual(inbound.our_rules([], legacy), [("-6", 5352, "5352", "0x5352")])
 
     def test_down_removes_only_our_rule_and_restores_src_valid_mark(self):
         from srnet_exits import inbound

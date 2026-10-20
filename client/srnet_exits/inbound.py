@@ -90,18 +90,28 @@ def _routes(fam: str, wan: str) -> list[dict]:
     return _ipj(fam, "route", "show", "table", "main", "dev", wan)
 
 
-def _is_ours(rule: dict) -> bool:
+LEGACY = 0x5352   # the whole-mark rule of earlier versions: fwmark 0x5352 lookup 5352 priority 5352
+
+
+def _fwspec(rule: dict) -> str | None:
+    """The fwmark argument to delete this rule with, if this module added it (else None)."""
     fw, mask = str(rule.get("fwmark", "")), str(rule.get("fwmask", ""))
     try:
-        return int(fw, 16) == MARK and mask and int(mask, 16) == MARK
+        if int(fw, 16) == MARK and mask and int(mask, 16) == MARK:
+            return f"{M}/{M}"
+        # left by an earlier version (say connected before an update): exactly that rule only
+        if (int(fw, 16) == LEGACY and (not mask or int(mask, 16) == 0xFFFFFFFF)
+                and int(rule.get("priority", -1)) == 5352 and str(rule.get("table", "")) == "5352"):
+            return f"{LEGACY:#x}"
     except ValueError:
-        return False
+        pass
+    return None
 
 
-def our_rules(rules4: list[dict], rules6: list[dict]) -> list[tuple[str, int, str]]:
-    """(family, priority, table) of the rules this module added (fwmark MARK/MARK)."""
-    return [(fam, int(r.get("priority", 0)), str(r.get("table", "")))
-            for fam, rules in (("-4", rules4), ("-6", rules6)) for r in rules if _is_ours(r)]
+def our_rules(rules4: list[dict], rules6: list[dict]) -> list[tuple[str, int, str, str]]:
+    """(family, priority, table, fwmark spec) of the rules this module added."""
+    return [(fam, int(r.get("priority", 0)), str(r.get("table", "")), _fwspec(r))
+            for fam, rules in (("-4", rules4), ("-6", rules6)) for r in rules if _fwspec(r)]
 
 
 def pick_slot(rules4: list[dict], rules6: list[dict], table_used) -> int | None:
@@ -213,10 +223,10 @@ def down() -> None:
             priv.run(["sysctl", "-qw", "net.ipv4.conf.all.src_valid_mark=0"], check=False, what=WHAT)
         priv.run([nft, "delete", "table", "inet", NFT_TABLE], check=False, what=WHAT)
     lines = []
-    for fam, prio, table in our_rules(_ipj("-4", "rule", "show"), _ipj("-6", "rule", "show")):
+    for fam, prio, table, fw in our_rules(_ipj("-4", "rule", "show"), _ipj("-6", "rule", "show")):
         if not table.isdigit():
             continue
-        lines.append(f"{fam} rule del priority {prio} fwmark {M}/{M} lookup {table}")
+        lines.append(f"{fam} rule del priority {prio} fwmark {fw} lookup {table}")
         lines.append(f"{fam} route flush table {table}")
     if lines:
         _ip_batch(lines)
