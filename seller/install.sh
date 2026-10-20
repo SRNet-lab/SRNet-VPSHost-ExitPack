@@ -176,6 +176,7 @@ health() {
   [ -f "$P/config/install.conf" ] && . "$P/config/install.conf"
   echo "health checks ($PREFIX):"
   chk "patched binary present" "grep -aq 'srnet-exit-admission/v2' '$P/bin/session-router'"
+  chk "clock synced" "timedatectl show -p NTPSynchronized --value | grep -qx yes"
   chk "exit identity key 0600" "[ \"\$(stat -c %a '$P/config/exit.key')\" = 600 ]"
   chk "issuer key 0600" "[ \"\$(stat -c %a '$P/config/issuer.key')\" = 600 ]"
   chk "admission store readable by exit user" "runuser -u $EXIT_USER -- test -r '$P/run/admissions.json'"
@@ -215,6 +216,7 @@ health() {
     chk "ufw allows udp/${PORT}" "ufw status | grep -q '${PORT}/udp'"
     [ -n "${PAYOUT:-}" ] && chk "ufw allows claims on sr-tun-submit" "ufw status | grep -q 'on sr-tun-submit'"
   fi
+  [ -n "${PAYOUT:-}" ] && chk "claim desk settings hold no RPC URLs" "! grep -q 'rpc\\|http' '$P/config/claimd.env'"
   [ -n "${PAYOUT:-}" ] && chk "quote key 0600" "[ \"\$(stat -c %a '$P/config/quote.key')\" = 600 ]"
   [ -n "${PAYOUT:-}" ] && chk "keys split: issuer key $WATCH_USER, quote key $CLAIM_USER" "[ \"\$(stat -c %U '$P/config/issuer.key')\" = $WATCH_USER ] && [ \"\$(stat -c %U '$P/config/quote.key')\" = $CLAIM_USER ]"
   [ -n "${PAYOUT:-}" ] && chk "listing quote_key matches quote.key" "python3 -c 'import json,sys;sys.path.insert(0,sys.argv[1]);import quote as Q;sys.exit(json.load(open(sys.argv[2]))[\"listing\"].get(\"quote_key\")!=Q.pub_hex(Q.load_key(sys.argv[3])))' '$P/pack' '$P/listing/listing.json' '$P/config/quote.key'"
@@ -578,7 +580,10 @@ python3 "$P/pack/listing.py" make --identity "$P/config/exit.key" --price-per-ho
   --max-hours "$MAX_HOURS" --payout "${PAYOUT:-0x0000000000000000000000000000000000000000}" $( [ -n "$PAYOUT" ] || echo --draft ) \
   $CHAIN_ARGS $TESTNET_FLAG --quote-key-file "$P/config/quote.key" \
   --country "$COUNTRY" --region "$REGION" --speed-cap-mbps "$SPEED_CAP" --policy tcp/443 --policy tcp/80 --claim-url "http://$CLAIM_SESH/claim" \
-  ${DNS_ADV:+--dns "$DNS_ADV"} > "$P/listing/listing.json"
+  ${DNS_ADV:+--dns "$DNS_ADV"} > "$P/listing/listing.json.new"
+# Keep the listing this one replaces: the watcher still honours quotes made under it.
+[ -f "$P/listing/listing.json" ] && cp "$P/listing/listing.json" "$P/listing/previous.json" && chmod 644 "$P/listing/previous.json"
+mv "$P/listing/listing.json.new" "$P/listing/listing.json"
 chmod 644 "$P/listing/listing.json"
 ln -sfn ../listing/listing.json "$P/config/listing.json"
 SELLER_SESH=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['listing']['seller'])" "$P/listing/listing.json")
@@ -604,6 +609,15 @@ ENV
 fi
 run chown root:"$WATCH_USER" "$PREFIX/config/watcher.env"
 chmod 640 "$P/config/watcher.env"
+# The claim desk gets its own settings only (no RPC URLs, which may hold API keys).
+cat > "$P/config/claimd.env" <<ENV
+# SRNet seller claim endpoint.
+CAP_USDC=$CAP_USDC
+# 1: log each quote's salted source tag (never the address), to check that buyers show up apart.
+SRNET_CLAIM_DEBUG_SOURCES=0
+ENV
+run chown root:"$CLAIMS_GROUP" "$PREFIX/config/claimd.env"
+chmod 640 "$P/config/claimd.env"
 
 # ----------------------------------------------------------------- network
 if [ -z "$WAN_IF" ]; then
@@ -753,7 +767,7 @@ EnvironmentFile=$PREFIX/config/watcher.env
 Environment=PATH=$PREFIX/bin:/usr/bin:/bin
 Environment=HOME=$PREFIX/run
 ExecStart=/usr/bin/python3 $PREFIX/pack/watcher.py --dir $PREFIX/claims --seller \${SELLER_SESH} \\
-  --issuer-key $PREFIX/config/issuer.key --store $PREFIX/run/admissions.json \\
+  --listing $PREFIX/listing/listing.json --issuer-key $PREFIX/config/issuer.key --store $PREFIX/run/admissions.json \\
   --state $PREFIX/watch/watcher-state.json \$CHAIN_FLAGS
 Restart=on-failure
 RestartSec=10
@@ -824,7 +838,7 @@ Type=simple
 User=$CLAIM_USER
 Group=$CLAIMS_GROUP
 SupplementaryGroups=$GROUP
-EnvironmentFile=$PREFIX/config/watcher.env
+EnvironmentFile=$PREFIX/config/claimd.env
 ExecStart=/usr/bin/python3 $PREFIX/pack/claimd.py --host $CLAIM_ADDR --port 80 --dir $PREFIX/claims \
   --quote-key $PREFIX/config/quote.key --listing $PREFIX/listing/listing.json --cap-usdc \${CAP_USDC} $TESTNET_FLAG
 Restart=always
@@ -836,7 +850,7 @@ NoNewPrivileges=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ReadWritePaths=$PREFIX/claims
-InaccessiblePaths=$PREFIX/config/issuer.key $PREFIX/run $PREFIX/watch
+InaccessiblePaths=$PREFIX/config/issuer.key $PREFIX/config/watcher.env $PREFIX/run $PREFIX/watch
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

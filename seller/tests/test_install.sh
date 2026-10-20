@@ -103,7 +103,7 @@ python3 -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['listing']['
 python3 "$T/r2/$U/pack/listing.py" verify "$T/r2/$U/listing/listing.json" >/dev/null || fail "listing with claim_url verifies"
 grep -q -- '--host fd2e:7365:736a::1 --port 80' "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd bind"
 grep -qx 'User=srnet-claim' "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd user"
-grep -qx "InaccessiblePaths=/$U/config/issuer.key /$U/run /$U/watch" "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd can't see the issuer key"
+grep -qx "InaccessiblePaths=/$U/config/issuer.key /$U/config/watcher.env /$U/run /$U/watch" "$T/r2/etc/systemd/system/srnet-seller-claimd.service" || fail "claimd can't see the issuer key"
 grep -qx 'SupplementaryGroups=srnet-claims' "$T/r2/etc/systemd/system/srnet-seller-watcher.service" || fail "watcher shares claims group"
 grep -q -- "--state /$U/watch/watcher-state.json" "$T/r2/etc/systemd/system/srnet-seller-watcher.service" || fail "watcher state outside claims"
 grep -q 'useradd .*srnet-claim$' "$T/r2/commands.log" || fail "claim user created"
@@ -245,5 +245,22 @@ grep -q 'ufw delete allow in on sr-tun-seller to 10.195.0.53 port 53 proto udp' 
 grep -q "rm -rf $T/r4/$U\$" "$T/r4/commands.log" && fail "uninstall purged without --purge"
 "$I" --uninstall --purge --dry-run --root "$T/r4" >/dev/null 2>&1
 grep -q "rm -rf $T/r4/$U\$" "$T/r4/commands.log" || fail "purge"
+ok
+# R2: the claim desk gets its own env (cap only, no RPC URLs), the watcher reads the listing,
+# a re-install keeps the replaced listing for the watcher, and health checks the clock.
+C5="$T/r5r/etc/systemd/system/srnet-seller-claimd.service"; W5="$T/r5r/etc/systemd/system/srnet-seller-watcher.service"
+grep -q "EnvironmentFile=/$U/config/claimd.env" "$C5" || fail "claimd env file"
+grep -q "^EnvironmentFile=/$U/config/watcher.env" "$C5" && fail "claimd loads watcher.env"
+grep -q "InaccessiblePaths=.*/$U/config/watcher.env" "$C5" || fail "claimd can read watcher.env"
+grep -qx 'CAP_USDC=5' "$T/r5r/$U/config/claimd.env" || fail "claimd cap"
+grep -q 'rpc\|https' "$T/r5r/$U/config/claimd.env" && fail "RPC settings in claimd.env"
+grep -qx 'SRNET_CLAIM_DEBUG_SOURCES=0' "$T/r5r/$U/config/claimd.env" || fail "source-tag debug not off by default"
+grep -q -- "--listing /$U/listing/listing.json --issuer-key" "$W5" || fail "watcher doesn't read the listing"
+[ -e "$T/r5r/$U/listing/previous.json" ] && fail "previous listing on a first install"
+"$I" --binary "$T/fakebin" --dry-run --root "$T/r5r" --payout $PAY --price-per-hour-usdc 2.00 >/dev/null 2>&1 || fail "re-install"
+python3 -c "import json,sys;assert json.load(open(sys.argv[1]))['listing']['price_per_hour_usdc']=='1.00'" "$T/r5r/$U/listing/previous.json" || fail "previous listing not kept"
+python3 -c "import json,sys;assert json.load(open(sys.argv[1]))['listing']['price_per_hour_usdc']=='2.00'" "$T/r5r/$U/listing/listing.json" || fail "new listing"
+[ -e "$T/r5r/$U/listing/listing.json.new" ] && fail "temp listing left"
+grep -q 'chk "clock synced" "timedatectl show -p NTPSynchronized --value | grep -qx yes"' "$I" || fail "no clock check"
 ok
 echo "install dry-run tests: OK ($n)"
