@@ -25,6 +25,7 @@ from pathlib import Path
 import chains as C  # noqa: E402
 
 from . import board as boardmod, config, inbound, listings, killswitch, pay, priv, reminder, routercfg, tunneldns, warning
+from . import state as S
 from .backend import LiveBackend
 from .prog import P as _P
 
@@ -305,10 +306,10 @@ def cmd_connect(args, st) -> int:
         print("DNS: left as it is (--system-dns): lookups may go out your normal connection, outside the exit",
               file=sys.stderr)
     if result.ok:
-        st.data["connected"] = {"seller": args.seller, "at": int(time.time()), "killswitch": armed,
-                                "dns": "tunnel" if dns_saved is not None else "system", "exit_dns": dns_ip,
-                                "lease_end": int(lease["end"])}
-        st.save()
+        conn = {"seller": args.seller, "at": int(time.time()), "killswitch": armed,
+                "dns": "tunnel" if dns_saved is not None else "system", "exit_dns": dns_ip,
+                "lease_end": int(lease["end"])}
+        S.update(st, lambda d: d.__setitem__("connected", conn))
         try:
             reminder.start(st.root, args.seller)
         except OSError:
@@ -357,11 +358,15 @@ def dns_original(st, tun: str) -> dict:
 
 
 def dns_up(st, saved: dict, upstream: str) -> None:
-    st.data["tunnel_dns"] = {"saved": saved, "at": int(time.time()), "exit_dns": upstream}
-    st.save()  # saved first: a crash after this point can still be undone by srnet disconnect
+    rec = {"saved": saved, "at": int(time.time()), "exit_dns": upstream}
+    # saved first: a crash after this point can still be undone by disconnect
+    S.update(st, lambda d: d.__setitem__("tunnel_dns", rec))
     pid = tunneldns.start_proxy(st.root, saved["tun"], upstream)
-    st.data["tunnel_dns"]["forwarder_pid"] = pid
-    st.save()
+
+    def with_pid(d):
+        if d.get("tunnel_dns"):
+            d["tunnel_dns"]["forwarder_pid"] = pid
+    S.update(st, with_pid)
     tunneldns.apply(saved)
 
 
@@ -389,8 +394,7 @@ def dns_down(st, quiet: bool = False) -> bool:
                 print(f"DNS NOT restored: {e}", file=sys.stderr)
     tunneldns.stop_proxy(st.root)
     if ok:
-        st.data["tunnel_dns"] = None
-        st.save()
+        S.update(st, lambda d: d.__setitem__("tunnel_dns", None))
     return ok
 
 
@@ -558,9 +562,8 @@ def cmd_disconnect(args, st) -> int:
                   "Router did not confirm the exit is unmapped (its routes may still send traffic into the "
                   f"tunnel). Run {_P()} disconnect again once Session Router answers; a reboot also clears it.",
                   file=sys.stderr)
-    if unmapped:
-        st.data["connected"] = None   # else kept, so the next disconnect tries the unmap again
-    st.save()
+    if unmapped:   # else kept, so the next disconnect tries the unmap again
+        S.update(st, lambda d: d.__setitem__("connected", None))
     out = {"ok": ks_ok, "unmapped": seller if unmapped else None}
     lease = pay.active_lease(st, seller) if seller else None
     if lease:

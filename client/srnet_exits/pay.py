@@ -18,7 +18,7 @@ import evm  # noqa: E402
 import listing as L  # noqa: E402
 import quote as Q  # noqa: E402
 
-from . import claim, config, watch as W
+from . import claim, config, state as S, watch as W
 from .prog import P as _P
 
 PAID_GRACE_S = 900       # this computer watches the chain this long after the quote expires
@@ -41,11 +41,15 @@ def buyer_key(root: Path):
     return Q.load_key(p)
 
 
-def _ex(st) -> dict:
-    e = st.data.setdefault("exits", {})
+def _exd(data: dict) -> dict:
+    e = data.setdefault("exits", {})
     e.setdefault("quotes", {})
     e.setdefault("leases", {})
     return e
+
+
+def _ex(st) -> dict:
+    return _exd(st.data)
 
 
 def no_match_text(q: dict, near: list[int] | None = None, other_chain: int | None = None) -> str:
@@ -107,6 +111,16 @@ class Buyer:
         self.testnets = config.testnets(self.cfg)
         self.rpc_factory = rpc_factory or (lambda cid: W.rpc_for(cid, config.rpc_overrides(self.cfg), self.testnets))
 
+    def _put(self, rec: dict, more=None) -> None:
+        """Store this quote record (and, with more(exits), a lease change) into a fresh copy of
+        state.json under the lock: everything else in it (a connect elsewhere, say) stays."""
+        def fn(data):
+            e = _exd(data)
+            e["quotes"][rec["id"]] = rec
+            if more:
+                more(e)
+        S.update(self.st, fn)
+
     # --------------------------------------------------------------- quote
     def desk(self, body: dict) -> claim.Desk:
         return claim.Desk(claim.base_url(body, self.testnets), self.transport, dns=config.sesh_dns(self.cfg))
@@ -148,8 +162,7 @@ class Buyer:
                                                      "quote_key", "claim_url", "dns", "max_hours")}}
         if nxt is not None:
             rec["scan"]["next"] = nxt
-        _ex(self.st)["quotes"][q["id"]] = rec
-        self.st.save()
+        self._put(rec)
         return rec
 
     def info(self, rec: dict) -> dict:
@@ -204,7 +217,7 @@ class Buyer:
         except claim.ClaimError as e:
             raise BuyError(str(e)) from e
         rec["tx"], rec["state"] = notice["tx"], "reported"
-        self.st.save()
+        self._put(rec)
         if code == 200 and out.get("status") in ("admitted", "rejected"):
             return self._settle(rec, out)
         return out
@@ -221,22 +234,25 @@ class Buyer:
     def _settle(self, rec: dict, out: dict) -> dict:
         q = rec["doc"]["quote"]
         st = out.get("status")
+        more = None
         if st == "admitted":
             rec["state"] = "admitted"
-            lease = _ex(self.st)["leases"].setdefault(q["seller"], {"quotes": []})
-            lease.update({"seller": q["seller"], "client_sesh": q["client_sesh"], "dns": rec["listing"].get("dns"),
-                          "chainid": q["chainid"]})
-            lease["end"] = max(int(lease.get("end") or 0), int(out.get("lease_end") or 0))
-            if q["id"] not in lease["quotes"]:
-                lease["quotes"].append(q["id"])
-            lease.pop("reminded", None)
+
+            def more(e):
+                lease = e["leases"].setdefault(q["seller"], {"quotes": []})
+                lease.update({"seller": q["seller"], "client_sesh": q["client_sesh"],
+                              "dns": rec["listing"].get("dns"), "chainid": q["chainid"]})
+                lease["end"] = max(int(lease.get("end") or 0), int(out.get("lease_end") or 0))
+                if q["id"] not in lease.setdefault("quotes", []):
+                    lease["quotes"].append(q["id"])
+                lease.pop("reminded", None)
         elif st == "rejected":
             rec["state"] = "rejected"
             rec["reason"] = reason_text(q, out.get("reason"))
             out = dict(out, message=rec["reason"])
         elif st == "expired":
             rec["state"] = "expired"
-        self.st.save()
+        self._put(rec, more)
         return out
 
     def watch(self, rec: dict, on_event=lambda kind, data: None, poll_s: float = 6, tx: str | None = None) -> dict:
@@ -249,7 +265,7 @@ class Buyer:
             if self.clock() > deadline and rec.get("scan_error"):
                 rec["state"] = "expired"
                 rec["reason"] = unreadable_text(q, rec["scan_error"])
-                self.st.save()
+                self._put(rec)
                 return {"status": "unknown", "message": rec["reason"]}
             if self.clock() > deadline:
                 other = None
@@ -263,7 +279,7 @@ class Buyer:
                     pass
                 rec["state"] = "expired"
                 rec["reason"] = expired_text(q, rec.get("near"), other)
-                self.st.save()
+                self._put(rec)
                 return {"status": "expired", "message": rec["reason"]}
             try:
                 hit = self.scan_once(rec)
@@ -272,7 +288,7 @@ class Buyer:
                 on_event("rpc_error", str(e))
                 rec["scan_error"] = str(e)[:200] or "no answer"
                 hit = None
-            self.st.save()
+            self._put(rec)
             if hit:
                 tx = hit["tx"]
                 on_event("seen", hit)

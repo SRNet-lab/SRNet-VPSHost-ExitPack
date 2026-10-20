@@ -62,7 +62,7 @@ class Backend:
 
     def _reload(self):
         from .state import State
-        self.st.data = State(self.st.root).data
+        self.st.data = State(self.st.root).data  # state.json is replaced atomically, never half-written
 
     # ------------------------------------------------------------ board / status
     def board(self) -> dict:
@@ -206,8 +206,12 @@ class Backend:
             if not rec:
                 return {"ok": False, "err": "unknown quote"}
             if rec.get("tx") != tx:
-                rec["state"] = "open"
-                self.st.save()
+                def reopen(d):
+                    r = ((d.get("exits") or {}).get("quotes") or {}).get(qid)
+                    if r:
+                        r["state"] = "open"
+                from . import state as S
+                S.update(self.st, reopen)
         self._start_watch(qid, tx=tx)
         return {"id": qid, "state": "confirming"}
 
