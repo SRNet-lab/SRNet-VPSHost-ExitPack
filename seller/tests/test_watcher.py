@@ -392,7 +392,7 @@ class WatcherTest(unittest.TestCase):
         with mock.patch.object(W.sys, "stderr", err):
             out = self.report(q_old, 1)
         self.assertEqual(out[0][1], "hold")
-        self.assertIn(f"srnet-seller admit {q_old['id']}", err.getvalue())
+        self.assertIn(f"sudo srnet-seller admit {q_old['id']}", err.getvalue())
         self.assertEqual(self.admitted(), [])
         st = self.status(q_old)
         self.assertEqual((st["status"], st["note"]), ("waiting", "needs_seller"))

@@ -1123,6 +1123,6 @@ if [ -n "$BOARD_URL" ]; then
   echo "board:           the listing is sent to the board automatically (no approval step) and"
   echo "                 appears to buyers within minutes; it is re-sent every hour (every 5 min until it gets through)."
 fi
-echo "manage:          srnet-seller status | health | listing | logs | held | admit <quote id> | uninstall [--purge]"
+echo "manage:          sudo srnet-seller status | health | listing | logs | held | admit <quote id> | uninstall [--purge]"
 echo "payments:        USDC arrives in your payout wallet directly; there is nothing to claim"
 if [ "$DRY" = 0 ] && [ "$START" = 1 ] && have_systemd; then echo; health || true; fi

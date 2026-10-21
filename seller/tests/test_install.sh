@@ -223,7 +223,7 @@ grep -q 'apt-get install .*libevent-core-2.1-7t64 .*libzstd1' "$T/r4/commands.lo
 grep -q 'ip link show sr-tun-seller >/dev/null 2>&1 || exit 0' "$T/r4/$U/bin/srnet-seller-shape" || fail "shaper not quiet without TUN"
 out=$("$I" --binary "$T/fakebin" --dry-run --root "$T/r8" --payout $PAY 2>&1)
 echo "$out" | grep -q 'sent to the board automatically' || fail "end text"
-echo "$out" | grep -q "srnet-seller status | health | listing | logs | held | admit" || fail "manage line"
+echo "$out" | grep -q "sudo srnet-seller status | health | listing | logs | held | admit" || fail "manage line"
 ok
 # 9. idempotent: issuer + exit identity + quote key kept on re-run
 P1=$(cat "$T/r4/$U/config/issuer.pub"); K1=$(sha256sum < "$T/r4/$U/config/exit.key"); S1=$(sha256sum < "$T/r4/$U/config/quote.key")

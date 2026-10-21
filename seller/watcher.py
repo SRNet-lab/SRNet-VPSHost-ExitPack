@@ -400,7 +400,7 @@ class Watcher:
               f"{C.fmt_usdc(q['price_per_hour'])} USDC/h, "
               f"tx {notice['tx']} on chain {q['chainid']}), but its terms match no listing I know of "
               f"({why.partition(': ')[2]}). If you did sell at that price, admit the buyer with: "
-              f"srnet-seller admit {qid}", file=sys.stderr, flush=True)
+              f"sudo srnet-seller admit {qid}", file=sys.stderr, flush=True)
 
     def held(self) -> dict:
         return dict(self.state.setdefault("needs_seller", {}))
@@ -420,7 +420,7 @@ class Watcher:
                     continue
                 self._admit_seen.add(qid)
                 print(f"watcher: can't remove admit request {qid} ({e.__class__.__name__}); "
-                      f"use `srnet-seller admit`, which runs as the watcher's user", file=sys.stderr, flush=True)
+                      f"use `sudo srnet-seller admit`, which runs as the watcher's user", file=sys.stderr, flush=True)
             h = self.state.setdefault("needs_seller", {}).get(qid) if Q.ID_RE.match(qid) else None
             if not h:
                 print(f"watcher: admit {qid}: no paid quote is waiting for you under that id", file=sys.stderr, flush=True)
@@ -541,13 +541,13 @@ def main(argv=None) -> int:
         d = sp.parent / "admit"
         owner = (d if d.exists() else sp.parent).stat().st_uid
         if hasattr(os, "geteuid") and os.geteuid() != owner:
-            raise SystemExit("run this as the watcher's user (`srnet-seller admit <id>` does that), "
+            raise SystemExit("run this as the watcher's user (`sudo srnet-seller admit <id>` does that), "
                              "so the watcher can clear the request")
         d.mkdir(mode=0o700, exist_ok=True)
         (d / a.quote).write_text("")
         note = "" if a.quote in held else " (it isn't in the held list yet; the watcher will say if it finds nothing)"
         print(f"asked the watcher to admit quote {a.quote}{note}. It re-checks the payment on chain first; "
-              f"see srnet-seller logs.")
+              f"see: sudo srnet-seller logs")
         return 0
     if argv[:1] == ["stop"]:
         ap = argparse.ArgumentParser(prog="watcher.py stop")
