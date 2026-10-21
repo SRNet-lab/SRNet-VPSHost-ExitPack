@@ -278,6 +278,19 @@ grep -q 'run chmod 700 "$PREFIX/watch" "$PREFIX/watch/admit"' "$I" || fail "watc
 grep -q 'runuser -u srnet-watch -- python3 /'"$U"'/pack/watcher.py admit --state /'"$U"'/watch/watcher-state.json' "$T/r5r/usr/local/sbin/srnet-seller" || fail "admit runs as the watcher user"
 python3 -c "import json,sys;assert json.load(open(sys.argv[1]))['listing']['price_per_hour_usdc']=='3.00'" "$T/r5r/$U/listing/listing.json" || fail "new listing"
 [ -e "$T/r5r/$U/listing/listing.json.new" ] && fail "temp listing left"
+# srnet-seller run without root says to use sudo instead of failing on a permission error
+SS="$T/r5r/usr/local/sbin/srnet-seller"
+mkdir -p "$T/fakeroot"; printf '#!/bin/sh\necho 0\n' > "$T/fakeroot/id"; chmod 755 "$T/fakeroot/id"
+mkdir -p "$T/fakeuser"; printf '#!/bin/sh\necho 1000\n' > "$T/fakeuser/id"; chmod 755 "$T/fakeuser/id"
+for a in health held listing "admit abc"; do
+  out=$(PATH="$T/fakeuser:$PATH" sh "$SS" $a 2>&1) && fail "srnet-seller $a ran without root"
+  echo "$out" | grep -qx "srnet-seller needs root. Run it with sudo: sudo srnet-seller $a" || fail "srnet-seller $a: $out"
+done
+out=$(PATH="$T/fakeuser:$PATH" sh "$SS" 2>&1) && fail "srnet-seller ran without root"
+echo "$out" | grep -q "sudo srnet-seller status" || fail "srnet-seller default: $out"
+set +e; out=$(PATH="$T/fakeroot:$PATH" sh "$SS" bogus 2>&1); rc=$?; set -e
+[ $rc = 2 ] && echo "$out" | grep -q '^usage: srnet-seller' || fail "srnet-seller as root: $rc $out"
+ok
 grep -q 'chk "clock synced" "timedatectl show -p NTPSynchronized --value | grep -qx yes"' "$I" || fail "no clock check"
 ok
 echo "install dry-run tests: OK ($n)"

@@ -412,6 +412,9 @@ cat > "$R/usr/local/sbin/srnet-seller" <<SH
 #!/bin/sh
 # srnet-seller status|health|listing|logs|held|admit <quote id>|uninstall [--purge]
 set -e
+if [ "\$(id -u)" != 0 ]; then
+  echo "srnet-seller needs root. Run it with sudo: sudo srnet-seller \${*:-status}" >&2; exit 1
+fi
 case "\${1:-status}" in
   status) systemctl --no-pager status srnet-seller-exit srnet-seller-watcher srnet-seller-nat || true;;
   health) exec $PREFIX/pack/install.sh --health;;
