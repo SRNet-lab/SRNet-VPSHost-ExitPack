@@ -459,50 +459,101 @@ if __name__ == "__main__":
 
 
 class KillSwitchNote(_Base):
-    """Wherever connect is shown, the kill switch says what it leaves open (UDP for the overlay)."""
+    """Wherever connect is shown, the kill switch says what it leaves open."""
 
-    def test_note_matches_the_rules(self):
-        from srnet_exits import killswitch
-        n = killswitch.NOTE
-        for part in ("except UDP, which Session Router needs", "QUIC in browsers and WebRTC calls",
-                     "DNS outside the tunnel is blocked"):
-            self.assertIn(part, n)
+    def owner(self, how="router"):
+        k = self.cli.killswitch
+        return {"router": k.UdpOwner((999,), "router", "the running session-router"),
+                "shared": k.UdpOwner((0,), "shared", "the running session-router"),
+                "all": k.UdpOwner((), "all", "could not tell which user Session Router runs as (x), so the kill "
+                                             "switch lets all UDP out")}[how]
 
-    def test_connect_prints_it_next_to_armed(self):
+    def connect(self, how):
         home = self.home()
-        out = _io.StringIO()
-        with mock.patch.object(self.cli.killswitch.KillSwitch, "arm", lambda self, wan, bootstrap_ips=None: None), \
-                mock.patch("sys.stdout", out):
+        out, err = _io.StringIO(), _io.StringIO()
+        o = self.owner(how)
+        with mock.patch.object(self.cli.killswitch.KillSwitch, "arm", lambda self, wan, bootstrap_ips=None: o), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             self.assertEqual(self.run_cli(home, "connect", SELLER), 0)
-        lines = out.getvalue().splitlines()
-        i = next(i for i, l in enumerate(lines) if l.startswith("kill switch armed on eth0"))
-        self.assertEqual(lines[i + 1], self.cli.killswitch.NOTE)
+        return home, out.getvalue().splitlines(), err.getvalue()
+
+    def test_notes_match_the_rules(self):
+        k = self.cli.killswitch
+        self.assertIn("except Session Router's own UDP", k.NOTE)
+        self.assertIn("DNS outside the tunnel is blocked", k.NOTE)
+        self.assertNotIn("QUIC", k.NOTE)
+        for n in (k.NOTE_ALL, k.NOTE_SHARED("root")):
+            self.assertIn("QUIC in browsers and WebRTC calls", n)
+            self.assertIn("DNS outside the tunnel is blocked", n)
+        self.assertIn("running as root", k.NOTE_SHARED("root"))
+
+    def test_connect_prints_the_note_for_the_rule_it_loaded(self):
+        k = self.cli.killswitch
+        for how, note in (("router", k.NOTE), ("shared", k.NOTE_SHARED("root")), ("all", k.NOTE_ALL)):
+            home, lines, err = self.connect(how)
+            i = next(i for i, l in enumerate(lines) if l.startswith("kill switch armed on eth0"))
+            self.assertEqual(lines[i + 1], note, how)
+            self.assertEqual("lets all UDP out" in err, how == "all", err)
+            c = self.st(home)["connected"]
+            self.assertEqual(c["killswitch_note"], note)
+            self.assertEqual(c["killswitch_udp"], list(self.owner(how).uids))
 
     def test_not_printed_without_the_kill_switch(self):
         home = self.home()
         out = _io.StringIO()
         with mock.patch("sys.stdout", out):
             self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch"), 0)
-        self.assertNotIn(self.cli.killswitch.NOTE, out.getvalue())
+        k = self.cli.killswitch
+        for n in (k.NOTE, k.NOTE_ALL):
+            self.assertNotIn(n, out.getvalue())
+        self.assertIsNone(self.st(home)["connected"]["killswitch_udp"])
 
     def test_status_summary_says_it_when_armed(self):
-        info = {"connected": {"seller": SELLER, "killswitch": True}, "dns": "x", "killswitch": "armed",
-                "leases": [], "quotes": []}
+        k = self.cli.killswitch
+        info = {"connected": {"seller": SELLER, "killswitch": True, "killswitch_note": k.NOTE}, "dns": "x",
+                "killswitch": "armed", "leases": [], "quotes": []}
         lines = self.cli.status_text(info).splitlines()
-        i = lines.index("Kill switch: armed")
-        self.assertEqual(lines[i + 1], "  " + self.cli.killswitch.NOTE)
+        self.assertEqual(lines[lines.index("Kill switch: armed") + 1], "  " + k.NOTE)
+        del info["connected"]["killswitch_note"]   # connected with an older version: all UDP
+        lines = self.cli.status_text(info).splitlines()
+        self.assertEqual(lines[lines.index("Kill switch: armed") + 1], "  " + k.NOTE_ALL)
         info["killswitch"] = "off"
-        self.assertNotIn("  " + self.cli.killswitch.NOTE, self.cli.status_text(info).splitlines())
+        self.assertFalse(any(l.startswith("  The kill switch") for l in self.cli.status_text(info).splitlines()))
+
+    def test_status_says_reconnect_when_the_router_changed_user(self):
+        from srnet_exits.state import State
+        home, _, _ = self.connect("router")
+        st = State(home)
+        with mock.patch.object(self.cli.killswitch, "router_uids", lambda: {998}):
+            info = self.cli.status_info(st, {}, rpc_probe=False)
+        self.assertIn("runs as a different user", info["connected_note"])
+        with mock.patch.object(self.cli.killswitch, "router_uids", lambda: {999}):
+            self.assertNotIn("connected_note", self.cli.status_info(st, {}, rpc_probe=False))
+        with mock.patch.object(self.cli.killswitch, "router_uids", set):   # not running: nothing to say
+            self.assertNotIn("connected_note", self.cli.status_info(st, {}, rpc_probe=False))
 
     def test_page_and_docs_carry_it(self):
         import re
         from srnet_exits import killswitch, ui, warning
         root = Path(__file__).resolve().parents[2]
         flat = lambda s: re.sub(r"\s+", " ", s)
-        self.assertIn(killswitch.NOTE, flat(warning.WARNING))
+        self.assertIn(killswitch.NOTE + " " + killswitch.NOTE_FALLBACK, flat(warning.WARNING))
         for doc in (root / "README.md", root / "client" / "README.md"):
             self.assertIn(killswitch.NOTE, flat(doc.read_text()), doc)
         js = (Path(ui.__file__).parent / "web" / "tab.js").read_text()
         self.assertIn('q("ksnote").textContent = r.killswitch_note', js)
-        src = Path(ui.__file__).read_text()
-        self.assertIn('info["killswitch_note"] = killswitch.NOTE', src)
+
+    def test_page_status_note(self):
+        from srnet_exits import ui
+        k = self.cli.killswitch
+        home, _, _ = self.connect("router")
+        from srnet_exits.state import State
+        b = ui.Backend(State(home))
+        with mock.patch.object(self.cli, "own_sesh", lambda: ME), \
+                mock.patch.object(k, "router_uids", lambda: {999}):
+            self.assertEqual(b.status()["killswitch_note"], k.NOTE)
+        self.cli.S.update(State(home), lambda d: d.__setitem__("connected", None))
+        b = ui.Backend(State(home))
+        with mock.patch.object(self.cli, "own_sesh", lambda: ME), \
+                mock.patch.object(k, "udp_owner", lambda: self.owner("all")):
+            self.assertEqual(b.status()["killswitch_note"], k.NOTE_ALL)   # what connect would load

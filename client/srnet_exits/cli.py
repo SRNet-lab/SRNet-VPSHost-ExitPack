@@ -273,14 +273,17 @@ def cmd_connect(args, st) -> int:
               "Pass --wan-if IFACE if the WAN interface is wrong.", file=sys.stderr)
         return 1
     armed = False
+    owner = None
     if args.no_killswitch:
         print("kill switch: OFF (--no-killswitch): if the tunnel drops, traffic goes out your normal connection")
     else:
         try:
-            ks.arm(wan, bootstrap_ips=cfg.get("bootstrap_ips") or [])
+            owner = ks.arm(wan, bootstrap_ips=cfg.get("bootstrap_ips") or [])
             armed = True
             print(f"kill switch armed on {wan} (tun={ks.tun})")
-            print(killswitch.NOTE)
+            if owner.how == "all":
+                print(f"note: {owner.why}", file=sys.stderr)
+            print(owner.note())
         except Exception as e:
             print(f"kill switch NOT armed: {e}", file=sys.stderr)
             if not args.allow_no_ks:
@@ -313,6 +316,8 @@ def cmd_connect(args, st) -> int:
               file=sys.stderr)
     if result.ok:
         conn = {"seller": args.seller, "at": int(time.time()), "killswitch": armed,
+                "killswitch_udp": list(owner.uids) if owner else None,
+                "killswitch_note": owner.note() if owner else None,
                 "dns": "tunnel" if dns_saved is not None else "system", "exit_dns": dns_ip,
                 "lease_end": int(lease["end"])}
         S.update(st, lambda d: d.__setitem__("connected", conn))
@@ -518,6 +523,14 @@ def status_info(st, cfg: dict, endpoint: str | None = None, rpc_probe: bool = Tr
             info["connected_note"] = (f"not actually connected: Session Router has no exit mapped (say after a "
                                       f"reboot). Reconnect: {_P()} connect {conn.get('seller')}  or clear this "
                                       f"record: {_P()} disconnect")
+    ku = (info.get("connected") or {}).get("killswitch_udp")
+    now_uids = killswitch.router_uids()
+    if ku and now_uids and not now_uids <= set(ku) and "connected_note" not in info:
+        # the router restarted as another user (reinstall, upgrade): the kill switch blocks it
+        conn = info["connected"]
+        info["connected_note"] = (f"Session Router now runs as a different user than when you connected, so the "
+                                  f"kill switch blocks its traffic. Reconnect: {_P()} disconnect, then "
+                                  f"{_P()} connect {conn.get('seller')}")
     return info
 
 
@@ -549,7 +562,7 @@ def status_text(info: dict, now: float | None = None) -> str:
                   if conn else f"not checked (needs root: {look})")
         out.append(f"Kill switch: {ks}")
         if ks.startswith("armed"):
-            out.append(f"  {killswitch.NOTE}")
+            out.append(f"  {conn.get('killswitch_note') or killswitch.NOTE_ALL}")
     out.append(f"DNS: {info['dns']}")
     for q in info["quotes"]:
         when = (f"good until {_hhmm(q['expires'])}" if q["expires"] > now

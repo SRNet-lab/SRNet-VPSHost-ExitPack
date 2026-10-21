@@ -60,6 +60,76 @@ class ExitDns(unittest.TestCase):
             self.assertIsNone(listings.exit_dns(bad), bad)
 
 
+class KillSwitchOwner(unittest.TestCase):
+    def fake_proc(self, procs):
+        d = Path(tempfile.mkdtemp())
+        for pid, (comm, cmd, uid) in procs.items():
+            (d / str(pid)).mkdir()
+            (d / str(pid) / "comm").write_text(comm + "\n")
+            (d / str(pid) / "cmdline").write_bytes(cmd.replace(" ", "\0").encode() + b"\0")
+            (d / str(pid) / "status").write_text(f"Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        (d / "self").mkdir()
+        return str(d)
+
+    def test_udp_owner_from_the_running_router(self):
+        proc = self.fake_proc({10: ("session-router", "/usr/bin/session-router /etc/session-router/client.ini", 999),
+                               11: ("session-router", "/opt/x/session-router /etc/srnet/exit.ini", 990),
+                               12: ("bash", "bash", 1000)})
+        self.assertEqual(killswitch.router_uids(self.fake_proc(
+            {20: ("sr-main", "/usr/bin/session-router /etc/session-router/client.ini", 998)})), {998})
+        with mock.patch.object(killswitch.os, "getuid", lambda: 1000), mock.patch.dict(os.environ, {}, clear=False):
+            o = killswitch.udp_owner(proc)
+        self.assertEqual((o.uids, o.how), ((999,), "router"))
+        self.assertEqual(o.note(), killswitch.NOTE)
+
+    def test_udp_owner_root_or_own_user_is_shared(self):
+        for uid in (0, 1000):
+            proc = self.fake_proc({10: ("session-router", "session-router client.ini", uid)})
+            with mock.patch.object(killswitch.os, "getuid", lambda: 1000):
+                o = killswitch.udp_owner(proc)
+            self.assertEqual((o.uids, o.how), ((uid,), "shared"))
+            self.assertIn("QUIC", o.note())
+
+    def test_udp_owner_falls_back_to_the_package_user_then_all(self):
+        proc = self.fake_proc({})
+        pw = type("P", (), {"pw_uid": 123})
+        with mock.patch.object(killswitch.pwd, "getpwnam", lambda n: pw if n == "_session" else None), \
+                mock.patch.object(killswitch.os, "getuid", lambda: 1000):
+            o = killswitch.udp_owner(proc)
+        self.assertEqual((o.uids, o.how), ((123,), "router"))
+        self.assertIn("not running", o.why)
+
+        def nouser(n):
+            raise KeyError(n)
+        with mock.patch.object(killswitch.pwd, "getpwnam", nouser):
+            o = killswitch.udp_owner(proc)
+        self.assertEqual((o.uids, o.how), ((), "all"))
+        self.assertEqual(o.note(), killswitch.NOTE_ALL)
+        self.assertIn("lets all UDP out", o.why)
+
+    def rules(self, owner):
+        ks = killswitch.KillSwitch(name="srnet_ks_test")
+        scripts = []
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+        ks._nft_f = lambda script, check=True: scripts.append(script) or R()
+        ks._nft = lambda *a, check=True: R()
+        self.assertIs(ks.arm("eth0", owner=owner), owner)
+        return [l for l in scripts[0].splitlines() if "l4proto udp" in l]
+
+    def test_wan_udp_rule_per_owner(self):
+        U = killswitch.UdpOwner
+        self.assertEqual(self.rules(U((999,), "router")),
+                         ['add rule inet srnet_ks_test output oifname "eth0" meta l4proto udp meta skuid 999 accept'])
+        self.assertEqual(self.rules(U((0, 999), "shared")),
+                         ['add rule inet srnet_ks_test output oifname "eth0" meta l4proto udp meta skuid { 0, 999 } accept'])
+        self.assertEqual(self.rules(U((), "all")),
+                         ['add rule inet srnet_ks_test output oifname "eth0" meta l4proto udp accept'])
+        with self.assertRaises(ValueError):
+            self.rules(U(("999; drop",), "router"))
+
+
 class KillSwitch(unittest.TestCase):
     def test_arm_disarm_dry(self):
         ks = killswitch.KillSwitch(name="srnet_ks_test")

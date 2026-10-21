@@ -80,7 +80,9 @@ class Backend:
         info["client_sesh"] = cfg.get("client_sesh") or cli.own_sesh()
         info["max_payment_usdc"] = C.fmt_usdc(config.max_payment(cfg))
         info["acked"] = warning.acked(self.st.root)
-        info["killswitch_note"] = killswitch.NOTE
+        conn = info.get("connected") or {}
+        info["killswitch_note"] = ((conn.get("killswitch_note") or killswitch.NOTE_ALL) if conn.get("killswitch")
+                                   else killswitch.udp_owner().note())
         return info
 
     def settings(self, req: dict) -> dict:

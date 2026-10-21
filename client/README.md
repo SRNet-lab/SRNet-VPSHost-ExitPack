@@ -122,9 +122,11 @@ run without the kill switch unless you pass `--no-killswitch`. As a normal user 
 through sudo; the Exits tab can only connect if sudo needs no password, otherwise run
 `srnet connect` in a terminal (as yourself, not `sudo srnet`).
 
-The kill switch blocks everything outside the tunnel except UDP, which Session Router needs. Apps
-that send UDP, such as QUIC in browsers and WebRTC calls, can still leave outside the exit if the
-tunnel drops or they pick your normal connection themselves. DNS outside the tunnel is blocked.
+The kill switch blocks everything outside the tunnel except Session Router's own UDP, which it
+needs. DNS outside the tunnel is blocked. Connect finds Session Router's user from the running
+router, or else the `_session` user its package creates. If the router runs as root or as your own
+user, other programs running as that user can still send UDP outside the exit, and connect says
+so. If connect can't tell which user Session Router runs as, it lets all UDP out and says so.
 
 On a remote machine (a VPS you reach over SSH or RDP), connecting keeps those sessions working.
 None of it (kill switch, routes, rules) survives a reboot.

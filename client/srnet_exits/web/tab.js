@@ -65,6 +65,7 @@
     e.hidden = !soon.length;
     if (soon.length) e.textContent = "Your exit time with " + soon[0].seller.slice(0, 12) + "… ends at " + hhmm(soon[0].end) + ". Buy more below to keep going.";
     q("conn").textContent = r.connected ? "Connected through " + String(r.connected.seller).slice(0, 16) + "… · DNS: " + r.dns : "Not connected.";
+    if (r.connected && r.connected_note) q("conn").textContent += " " + r.connected_note;
     q("ksnote").textContent = r.killswitch_note || ""; q("ksnote").hidden = !r.killswitch_note;
     if (!q("limit").value) q("limit").value = r.max_payment_usdc || "20";
     (r.quotes || []).forEach((x) => { if (!polls[x.id]) watch(x.id); });

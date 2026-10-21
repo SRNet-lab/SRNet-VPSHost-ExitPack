@@ -4,7 +4,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-from .killswitch import NOTE
+from .killswitch import NOTE, NOTE_FALLBACK
 
 WARNING = """\
 SRNet exit visibility warning
@@ -32,7 +32,7 @@ network fee yourself. Payments are FINAL: there is no refund, even if the
 exit does not work. Nothing renews by itself; buy again to add time.
 
 Type exactly:  I UNDERSTAND
-""".format(ks=textwrap.fill(NOTE, 78))
+""".format(ks=textwrap.fill(NOTE + " " + NOTE_FALLBACK, 78))
 
 
 def acked(state_dir: Path) -> bool:

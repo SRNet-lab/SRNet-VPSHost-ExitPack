@@ -1,4 +1,4 @@
-"""Netns lab for inbound.py + the kill switch (cases: full rpfilter metrics foreign legacy container udpgap).
+"""Netns lab for inbound.py + the kill switch (cases: full rpfilter metrics foreign legacy container udpgap udpowner).
 
 Runs inside `unshare -rn` after setup.sh: this netns is the client (eth0 = WAN 10.0.0.2/24 +
 2001:db8::2/64, sr-tun0 = a veth standing in for the tunnel); the remote netns (pid in argv[1])
@@ -330,7 +330,8 @@ elif CASE == "container":
     srv.kill()
     cp.kill()
 elif CASE == "udpgap":
-    # what killswitch.NOTE says: armed, only UDP may leave on the WAN (DNS and TCP may not)
+    # the fallback (no router user found, killswitch.NOTE_ALL): armed, only UDP may leave on the WAN
+    # (DNS and TCP may not)
     inbound.up("eth0")
     killswitch.KillSwitch().arm("eth0", bootstrap_ips=[])
     tunnel_routes()
@@ -361,6 +362,112 @@ elif CASE == "udpgap":
     check(res == b"hi" and d.get("wan_tcp", 0) > 0, "disarmed: TCP on the WAN works again", (res, d))
     res, d = delta(lambda: udp("198.51.100.1", 53))
     check(res == b"ok", "disarmed: DNS on the WAN works again", (res, d))
+elif CASE == "udpowner":
+    # needs more than uid 0 in the user namespace (run.sh: unshare --map-auto)
+    try:
+        os.stat("/proc/self")
+        ok_ids = subprocess.run(["setpriv", "--reuid", "999", "--regid", "999", "--clear-groups", "true"]).returncode == 0
+    except OSError:
+        ok_ids = False
+    if not ok_ids:
+        print("SKIP: no uids besides 0 in this user namespace (unshare --map-auto)")
+        sys.exit(0)
+    # fallback first: no session-router running and no _session user here -> all UDP, as before
+    o = killswitch.udp_owner()
+    check(o.how == "all" and not o.uids and "lets all UDP out" in o.why, "no router user found: falls back to all UDP", o)
+    # a stand-in Session Router: uid 999, comm "session-router", one UDP socket on the WAN that
+    # echoes a probe to a peer (198.51.100.2, reached by a host route like the router's own peers)
+    sh("ip route add 198.51.100.2/32 via 10.0.0.1 dev eth0")
+    FAKE = (
+        "import ctypes,socket,sys\n"
+        "ctypes.CDLL(None).prctl(15, b'session-router', 0, 0, 0)\n"
+        "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('0.0.0.0',1090));s.settimeout(1.5)\n"
+        "c=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM);c.bind('/tmp/srnet_lab_fake.sock')\n"
+        "while True:\n"
+        "    d,a=c.recvfrom(99);dst,port=d.decode().split()\n"
+        "    try:\n"
+        "        s.sendto(b'q',(dst,int(port)));r=s.recvfrom(9)[0]\n"
+        "    except OSError as e: r=repr(e).encode()\n"
+        "    c.sendto(r,a)\n")
+    for f in ("/tmp/srnet_lab_fake.sock", "/tmp/srnet_lab_ask.sock"):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    open("/tmp/srnet_lab_fake.py", "w").write(FAKE)
+    fake = subprocess.Popen(["setpriv", "--reuid", "999", "--regid", "999", "--clear-groups",
+                             sys.executable, "/tmp/srnet_lab_fake.py"])
+    KIDS.append(fake)
+    for _ in range(50):
+        if os.path.exists("/tmp/srnet_lab_fake.sock"):
+            break
+        time.sleep(0.1)
+    os.chmod("/tmp/srnet_lab_fake.sock", 0o777)
+    ask = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    ask.bind("/tmp/srnet_lab_ask.sock")
+    os.chmod("/tmp/srnet_lab_ask.sock", 0o777)
+    ask.settimeout(4)
+
+    def router_udp(dst="198.51.100.2", port=9999):
+        ask.sendto(f"{dst} {port}".encode(), "/tmp/srnet_lab_fake.sock")
+        return ask.recv(99)
+
+    def as_user(code, uid=1000):
+        r = subprocess.run(["setpriv", "--reuid", str(uid), "--regid", str(uid), "--clear-groups",
+                            sys.executable, "-c", code], text=True, capture_output=True, timeout=10)
+        return (r.stdout + r.stderr).strip()
+    UDP = ("import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1.5);{bind}"
+           "s.sendto(b'q',({dst!r},{port}));print(s.recvfrom(9)[0])")
+    o = killswitch.udp_owner()
+    check(o.how == "router" and o.uids == (999,), "finds the running router's uid", o)
+    inbound.up("eth0")
+    killswitch.KillSwitch().arm("eth0", bootstrap_ips=[], owner=o)
+    rules = sh("nft list table inet srnet_ks")
+    check('oifname "eth0" meta l4proto udp meta skuid 999 accept' in rules or "skuid 999" in rules,
+          "WAN UDP allow is limited to the router's uid", rules)
+    tunnel_routes()
+    res, d = delta(router_udp)
+    check(res == b"ok" and d.get("wan_udp", 0) > 0, "armed: the router's own UDP still reaches its peer on the WAN", (res, d))
+    res, d = delta(lambda: as_user(UDP.format(bind="", dst="198.51.100.2", port=9999)))
+    check("b'ok'" not in res and not d.get("wan_udp"), "armed: a normal user's UDP to a router peer is dropped", (res, d))
+    res, d = delta(lambda: as_user(UDP.format(bind="s.setsockopt(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,b'eth0');",
+                                              dst="198.51.100.1", port=443), uid=0))
+    check("b'ok'" not in res and not d.get("wan_udp"), "armed: root's UDP bound to eth0 is dropped", (res, d))
+    res, d = delta(lambda: as_user(UDP.format(bind="", dst="198.51.100.1", port=9999)))
+    check("b'ok'" in res and not d.get("wan_udp") and d.get("tun_any", 0) > 0,
+          "armed, tunnel up: a normal user's UDP goes into the tunnel", (res, d))
+    res, d = delta(lambda: tcp("198.51.100.1"))
+    check(not d.get("wan_tcp") and d.get("tun_any", 0) > 0, "armed, tunnel up: TCP goes into the tunnel", (res, d))
+    res, d = delta(lambda: remote_ssh("10.0.0.2"))
+    check("SSH:x" in res and not d.get("tun_tcp"), "armed: inbound SSH still works, replies on the WAN", (res, d))
+    tunnel_routes(False)   # the tunnel drops
+    res, d = delta(lambda: as_user(UDP.format(bind="", dst="198.51.100.1", port=443)))
+    check("b'ok'" not in res and not d.get("wan_udp"), "armed, tunnel down: a normal user's UDP (QUIC port) is dropped", (res, d))
+    res, d = delta(lambda: udp("198.51.100.1", 53))
+    check(isinstance(res, Exception) and not d.get("wan_udp"), "armed, tunnel down: DNS udp/53 is dropped", (res, d))
+    res, d = delta(lambda: router_udp("198.51.100.1", 53))
+    check(res != b"ok" and not d.get("wan_udp"), "armed, tunnel down: DNS udp/53 from the router's uid is dropped too", (res, d))
+    res, d = delta(lambda: tcp("198.51.100.1", 53))
+    check(isinstance(res, Exception) and not d.get("wan_tcp"), "armed, tunnel down: DNS tcp/53 is dropped", (res, d))
+    res, d = delta(router_udp)
+    check(res == b"ok", "armed, tunnel down: the router's own UDP still works", (res, d))
+    tunnel_routes()
+    teardown_checks()
+    res, d = delta(lambda: as_user(UDP.format(bind="", dst="198.51.100.1", port=443)))
+    check(d.get("wan_udp", 0) > 0, "disarmed: a normal user's udp/443 leaves on the WAN again", (res, d))
+    res, d = delta(lambda: as_user(UDP.format(bind="", dst="198.51.100.1", port=9999)))
+    check("b'ok'" in res and d.get("wan_udp", 0) > 0, "disarmed: a normal user's UDP on the WAN works again", (res, d))
+    res, d = delta(lambda: udp("198.51.100.1", 53))
+    check(res == b"ok", "disarmed: DNS on the WAN works again", (res, d))
+    res, d = delta(lambda: tcp("198.51.100.1"))
+    check(res == b"hi", "disarmed: TCP on the WAN works again", (res, d))
+    # the router restarted as another user while armed: its traffic is blocked (fail closed)
+    killswitch.KillSwitch().arm("eth0", bootstrap_ips=[], owner=killswitch.UdpOwner((998,), "router", "test"))
+    res, d = delta(router_udp)
+    check(res != b"ok" and not d.get("wan_udp"), "router under another uid than armed for: blocked (reconnect needed)", (res, d))
+    killswitch.KillSwitch().disarm()
+    sh("ip route del 198.51.100.2/32")
+    fake.kill()
 else:
     sys.exit(f"unknown case {CASE}")
 
