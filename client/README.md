@@ -8,7 +8,8 @@ srnet exits                          list exits from the signed board
 srnet buy --seller <id> --hours N    get a quote, pay it from any wallet, wait for the seller
 srnet paid [--quote ID] [--tx 0x..]  carry on after paying (or give the transaction hash)
 srnet connect <seller>               route traffic and DNS through the exit (Linux, asks for sudo)
-srnet status | disconnect
+srnet status [--json]                paid time left, connection, kill switch and DNS
+srnet disconnect                     DNS and routes back, kill switch off
 srnet setup-router                   once: persistent router key, no blackhole routes (asks for sudo)
 srnet verify --chain base --tx 0x.. --to 0x.. --amount 3.50   check a shop payment on chain
 ```
@@ -43,10 +44,11 @@ The installer:
 Run it again to update. `client/install.sh --uninstall` removes the command, its environment and
 that one line, and stops the page, reminder and DNS forwarder it started; your paid time and
 settings in `~/.srnet` stay. It refuses while an exit is connected (disconnect first). With
-`--force` it goes ahead: it puts the tunnel's DNS back first (or, if it can't, prints the
-`sudo resolvectl revert <interface>` line to do it) and tells you how to remove the kill switch:
-`sudo nft delete table inet srnet_ks`. Install and uninstall only touch `SRNET_EXITS_PREFIX` if it
-is empty or holds a srnet-exits install.
+`--force` it disconnects for you before removing anything: DNS goes back, the exit is unmapped,
+your traffic leaves through your own connection again and the kill switch is removed (sudo may
+ask for your password). Anything it can't undo, it names with the command that does it. Your paid
+time stays, so after a reinstall `connect` works again. Install and uninstall only touch
+`SRNET_EXITS_PREFIX` if it is empty or holds a srnet-exits install.
 
 Every command below works the same with `srnet-exits` in place of `srnet`, and
 `srnet-exits doctor` checks Session Router, `.sesh` names, the clock and everything exits need.
@@ -83,10 +85,11 @@ srnet buy --seller <id> --hours 2
 ```
 
 The seller answers with a quote bound to your `.sesh` address. The client prints the chain,
-the payout address, the exact amount and a QR code (scan it with a phone wallet), then watches
-the chain. Send exactly that amount of USDC on that chain, from any wallet; you pay the network
-fee. The amount has a few extra millionths of a USDC on the end so your payment can be told
-apart from others; send it as shown.
+the payout address, the exact amount and a QR code (scan it with a phone wallet), with the
+amount, chain, address and end time again below the code, then watches the chain. Send exactly
+that amount of USDC on that chain, from any wallet; you pay the network fee. The amount is the
+price plus a payment ID, usually under one cent (0.50 for an hour can be 0.505521), so your
+payment can be told apart from others; send it as shown.
 
 Once the transfer is seen, the client tells the seller, the seller checks it on chain and
 admits you for the hours you paid. Then:
@@ -94,8 +97,13 @@ admits you for the hours you paid. Then:
 ```sh
 srnet connect <id>
 curl -s https://api.ipify.org; echo    # the exit's IP
+srnet status
 srnet disconnect
 ```
+
+`status` says in a few lines whether you're connected and through which exit, how much paid time
+is left and until when, whether the kill switch is on, where DNS goes, and any quote still
+waiting for payment. `status --json` prints the full record.
 
 `connect` again later works with no new purchase while paid time is left. About 10 minutes
 before it ends you get a warning (a desktop notification if `notify-send` is there). Nothing

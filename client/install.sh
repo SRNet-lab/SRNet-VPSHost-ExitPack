@@ -5,6 +5,7 @@
 #   client/install.sh                   install or upgrade
 #   client/install.sh --no-router-setup skip the Session Router setup (run srnet-exits setup-router later)
 #   client/install.sh --uninstall       remove srnet-exits (your ~/.srnet stays)
+#   client/install.sh --uninstall --force   the same while connected: disconnects first
 set -euo pipefail
 PREFIX="${SRNET_EXITS_PREFIX:-$HOME/.local/share/srnet-exits}"
 BIN="${SRNET_BIN:-$HOME/.local/bin}"
@@ -18,7 +19,7 @@ for a in "$@"; do
     --uninstall) UNINSTALL=1;;
     --no-router-setup) ROUTER=0;;
     --force) FORCE=1;;
-    -h|--help) sed -n '2,7p' "$0"; exit 0;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0;;
     *) echo "install.sh: unknown option $a (see --help)" >&2; exit 2;;
   esac
 done
@@ -84,6 +85,35 @@ if [ "$UNINSTALL" = 1 ]; then
   if [ -e "$PREFIX" ] && { [ ! -f "$INSTALL_MARK" ] || [ ! -x "$VPY" ]; }; then
     not_an_install removing
   fi
+  # --force while connected: a full disconnect first (DNS back, the exit unmapped, the tunnel
+  # routes gone, the kill switch removed), while the installed command is still here.
+  DISC=""; STILL=0; KS_LEFT=0
+  if [ "$CONNECTED" = 1 ]; then
+    echo "An exit is still connected. Disconnecting first (sudo may ask for your password)."
+    if [ -x "$VPY" ]; then
+      if SRNET_EXITS_PROG=srnet-exits "$VPY" -I -m srnet_exits --home "$SHOME" disconnect; then
+        DISC=ok
+      else
+        DISC=failed; KS_LEFT=1
+      fi
+      "$VPY" -I -c 'import json,sys; sys.exit(1 if (json.load(open(sys.argv[1])).get("connected")) else 0)' "$STATE" 2>/dev/null \
+        || STILL=1
+    else
+      # no installed Python left to talk to Session Router: remove the kill switch directly
+      DISC=novenv; STILL=1; KS_LEFT=1
+      NFT=$(command -v nft || { [ -x /usr/sbin/nft ] && echo /usr/sbin/nft; } || true)
+      if [ -n "$NFT" ]; then
+        if [ "$(id -u)" = 0 ]; then SUDO=(); elif [ -t 0 ]; then SUDO=(sudo); else SUDO=(sudo -n); fi
+        if ERR=$("${SUDO[@]}" "$NFT" delete table inet srnet_ks 2>&1); then
+          KS_LEFT=0; echo "kill switch disarmed"
+        else
+          case "$ERR" in *"No such file"*|*"does not exist"*) KS_LEFT=0;; esac
+        fi
+      else
+        KS_LEFT=0
+      fi
+    fi
+  fi
   # Tunnel DNS still set up (a connect, or one cut short): put the link's DNS back before the
   # forwarder it points at is stopped, else the machine is left without DNS.
   TUN=""
@@ -96,7 +126,9 @@ if [ "$UNINSTALL" = 1 ]; then
   fi
   case "$TUN" in *[!A-Za-z0-9_.-]*) TUN="<tun interface>";; esac
   DNS_LEFT=""
-  if [ -n "$TUN" ]; then
+  if [ -n "$TUN" ] && [ -n "$DISC" ]; then
+    DNS_LEFT="$TUN"   # the disconnect above already tried and could not
+  elif [ -n "$TUN" ]; then
     echo "Putting DNS on $TUN back as it was before connecting (sudo may ask for your password)."
     if [ -x "$VPY" ] && "$VPY" -I -c 'import sys; from pathlib import Path; from srnet_exits import cli; from srnet_exits.state import State; sys.exit(0 if cli.dns_down(State(Path(sys.argv[1]))) else 1)' "$SHOME"; then
       :
@@ -124,9 +156,18 @@ if [ "$UNINSTALL" = 1 ]; then
   done
   echo "Removed srnet-exits. Your paid time and settings in ~/.srnet were left in place, and so were"
   echo "Session Router's settings (the original client.ini is kept as client.ini.srnet-orig)."
-  if [ "$CONNECTED" = 1 ]; then
+  if [ "$DISC" = ok ] && [ "$STILL" = 0 ]; then
+    echo "You were connected: the exit is disconnected and your traffic goes out your own connection again."
+  fi
+  if [ "$STILL" = 1 ]; then
     echo
-    echo "You were still connected, so the kill switch may still block traffic outside the tunnel."
+    echo "Session Router did not confirm that the exit is unmapped, so traffic may still go through it."
+    echo "Restarting Session Router drops the exit: sudo systemctl restart session-router-client"
+    echo "To clear the rest, reinstall and run srnet-exits disconnect, or reboot."
+  fi
+  if [ "$KS_LEFT" = 1 ]; then
+    echo
+    echo "The kill switch may still block traffic outside the tunnel."
     echo "Remove it with: sudo nft delete table inet srnet_ks"
   fi
   if [ -n "$DNS_LEFT" ]; then

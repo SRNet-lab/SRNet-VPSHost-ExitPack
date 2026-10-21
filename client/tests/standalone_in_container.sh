@@ -68,7 +68,9 @@ out srnet-exits buy | grep -q "which seller? srnet-exits buy" || fail "buy hint"
   | grep -q "no paid time for this seller; buy some first: srnet-exits buy" || fail "connect hint"
 out srnet-exits verify --chain nochain --tx 0x00 --to 0x00 --amount 1 | grep -q "error" || fail verify
 out sudo ~/.local/bin/srnet-exits exits | grep -q "not with sudo" || fail "sudo refusal"
-out srnet-exits status | grep -q "list_exits_error" || fail status
+out srnet-exits status --json | grep -q "list_exits_error" || fail "status --json"
+out srnet-exits status | grep -q "^Session Router: not answering" || fail status
+out srnet-exits status | grep -q "^Connected: no" || fail status
 set -o pipefail
 echo "--- page"
 srnet-exits ui --no-browser > /tmp/ui.log 2>&1 &
@@ -115,6 +117,18 @@ echo "--- reinstall"
 SRNet-VPSHost-ExitPack/client/install.sh > /tmp/i2.log 2>&1 || { cat /tmp/i2.log; fail reinstall; }
 [ "$(grep -c "added by SRNet-VPSHost-ExitPack" ~/.bashrc)" = 1 ] || fail "PATH line twice"
 srnet-exits --version
+echo "--- uninstall --force while connected (no Session Router and no NET_ADMIN here: both fall short)"
+"$VPY" -c "import json,os,time; p=os.path.expanduser(\"~/.srnet/state.json\"); d=json.load(open(p)) if os.path.exists(p) else {}; d[\"connected\"]={\"seller\":\"y3yi.sesh\",\"at\":int(time.time()),\"killswitch\":True,\"dns\":\"system\"}; d.setdefault(\"exits\",{}).setdefault(\"leases\",{})[\"y3yi.sesh\"]={\"end\":int(time.time())+3600}; json.dump(d,open(p,\"w\"))"
+SRNet-VPSHost-ExitPack/client/install.sh --uninstall --force > /tmp/unf.log 2>&1 || { cat /tmp/unf.log; fail "--force"; }
+cat /tmp/unf.log
+grep -q "Disconnecting first" /tmp/unf.log || fail "no disconnect before removing"
+grep -q "sudo systemctl restart session-router-client" /tmp/unf.log || fail "no Session Router line"
+grep -q "Remove it with: sudo nft delete table inet srnet_ks" /tmp/unf.log || fail "no kill switch line"
+[ ! -e ~/.local/share/srnet-exits ] || fail "not removed after --force"
+python3 -c "import json,os,sys; d=json.load(open(os.path.expanduser(\"~/.srnet/state.json\"))); sys.exit(0 if \"y3yi.sesh\" in d[\"exits\"][\"leases\"] else 1)" || fail "paid time lost"
+SRNet-VPSHost-ExitPack/client/install.sh > /tmp/i3.log 2>&1 || { cat /tmp/i3.log; fail "reinstall after --force"; }
+python3 -c "import json,os; p=os.path.expanduser(\"~/.srnet/state.json\"); d=json.load(open(p)); d[\"connected\"]=None; json.dump(d,open(p,\"w\"))"
+srnet-exits status | grep -q "^Paid time: .* left with y3yi.sesh" || fail "paid time not shown after reinstall"
 echo "--- uninstall"
 cp ~/.bashrc /tmp/bashrc.before
 [ -f ~/.local/share/srnet-exits/.srnet-exits-install ] || fail "no install marker"

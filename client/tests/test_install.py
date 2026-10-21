@@ -17,6 +17,17 @@ FAKE_PY = r'''#!/usr/bin/env bash
 echo "$*" >> "$FAKE_LOG"
 # the uninstall's DNS step: log it, answer with FAKE_DNS_RC
 case "$*" in *"cli.dns_down"*) echo "dns_down ${@: -1}" >> "$FAKE_LOG"; exit "${FAKE_DNS_RC:-0}";; esac
+# the --force disconnect: log it, then do to state.json what FAKE_DISC says (ok: all undone;
+# nounmap: Session Router did not answer; ksfail: the kill switch could not be removed)
+case "$*" in *"-m srnet_exits --home "*" disconnect"*)
+  echo "disconnect $5 prog=$SRNET_EXITS_PROG" >> "$FAKE_LOG"
+  "$REAL_PY" -c 'import json,sys
+p, mode = sys.argv[1] + "/state.json", sys.argv[2]
+d = json.load(open(p)); d["tunnel_dns"] = None
+if mode != "nounmap": d["connected"] = None
+json.dump(d, open(p, "w"))' "$5" "${FAKE_DISC:-ok}"
+  [ "${FAKE_DISC:-ok}" = ksfail ] && exit 1; exit 0;;
+esac
 # the uninstall's state checks run real Python code
 if [ "$1" = "-I" ] && [ "$2" = "-c" ]; then shift; exec "$REAL_PY" "$@"; fi
 case "$*" in *"-m srnet_exits setup-router"*) exit "${FAKE_ROUTER_RC:-0}";; esac
@@ -58,6 +69,9 @@ class InstallSh(unittest.TestCase):
 
     def dns_calls(self):
         return [l for l in self.calls() if l.startswith("dns_down ")]
+
+    def disc_calls(self):
+        return [l for l in self.calls() if l.startswith("disconnect ")]
 
     def calls(self, word=""):
         return [l for l in self.log.read_text().splitlines() if word in l]
@@ -226,6 +240,7 @@ class InstallSh(unittest.TestCase):
         self.assertTrue(self.prefix.exists())
         self.assertEqual(self.run_install("--uninstall", "--force").returncode, 0)
         self.assertFalse(self.prefix.exists())
+        self.assertEqual(len(self.disc_calls()), 1)
 
     def test_uninstall_reads_compact_json(self):
         self.run_install()
@@ -250,17 +265,64 @@ class InstallSh(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("still connected", r.stderr)
 
-    def test_force_while_connected_names_the_kill_switch_command(self):
+    def test_force_while_connected_disconnects_first(self):
+        self.run_install()
+        state = self.home / ".srnet"
+        state.mkdir()
+        lease = {"quotes": {}, "leases": {"x.sesh": {"end": 4102444800}}}
+        (state / "state.json").write_text(json.dumps({"connected": {"seller": "x.sesh", "killswitch": True},
+                                                     "exits": lease}))
+        r = self.run_install("--uninstall", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.disc_calls(), [f"disconnect {state} prog=srnet-exits"])
+        self.assertIn("Disconnecting first", r.stdout)
+        self.assertIn("goes out your own connection again", r.stdout)
+        self.assertNotIn("srnet_ks", r.stdout)
+        self.assertNotIn("restart session-router-client", r.stdout)
+        self.assertFalse(self.prefix.exists())
+        d = json.loads((state / "state.json").read_text())
+        self.assertIsNone(d["connected"])
+        self.assertEqual(d["exits"], lease)   # paid time stays
+        r = self.run_install("--uninstall")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.disc_calls(), [])
+
+    def test_force_when_the_disconnect_falls_short_names_the_fixes(self):
         self.run_install()
         state = self.home / ".srnet"
         state.mkdir()
         (state / "state.json").write_text('{"connected":{"seller":"x.sesh","killswitch":true}}')
-        r = self.run_install("--uninstall", "--force")
+        r = self.run_install("--uninstall", "--force", FAKE_DISC="nounmap")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("sudo systemctl restart session-router-client", r.stdout)
+        self.assertNotIn("srnet_ks", r.stdout)
+        self.assertFalse(self.prefix.exists())
+        self.run_install()
+        (state / "state.json").write_text('{"connected":{"seller":"x.sesh","killswitch":true}}')
+        r = self.run_install("--uninstall", "--force", FAKE_DISC="ksfail")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("sudo nft delete table inet srnet_ks", r.stdout)
-        self.assertFalse(self.prefix.exists())
-        r = self.run_install("--uninstall")
-        self.assertNotIn("srnet_ks", r.stdout)
+        self.assertNotIn("restart session-router-client", r.stdout)
+
+    def test_force_without_the_venv_removes_the_kill_switch_itself(self):
+        nft = self.fake / "nft"
+        nft.write_text('#!/bin/sh\necho "nft $*" >> "$FAKE_LOG"\nexit "${FAKE_NFT_RC:-0}"\n')
+        nft.chmod(0o755)
+        sudo = self.fake / "sudo"
+        sudo.write_text('#!/bin/sh\necho "sudo $*" >> "$FAKE_LOG"\n[ "$1" = -n ] && shift\nexec "$@"\n')
+        sudo.chmod(0o755)
+        state = self.home / ".srnet"
+        state.mkdir()
+        (state / "state.json").write_text('{\n  "connected": {\n    "seller": "x.sesh"\n  }\n}')
+        r = self.run_install("--uninstall", "--force")   # nothing installed (any more)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.calls("nft delete"), [f"sudo -n {nft} delete table inet srnet_ks",
+                                                    "nft delete table inet srnet_ks"])
+        self.assertIn("kill switch disarmed", r.stdout)
+        self.assertNotIn("Remove it with", r.stdout)
+        self.assertIn("sudo systemctl restart session-router-client", r.stdout)
+        r = self.run_install("--uninstall", "--force", FAKE_NFT_RC="1")
+        self.assertIn("Remove it with: sudo nft delete table inet srnet_ks", r.stdout)
 
     def test_install_writes_the_marker(self):
         self.run_install()
@@ -315,24 +377,24 @@ class InstallSh(unittest.TestCase):
         (state / "state.json").write_text(json.dumps(d))
         return state
 
-    def test_force_while_connected_puts_dns_back_first(self):
+    def test_force_while_connected_leaves_dns_to_the_disconnect(self):
         self.run_install()
         state = self._tunnel_state()
         r = self.run_install("--uninstall", "--force")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.dns_calls(), [f"dns_down {state}"])
-        self.assertIn("Putting DNS on sr-tun0 back", r.stdout)
+        self.assertEqual(self.disc_calls(), [f"disconnect {state} prog=srnet-exits"])
+        self.assertEqual(self.dns_calls(), [])
         self.assertNotIn("resolvectl revert", r.stdout)
-        self.assertIn("sudo nft delete table inet srnet_ks", r.stdout)
+        self.assertNotIn("srnet_ks", r.stdout)
         self.assertFalse(self.prefix.exists())
 
     def test_dns_that_could_not_be_put_back_gets_the_resolvectl_line(self):
         self.run_install()
-        self._tunnel_state()
-        r = self.run_install("--uninstall", "--force", FAKE_DNS_RC="1")
+        self._tunnel_state(connected=False)
+        r = self.run_install("--uninstall", FAKE_DNS_RC="1")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Putting DNS on sr-tun0 back", r.stdout)
         self.assertIn("Restore DNS with: sudo resolvectl revert sr-tun0", r.stdout)
-        self.assertIn("sudo nft delete table inet srnet_ks", r.stdout)
         # the environment already gone: the line is printed from the state file alone
         r = self.run_install("--uninstall", "--force")
         self.assertEqual(self.dns_calls(), [])
