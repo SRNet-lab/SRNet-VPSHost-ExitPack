@@ -104,6 +104,9 @@ Then use `srnet exits`, `srnet buy`, `srnet connect` and `srnet disconnect` the 
 above, or the **Exits** tab in the app. `srnet` and `srnet-exits` share your paid time, so you
 can have both.
 
+To update the exits client: `cd ~/SRNet-VPSHost-ExitPack && git pull && client/install.sh`. To
+update SRNet-Desktop and its exits add-on: `cd ~/SRNet-Desktop && git pull && ./install.sh`.
+
 ## Sell exit time
 
 You need:

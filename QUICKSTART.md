@@ -70,6 +70,10 @@ Payments land in your wallet directly; there is nothing to claim.
 **Change the price:** run the install command from step 3 again with the new
 `--price-per-hour-usdc`. Don't edit `listing.json` by hand.
 
+**Update the pack:** `cd ~/SRNet-VPSHost-ExitPack && git pull`, then run the install command from
+step 3 again with the same options. It builds Session Router again, so it takes as long as the
+first install. Your keys and seller id are kept.
+
 **Held payments:** if a buyer paid a quote that no longer matches your listing (for example right
 after a price change), it is held. `sudo srnet-seller held` lists them and
 `sudo srnet-seller admit <quote id>` lets the buyer in. Answer within 8 days.

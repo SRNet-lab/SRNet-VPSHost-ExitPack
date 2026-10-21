@@ -34,7 +34,13 @@ srnet-exits doctor
 
 It ends with `all good` when everything is ready.
 
-Run `client/install.sh` again to update. `client/install.sh --uninstall` removes the client and
+To update:
+
+```sh
+cd ~/SRNet-VPSHost-ExitPack && git pull && client/install.sh
+```
+
+`client/install.sh --uninstall` removes the client and
 keeps your paid time and settings in `~/.srnet`.
 
 ## Install into SRNet-Desktop
@@ -44,7 +50,8 @@ keeps your paid time and settings in `~/.srnet`.
 ```
 
 This adds the commands below to `srnet` and an **Exits** tab to the app. You can have both:
-`srnet` and `srnet-exits` share the same paid time and connection.
+`srnet` and `srnet-exits` share the same paid time and connection. To update, run
+`cd ~/SRNet-Desktop && git pull && ./install.sh`.
 
 ## Buy time and connect
 
