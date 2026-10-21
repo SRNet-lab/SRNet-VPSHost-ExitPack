@@ -7,6 +7,8 @@
   the hour. No balance, no contract and no escrow.
 - `srnet-exits` runs on its own, so you can use exits without SRNet-Desktop.
 
+Full history: [CHANGELOG.md](CHANGELOG.md)
+
 Everything for SRNet exits in one place:
 
 - **Seller pack** (`seller/`): patches, build scripts and an installer for running a paid,
