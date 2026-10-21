@@ -129,6 +129,27 @@ class KillSwitchOwner(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.rules(U(("999; drop",), "router"))
 
+    def test_dhcp_renewal_allowed_narrowly_in_every_mode(self):
+        U = killswitch.UdpOwner
+        want = ['add rule inet srnet_ks_test output oifname "eth0" meta nfproto ipv4 udp sport 68 udp dport 67 accept',
+                'add rule inet srnet_ks_test output oifname "eth0" meta nfproto ipv6 udp sport 546 udp dport 547 accept']
+        for owner in (U((999,), "router"), U((0, 999), "shared"), U((), "all")):
+            ks = killswitch.KillSwitch(name="srnet_ks_test")
+            scripts = []
+
+            class R:
+                returncode, stdout, stderr = 0, "", ""
+            ks._nft_f = lambda script, check=True: scripts.append(script) or R()
+            ks._nft = lambda *a, check=True: R()
+            ks.arm("eth0", owner=owner)
+            lines = scripts[0].splitlines()
+            dhcp = [l for l in lines if "sport 68" in l or "sport 546" in l or "dport 67" in l or "dport 547" in l]
+            self.assertEqual(dhcp, want, owner)
+            # before every drop and the WAN UDP allow
+            first_drop = next(i for i, l in enumerate(lines) if l.endswith(" drop"))
+            wan_udp = next(i for i, l in enumerate(lines) if "l4proto udp" in l)
+            self.assertLess(lines.index(want[1]), min(first_drop, wan_udp))
+
 
 class KillSwitch(unittest.TestCase):
     def test_arm_disarm_dry(self):

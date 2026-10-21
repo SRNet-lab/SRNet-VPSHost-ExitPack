@@ -479,7 +479,7 @@ class KillSwitchNote(_Base):
 
     def test_notes_match_the_rules(self):
         k = self.cli.killswitch
-        self.assertIn("except Session Router's own UDP", k.NOTE)
+        self.assertIn("except DHCP lease renewal and Session Router's own UDP", k.NOTE)
         self.assertIn("DNS outside the tunnel is blocked", k.NOTE)
         self.assertNotIn("QUIC", k.NOTE)
         for n in (k.NOTE_ALL, k.NOTE_SHARED("root")):

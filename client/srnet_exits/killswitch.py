@@ -1,7 +1,8 @@
 """nftables kill switch: block clearnet egress except Session Router's own UDP + the tunnel.
 
 When armed, only traffic via the TUN (exit path), UDP on the WAN interface sent by the user
-Session Router runs as (`meta skuid`, see udp_owner()), IPv6 neighbor discovery and replies to
+Session Router runs as (`meta skuid`, see udp_owner()), DHCP lease renewal on the WAN (UDP
+68->67 and 546->547), IPv6 neighbor discovery and replies to
 connections that came in on the WAN (SSH/RDP to this machine, see inbound.py) are allowed out.
 Only this machine's own traffic is covered (output hook): traffic forwarded for containers or VMs
 is not. If the router's user cannot be found, the WAN UDP allow falls back to all UDP (QUIC/WebRTC
@@ -31,8 +32,8 @@ ROUTER_USER = "_session"  # User= in the packaged session-router-client.service
 ROUTER_COMM = "session-router"
 
 # What the kill switch leaves open, shown wherever connect is (CLI, status, Exits page, warning).
-NOTE = ("The kill switch blocks everything outside the tunnel except Session Router's own UDP, which it "
-        "needs. DNS outside the tunnel is blocked.")
+NOTE = ("The kill switch blocks everything outside the tunnel except DHCP lease renewal and Session "
+        "Router's own UDP, which it needs. DNS outside the tunnel is blocked.")
 NOTE_FALLBACK = ("If connect can't tell which user Session Router runs as, it lets all UDP out and says so.")
 NOTE_ALL = ("The kill switch blocks everything outside the tunnel except UDP, which Session Router needs. "
             "Apps that send UDP, such as QUIC in browsers and WebRTC calls, can still leave outside the exit "
@@ -40,8 +41,8 @@ NOTE_ALL = ("The kill switch blocks everything outside the tunnel except UDP, wh
 
 
 def NOTE_SHARED(user: str) -> str:
-    return (f"The kill switch blocks everything outside the tunnel except UDP from programs running as {user}, "
-            f"the user Session Router runs as here. Apps running as {user} that send UDP, such as QUIC in "
+    return (f"The kill switch blocks everything outside the tunnel except DHCP lease renewal and UDP from "
+            f"programs running as {user}, the user Session Router runs as here. Apps running as {user} that send UDP, such as QUIC in "
             "browsers and WebRTC calls, can still leave outside the exit if the tunnel drops or they pick "
             "your normal connection themselves. DNS outside the tunnel is blocked.")
 
@@ -206,7 +207,7 @@ class KillSwitch:
             who = (f" meta skuid {owner.uids[0]}" if len(owner.uids) == 1
                    else " meta skuid { " + ", ".join(str(u) for u in owner.uids) + " }")
         self.disarm()
-        # Order matters: TUN accept, then DNS drop, then WAN overlay UDP.
+        # Order matters: TUN accept, DHCP renewal, then DNS drop, then WAN overlay UDP.
         # Without the DNS drop, the WAN UDP accept would leak resolver traffic.
         lines = [
             f"add table {self.table} {self.name}",
@@ -222,6 +223,9 @@ class KillSwitch:
             f"add rule {self.table} {self.name} output meta l4proto ipv6-icmp icmpv6 type "
             "{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } ip6 hoplimit 255 accept",
             f'add rule {self.table} {self.name} output oifname "{self.tun}" accept',
+            # DHCP lease renewal on the WAN (the client ports need root, so apps can't use them)
+            f'add rule {self.table} {self.name} output oifname "{wan_if}" meta nfproto ipv4 udp sport 68 udp dport 67 accept',
+            f'add rule {self.table} {self.name} output oifname "{wan_if}" meta nfproto ipv6 udp sport 546 udp dport 547 accept',
             f"add rule {self.table} {self.name} output udp dport 53 drop",
             f"add rule {self.table} {self.name} output tcp dport 53 drop",
             f'add rule {self.table} {self.name} output oifname "{wan_if}" meta l4proto udp{who} accept',

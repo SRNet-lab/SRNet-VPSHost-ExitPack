@@ -7,7 +7,8 @@
 - The kill switch lets only Session Router's own UDP out on your normal connection (nftables
   `meta skuid`, the user the router runs as), so QUIC and WebRTC from your apps no longer leave
   outside the exit while it is armed. If connect can't tell which user Session Router runs as, it
-  lets all UDP out as before and says so. DNS outside the tunnel stays blocked.
+  lets all UDP out as before and says so. DNS outside the tunnel stays blocked. DHCP lease renewal
+  is allowed on your normal connection, so the machine keeps its address during long connections.
 - `connect`, `status`, the Exits page and the first-run warning say what the kill switch leaves
   open.
 - `status` and the Exits page say to reconnect if Session Router now runs as a different user than
