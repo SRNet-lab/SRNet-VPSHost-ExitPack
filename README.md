@@ -52,11 +52,6 @@ Building the router from source takes about 12 minutes on a 2 vCPU server, longe
 If the amount or the chain is wrong, nothing is matched and the client says so plainly.
 Payments are final.
 
-A payment made in time is never lost because someone came back late or an RPC was down. The
-seller takes the report for 8 days and keeps checking while its RPC is down. If the client
-couldn't read the chain, it says so and tells you not to pay again; `srnet paid --tx 0x...`
-reports a hash you already have.
-
 ## Buyer: use exits without SRNet-Desktop
 
 On Ubuntu 24.04, with Session Router installed and running (steps 1 and 2 of the
