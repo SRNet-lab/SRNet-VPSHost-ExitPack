@@ -4,10 +4,10 @@ Run an SRNet exit on a fresh server.
 
 ## Requirements
 
-- Ubuntu 24.04 LTS x86_64 (Debian 12 is untested), root access
+- Ubuntu 24.04 LTS x86_64 (Debian 12 is untested), and a user who can use sudo
 - A public IPv4 address with udp/1193 reachable
-- 2+ vCPU and 4 GB RAM (or swap) for a source build, which takes 20 to 60
-  minutes. The release install uses a prebuilt router and needs less.
+- 2+ vCPU and 4 GB RAM (or swap) for a source build, which takes about 12 minutes on 2 vCPU
+  and longer on slower servers. The release install uses a prebuilt router and needs less.
 - A payout wallet address that can receive USDC on Arbitrum One and Base. Only the address;
   the pack never needs a private key.
 - An hourly price in USDC (at least 0.10)
@@ -26,6 +26,9 @@ cd SRNet-VPSHost-ExitPack
 sudo seller/install.sh --source --payout 0xYourPayoutWallet --price-per-hour-usdc 1.00 \
   --enable-exit --i-accept-exit-operator-responsibility
 ```
+
+Your listing goes on the public SRNet board within minutes. To try the pack first without
+being listed, add `--board-submit-url none`.
 
 Exit forwarding stays off unless you pass both `--enable-exit` and
 `--i-accept-exit-operator-responsibility`.
@@ -83,12 +86,12 @@ the next valid refresh. Each listing carries `exit_version`, the pack version fr
 ## Usage
 
 ```sh
-srnet-seller status
-srnet-seller health     # binary, keys, firewall, NAT, DNS drop, exit resolver, listing age
-srnet-seller listing
-srnet-seller logs
-srnet-seller held       # paid quotes waiting for you (their price matches no listing)
-srnet-seller admit <quote id>
+sudo srnet-seller status
+sudo srnet-seller health     # binary, keys, firewall, NAT, DNS drop, exit resolver, listing age
+sudo srnet-seller listing
+sudo srnet-seller logs
+sudo srnet-seller held       # paid quotes waiting for you (their price matches no listing)
+sudo srnet-seller admit <quote id>
 ```
 
 Payments land in your payout wallet directly; there is nothing to claim. Each admitted
@@ -98,13 +101,13 @@ To change the price, re-run the installer with the new `--price-per-hour-usdc` (
 other flags you used). Don't edit `listing.json` by hand: the installer keeps the old
 listing in `listing/previous.json` so quotes made just before the change still count. If a
 paid quote ever matches no listing, the watcher holds it, logs the quote id, and waits for
-`srnet-seller admit <quote id>`. Answer within 8 days; after that it is refused as too old.
+`sudo srnet-seller admit <quote id>`. Answer within 8 days; after that it is refused as too old.
 
 ## Uninstall
 
 ```sh
-srnet-seller uninstall           # remove services, firewall rules and NAT; keep keys
-srnet-seller uninstall --purge   # also delete keys, listing, data and service users
+sudo srnet-seller uninstall           # remove services, firewall rules and NAT; keep keys
+sudo srnet-seller uninstall --purge   # also delete keys, listing, data and service users
 ```
 
 ## Options

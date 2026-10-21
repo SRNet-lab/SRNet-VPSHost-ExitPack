@@ -26,7 +26,7 @@ or the Session Technology Foundation.
 Install from a clone (below). Release builds (a prebuilt router tarball, the seller pack and a
 pinned `bootstrap.sh`, made with `scripts/make-release.sh`) go on
 [GitHub Releases](https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack/releases) when published.
-Building the router from source takes 20 to 60 minutes.
+Building the router from source takes about 12 minutes on a 2 vCPU server, longer on a slower one.
 
 ## How paying works
 
@@ -94,23 +94,58 @@ or, by hand, `<the client's python> -m pip install "srnet-exits @ git+https://gi
 
 ## Seller: install
 
-On a fresh Ubuntu 24.04 x86_64 server, as root:
+You need a fresh Ubuntu 24.04 x86_64 server with at least 2 vCPU and 4 GB RAM, a public IPv4
+address, and a wallet address that can receive USDC on Arbitrum One and Base. The installer
+builds Session Router from source. That takes about 12 minutes on a 2 vCPU server, longer on a
+slower one.
+
+Log in as a user who can use sudo, then:
 
 ```sh
 cd ~
-apt update && apt install -y git
+sudo apt update && sudo apt install -y git
 git clone https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack.git
 cd SRNet-VPSHost-ExitPack
-seller/install.sh --source --payout 0xYourPayoutWallet --price-per-hour-usdc 1.00 \
+sudo seller/install.sh --source --payout 0xYourPayoutWallet --price-per-hour-usdc 1.00 \
   --enable-exit --i-accept-exit-operator-responsibility
 ```
+
+The installer asks no questions. At the end it prints your seller id (`seller .sesh:`), your
+signed listing and a health check that ends with `health: OK`.
+
+Your listing goes on the public SRNet board within minutes, and buyers can pay you from then on.
+To try the pack first without being listed, add `--board-submit-url none`. When you are ready,
+run the same command again without it.
+
+The installer sets the firewall to block all incoming traffic except SSH and udp/1193. It reads
+the SSH port from your SSH server's settings. To set it yourself, add `--ssh-port N`.
+
+Check on it any time:
+
+```sh
+sudo srnet-seller health
+sudo srnet-seller listing
+sudo srnet-seller logs
+```
+
+To see what a buyer sees, run this on any computer with `srnet-exits` installed:
+
+```sh
+srnet-exits exits
+srnet-exits buy --seller <your seller id> --hours 1 --no-wait
+```
+
+The second command shows the payment screen with your payout address and the exact amount, then
+stops. Nothing is paid. If you installed with `--board-submit-url none`, copy
+`/opt/srnet-seller/listing/listing.json` from the server and add `--listings listing.json` to
+both commands.
 
 Once a release is published, its `ONE-LINER.txt` has the exact `bootstrap.sh` command and hash;
 the bootstrap falls back to a source build if the router tarball is missing or its hash doesn't
 match.
 
-See [QUICKSTART.md](QUICKSTART.md) for requirements, what gets installed and
-day-to-day commands. `seller/install.sh --help` lists every flag.
+See [QUICKSTART.md](QUICKSTART.md) for what gets installed and day-to-day commands.
+`seller/install.sh --help` lists every flag.
 
 ## Build
 
@@ -217,8 +252,8 @@ keeps the last few listings, with the time each was replaced, in `listing/previo
 quotes made just before the change still count. If a paid quote matches no listing the
 watcher knows (say the price was changed some other way), the buyer is not refused: the
 payment is checked on chain, the buyer sees "the seller has to confirm it", and the
-watcher's log names the quote. `srnet-seller held` lists those quotes with the amount,
-hours, price per hour, chain and age, and `srnet-seller admit <quote id>` admits one after
+watcher's log names the quote. `sudo srnet-seller held` lists those quotes with the amount,
+hours, price per hour, chain and age, and `sudo srnet-seller admit <quote id>` admits one after
 the watcher checks the payment again. Answer held quotes within 8 days of the quote: after
 that the watcher refuses them as too old. Only quotes our own listings could have made are
 held (at least the 0.10 minimum price, no more hours than the largest max hours). A quote
