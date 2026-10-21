@@ -312,12 +312,30 @@ class TunnelDNS(_Base):
         with mock.patch("sys.stdout", out), mock.patch("sys.stderr", _io.StringIO()), \
                 mock.patch.object(self.cli.killswitch.KillSwitch, "status", lambda self: None), \
                 mock.patch.object(self.cli.killswitch, "find_nft", lambda: "/usr/sbin/nft"):
-            self.run_cli(home, "status")
+            self.run_cli(home, "status", "--json")
         j = json.loads(out.getvalue())
         self.assertTrue(j["killswitch"].startswith("unknown (checking needs root"))
         self.assertNotIn("sudo srnet", j["killswitch"])
         self.assertIn("through the exit", j["dns"])
         self.assertEqual(j["leases"][0]["seller"], SELLER)
+
+    def test_status_summary(self):
+        home, _ = self.connect()
+        out = _io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", _io.StringIO()), \
+                mock.patch.object(self.cli.killswitch.KillSwitch, "status", lambda self: None), \
+                mock.patch.object(self.cli.killswitch, "find_nft", lambda: "/usr/sbin/nft"):
+            self.assertEqual(self.run_cli(home, "status"), 0)
+        text = out.getvalue()
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith(f"Connected: yes, through {SELLER} since "), text)
+        self.assertRegex(text, rf"Paid time: \d+ (h \d+ )?min left with {SELLER}, until \d\d:\d\d")
+        word = "armed" if self.st(home)["connected"]["killswitch"] else "off"
+        self.assertIn(f"Kill switch: {word} when you connected (checking it now needs root: "
+                      "sudo nft list table inet srnet_ks)", text)
+        self.assertIn("DNS: through the exit", text)
+        self.assertNotIn("{", text)
+        self.assertLess(len(lines), 10)
 
 
 class DisconnectWhenNotConnected(_Base):

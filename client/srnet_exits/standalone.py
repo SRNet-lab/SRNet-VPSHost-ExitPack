@@ -6,7 +6,8 @@
   srnet-exits buy --seller ID --hours N    get a quote, pay it from any wallet, wait for the seller
   srnet-exits paid [--quote ID] [--tx 0x]  carry on after paying (or give the transaction hash)
   srnet-exits connect ID                   route traffic and DNS through the exit (Linux, asks sudo)
-  srnet-exits status | disconnect
+  srnet-exits status [--json]              paid time left, connection, kill switch, DNS
+  srnet-exits disconnect                   DNS and routes back, kill switch off
   srnet-exits verify --chain base --tx 0x.. --to 0x.. --amount 3.50   check a shop payment on chain
   srnet-exits ui                           the same in a small page in your browser (127.0.0.1 only)
 

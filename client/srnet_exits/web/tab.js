@@ -91,7 +91,7 @@
 
   async function buy(x, hours) {
     const total = (Number(x.price) * hours).toFixed(2);
-    sh.sheet("Buy " + hours + " h of exit time?", x.seller, ["about " + total + " USDC plus the network fee", "paid directly to the seller from your own wallet", "final: no refund, even if the exit doesn't work"],
+    sh.sheet("Buy " + hours + " h of exit time?", x.seller, [total + " USDC, plus a payment ID of usually under one cent that tells your payment apart from others", "the next screen shows the exact amount to send", "paid directly to the seller from your own wallet; you pay the network fee", "final: no refund, even if the exit doesn't work"],
       [["Get payment details", async () => {
         let r = await call("quote", {seller: x.seller, hours, chain: q("chain").value});
         if (r.need_ack) { if (!(await needAck(r))) return; r = await call("quote", {seller: x.seller, hours, chain: q("chain").value}); }

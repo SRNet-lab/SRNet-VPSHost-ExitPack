@@ -32,8 +32,8 @@ Building the router from source takes 20 to 60 minutes.
 
 1. The buyer runs `srnet buy --seller <id> --hours N` (or presses Buy in the Exits tab).
 2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
-   contract, and an exact amount (the hourly price times N plus a few millionths of a USDC as a
-   payment ID, so no two quotes in 7 days share an amount). The payment ID is usually under one
+   contract, and an exact amount (the hourly price times N plus a small payment ID, so no two
+   quotes in 7 days share an amount). The payment ID is usually under one
    cent. When many quotes are out it can grow, but never past 0.05 USDC or 5% of the price,
    whichever is larger, and never past half the price. The payment screen shows it. The
    quote is bound to the buyer's `.sesh` address and expires after about 15 minutes. One

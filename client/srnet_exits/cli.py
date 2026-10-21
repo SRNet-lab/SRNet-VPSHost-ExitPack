@@ -4,7 +4,7 @@
   srnet buy --seller ID --hours N      get a quote, pay it from any wallet, wait for the exit to admit you
   srnet paid [--quote ID] [--tx HASH]  carry on after `buy --no-wait` (or tell the seller a tx hash)
   srnet connect ID                     route your traffic through that exit (kill switch, exit DNS)
-  srnet status                         paid time left, connection, kill switch, DNS
+  srnet status [--json]                paid time left, connection, kill switch, DNS
   srnet disconnect                     restore DNS, unmap, remove the kill switch
 
 You pay the seller directly in USDC on Arbitrum or Base, from your own wallet, and pay the network
@@ -92,20 +92,24 @@ def extra_text(i: dict) -> str:
             "(it makes your payment unique; the seller keeps it).")
 
 
-def payment_text(i: dict) -> str:
-    qr = qr_text(i["uri"])
-    return "\n".join(x for x in [
-        f"Pay exactly {i['amount_text']} USDC on {i['chain']} to:",
-        f"  {i['address']}",
+def payment_text(i: dict, qr: str | None = None) -> str:
+    """The payment screen. With a QR code the amount, network, address and end time come again
+    below it, so the last lines on a small screen still say what to send."""
+    qr = qr_text(i["uri"]) if qr is None else qr
+    pay = [f"Pay exactly {i['amount_text']} USDC on {i['chain']} to:", f"  {i['address']}"]
+    until = f"Quote {i['id']}: {i['hours']} h, good until {_hhmm(i['expires'])} (about 15 min)."
+    lines = [
+        *pay,
         extra_text(i),
-        "",
-        qr.rstrip("\n") if qr else "",
         f"Payment link (most wallets): {i['uri']}",
         f"USDC contract on {i['chain']}: {i['token_address']}",
-        f"Quote {i['id']}: {i['hours']} h, good until {_hhmm(i['expires'])} (about 15 min).",
         "Send that exact amount: a different amount or another chain can't be matched to you.",
         "You pay the network fee yourself. The payment is final.",
-    ] if x is not None)
+    ]
+    if qr:
+        lines += ["", qr.rstrip("\n"), *pay]
+    lines.append(until)
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ commands
@@ -516,13 +520,51 @@ def status_info(st, cfg: dict, endpoint: str | None = None, rpc_probe: bool = Tr
     return info
 
 
+def status_text(info: dict, now: float | None = None) -> str:
+    """The short summary `status` prints (the full record is behind --json)."""
+    now = time.time() if now is None else now
+    conn = info.get("connected") or {}
+    out = []
+    if conn:
+        since = f" since {_hhmm(conn['at'])}" if conn.get("at") else ""
+        out.append(f"Connected: yes, through {conn.get('seller')}{since}")
+        if info.get("connected_note"):
+            out.append(f"  {info['connected_note']}")
+    else:
+        out.append("Connected: no")
+    if info["leases"]:
+        for l in info["leases"]:
+            tail = " (ending soon: buy more to keep going)" if l["ending"] else ""
+            out.append(f"Paid time: {_left(l['left_s'])} left with {l['seller']}, until {_hhmm(l['end'])}{tail}")
+        if not conn:
+            out.append(f"  connect: {_P()} connect {info['leases'][0]['seller']}")
+    else:
+        out.append(f"Paid time: none (buy some: {_P()} exits)")
+    ks = info.get("killswitch")
+    if ks is not None:
+        if ks.startswith("unknown (checking needs root"):
+            look = "sudo nft list table inet srnet_ks"
+            ks = (f"{'armed' if conn.get('killswitch') else 'off'} when you connected (checking it now needs root: {look})"
+                  if conn else f"not checked (needs root: {look})")
+        out.append(f"Kill switch: {ks}")
+    out.append(f"DNS: {info['dns']}")
+    for q in info["quotes"]:
+        when = (f"good until {_hhmm(q['expires'])}" if q["expires"] > now
+                else f"ran out at {_hhmm(q['expires'])}")
+        out.append(f"Open quote {q['id']}: pay exactly {q['amount']} USDC on {q['chain']} to {q['seller']}, {when}")
+        out.append(f"  after paying: {_P()} paid --quote {q['id']}")
+    if info.get("list_exits_error"):
+        out.append(f"Session Router: not answering ({info['list_exits_error']})")
+    return "\n".join(out)
+
+
 def cmd_status(args, st) -> int:
     cfg = config.load(st.root)
     info = status_info(st, cfg, args.rpc_endpoint)
-    for l in info["leases"]:
-        tail = "  (ending soon: buy more to keep going)" if l["ending"] else ""
-        print(f"paid time: {l['seller']} until {_hhmm(l['end'])}, {_left(l['left_s'])} left{tail}", file=sys.stderr)
-    print(json.dumps(info, indent=2))
+    if args.json:
+        print(json.dumps(info, indent=2))
+    else:
+        print(status_text(info))
     return 0
 
 
@@ -610,6 +652,7 @@ def register(sub) -> dict:
 
     s = sub.add_parser("status", help="exits: paid time left, connection, kill switch, DNS")
     s.add_argument("--rpc-endpoint")
+    s.add_argument("--json", action="store_true", help="everything as JSON")
 
     d = sub.add_parser("disconnect", help="exits: restore DNS, unmap, remove the kill switch")
     d.add_argument("--seller")

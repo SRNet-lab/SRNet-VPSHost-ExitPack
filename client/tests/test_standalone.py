@@ -156,11 +156,37 @@ class Commands(unittest.TestCase):
         def no_router(endpoint):
             raise RuntimeError("Session Router is not running")
         with mock.patch("srnet_exits.cli._rpc", no_router):
+            rc, out, _ = run_main(["--home", str(home), "status", "--json"])
+            self.assertEqual(rc, 0)
+            info = json.loads(out)
+            self.assertIsNone(info["connected"])
+            self.assertEqual(info["list_exits_error"], "Session Router is not running")
             rc, out, _ = run_main(["--home", str(home), "status"])
         self.assertEqual(rc, 0)
-        info = json.loads(out)
-        self.assertIsNone(info["connected"])
-        self.assertEqual(info["list_exits_error"], "Session Router is not running")
+        self.assertEqual(out.splitlines()[0], "Connected: no")
+        self.assertIn("Paid time: none (buy some: srnet-exits exits)", out)
+        self.assertIn("Session Router: not answering (Session Router is not running)", out)
+
+    def test_status_summary_lists_an_open_quote_and_paid_time(self):
+        import time as _t
+        from srnet_exits import cli
+        now = 1_800_000_000
+        info = {"connected": None, "dns": "system (normal resolver)", "killswitch": "off",
+                "leases": [{"seller": "abc.sesh", "end": now + 3000, "left_s": 3000, "ending": False}],
+                "quotes": [{"id": "q123", "seller": "abc.sesh", "state": "open", "amount": "0.505521",
+                            "chain": "Arbitrum One", "expires": now + 600}]}
+        with mock.patch.dict(os.environ, PROG_ENV):
+            text = cli.status_text(info, now=now)
+        hhmm = lambda t: _t.strftime("%H:%M %Z", _t.localtime(t)).strip()
+        self.assertEqual(text.splitlines(), [
+            "Connected: no",
+            f"Paid time: 50 min left with abc.sesh, until {hhmm(now + 3000)}",
+            "  connect: srnet-exits connect abc.sesh",
+            "Kill switch: off",
+            "DNS: system (normal resolver)",
+            f"Open quote q123: pay exactly 0.505521 USDC on Arbitrum One to abc.sesh, good until {hhmm(now + 600)}",
+            "  after paying: srnet-exits paid --quote q123",
+        ])
 
 
 class Doctor(unittest.TestCase):

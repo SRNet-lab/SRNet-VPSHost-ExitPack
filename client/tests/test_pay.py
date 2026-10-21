@@ -114,6 +114,21 @@ class QuoteBinding(Flow):
         text = cli.payment_text(i)
         self.assertIn(f"That is 2.00 USDC for 2 h plus {C.fmt_usdc(i['extra'])} USDC as a payment ID", text)
 
+    def test_payment_screen_repeats_what_to_send_below_the_qr(self):
+        from srnet_exits import cli
+        i = self.buyer.info(self.buy())
+        pay = f"Pay exactly {i['amount_text']} USDC on {i['chain']} to:"
+        text = cli.payment_text(i, qr="QR-LINE-1\nQR-LINE-2\n")
+        tail = text.split("QR-LINE-2\n", 1)[1].splitlines()
+        self.assertEqual(tail[:2], [pay, f"  {i['address']}"])
+        self.assertTrue(tail[2].startswith(f"Quote {i['id']}: 1 h, good until "), tail)
+        self.assertEqual(len(tail), 3)
+        self.assertEqual(text.count(pay), 2)
+        # no QR (the qrcode package missing): said once, the end time last
+        text = cli.payment_text(i, qr="")
+        self.assertEqual(text.count(pay), 1)
+        self.assertTrue(text.splitlines()[-1].startswith(f"Quote {i['id']}: "))
+
     def test_two_open_quotes_get_different_amounts(self):
         a = self.buy()["doc"]["quote"]["amount"]
         b = self.buy()["doc"]["quote"]["amount"]
