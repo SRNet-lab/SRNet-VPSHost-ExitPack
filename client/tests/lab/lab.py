@@ -1,4 +1,4 @@
-"""Netns lab for inbound.py + the kill switch (cases: full rpfilter metrics foreign legacy container).
+"""Netns lab for inbound.py + the kill switch (cases: full rpfilter metrics foreign legacy container udpgap).
 
 Runs inside `unshare -rn` after setup.sh: this netns is the client (eth0 = WAN 10.0.0.2/24 +
 2001:db8::2/64, sr-tun0 = a veth standing in for the tunnel); the remote netns (pid in argv[1])
@@ -150,6 +150,16 @@ def udp(dst, port, fam=socket.AF_INET):
     s.settimeout(1.5)
     s.sendto(b"q", (dst, port))
     return s.recvfrom(9)[0]
+
+
+def tcp_dev(dst, port, dev):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode())
+    s.settimeout(1.5)
+    s.connect((dst, port))
+    d = s.recv(9)
+    s.close()
+    return d
 
 
 def tunnel_routes(add=True):
@@ -319,6 +329,38 @@ elif CASE == "container":
     teardown_checks()
     srv.kill()
     cp.kill()
+elif CASE == "udpgap":
+    # what killswitch.NOTE says: armed, only UDP may leave on the WAN (DNS and TCP may not)
+    inbound.up("eth0")
+    killswitch.KillSwitch().arm("eth0", bootstrap_ips=[])
+    tunnel_routes()
+
+    def udp_dev(dst, port, dev):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, dev.encode())
+        s.settimeout(1.5)
+        s.sendto(b"q", (dst, port))
+        return s.recvfrom(9)[0]
+    res, d = delta(lambda: udp_dev("198.51.100.1", 9999, "eth0"))
+    check(res == b"ok" and d.get("wan_udp", 0) > 0, "armed, tunnel up: UDP an app sends on eth0 itself leaves on the WAN",
+          (res, d))
+    res, d = delta(lambda: tcp_dev("198.51.100.1", 80, "eth0"))
+    check(not d.get("wan_tcp"), "armed, tunnel up: TCP an app sends on eth0 itself is dropped", (res, d))
+    tunnel_routes(False)   # the tunnel drops: its routes go away
+    res, d = delta(lambda: udp("198.51.100.1", 9999))
+    check(res == b"ok" and d.get("wan_udp", 0) > 0, "armed, tunnel down: UDP leaves on the WAN", (res, d))
+    res, d = delta(lambda: udp("198.51.100.1", 53))
+    check(isinstance(res, Exception) and not d.get("wan_udp"), "armed, tunnel down: DNS udp/53 is dropped", (res, d))
+    res, d = delta(lambda: tcp("198.51.100.1", 53))
+    check(isinstance(res, Exception) and not d.get("wan_tcp"), "armed, tunnel down: DNS tcp/53 is dropped", (res, d))
+    res, d = delta(lambda: tcp("198.51.100.1"))
+    check(isinstance(res, Exception) and not d.get("wan_tcp"), "armed, tunnel down: TCP is dropped", (res, d))
+    tunnel_routes()
+    teardown_checks()
+    res, d = delta(lambda: tcp("198.51.100.1"))
+    check(res == b"hi" and d.get("wan_tcp", 0) > 0, "disarmed: TCP on the WAN works again", (res, d))
+    res, d = delta(lambda: udp("198.51.100.1", 53))
+    check(res == b"ok", "disarmed: DNS on the WAN works again", (res, d))
 else:
     sys.exit(f"unknown case {CASE}")
 

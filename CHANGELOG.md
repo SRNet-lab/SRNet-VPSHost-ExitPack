@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `connect`, `status`, the Exits page and the first-run warning say what the kill switch leaves
+  open: UDP stays allowed on your normal connection because Session Router needs it, so QUIC and
+  WebRTC can leave outside the exit if the tunnel drops or they pick your normal connection
+  themselves. DNS outside the tunnel stays blocked.
+
 ## [0.4.0] - 2026-10-20
 
 ### Added

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Run the netns lab: every case in fresh namespaces of an unprivileged user namespace (no root
 # needed, but user namespaces and the nft tool must be available). Exit 0 when all cases pass.
-#   tests/lab/run.sh [case ...]     cases: full rpfilter metrics foreign legacy container
+#   tests/lab/run.sh [case ...]     cases: full rpfilter metrics foreign legacy container udpgap
 set -u
 cd "$(dirname "$0")"
 command -v nft >/dev/null || [ -x /usr/sbin/nft ] || { echo "SKIP: no nft"; exit 0; }
 unshare -rn true 2>/dev/null || { echo "SKIP: no user namespaces"; exit 0; }
-CASES="${*:-full rpfilter metrics foreign legacy container}"
+CASES="${*:-full rpfilter metrics foreign legacy container udpgap}"
 fail=0
 for c in $CASES; do
   rp=$(mktemp -u /tmp/srnet_lab_rp.XXXXXX)

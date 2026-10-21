@@ -1,7 +1,10 @@
 """First-run exit-visibility warning (required before connect/buy)."""
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
+
+from .killswitch import NOTE
 
 WARNING = """\
 SRNet exit visibility warning
@@ -20,16 +23,16 @@ and destination IPs are enough to learn which sites you visit.
 While connected, every DNS lookup goes through the tunnel to the exit's own
 resolver, which resolves it itself (no public resolver involved). The exit
 operator can therefore see the names you look up, as well as your
-destinations; .sesh names stay on Session Router. The local nftables kill switch blocks clearnet TCP and DNS if
-the tunnel drops; other UDP to the internet stays open for the overlay, so apps using
-QUIC or WebRTC may bypass the exit.
+destinations; .sesh names stay on Session Router.
+
+{ks}
 
 You pay the seller directly in USDC from your own wallet, and you pay the
 network fee yourself. Payments are FINAL: there is no refund, even if the
 exit does not work. Nothing renews by itself; buy again to add time.
 
 Type exactly:  I UNDERSTAND
-"""
+""".format(ks=textwrap.fill(NOTE, 78))
 
 
 def acked(state_dir: Path) -> bool:

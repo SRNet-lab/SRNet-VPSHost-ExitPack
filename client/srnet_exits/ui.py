@@ -26,7 +26,7 @@ from pathlib import Path
 import chains as C  # noqa: E402
 import quote as Q  # noqa: E402
 
-from . import board as boardmod, cli, config, pay, warning
+from . import board as boardmod, cli, config, killswitch, pay, warning
 from .prog import P as _P
 
 WEB = Path(__file__).resolve().parent / "web"
@@ -80,6 +80,7 @@ class Backend:
         info["client_sesh"] = cfg.get("client_sesh") or cli.own_sesh()
         info["max_payment_usdc"] = C.fmt_usdc(config.max_payment(cfg))
         info["acked"] = warning.acked(self.st.root)
+        info["killswitch_note"] = killswitch.NOTE
         return info
 
     def settings(self, req: dict) -> dict:

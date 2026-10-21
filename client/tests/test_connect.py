@@ -456,3 +456,53 @@ class Helpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KillSwitchNote(_Base):
+    """Wherever connect is shown, the kill switch says what it leaves open (UDP for the overlay)."""
+
+    def test_note_matches_the_rules(self):
+        from srnet_exits import killswitch
+        n = killswitch.NOTE
+        for part in ("except UDP, which Session Router needs", "QUIC in browsers and WebRTC calls",
+                     "DNS outside the tunnel is blocked"):
+            self.assertIn(part, n)
+
+    def test_connect_prints_it_next_to_armed(self):
+        home = self.home()
+        out = _io.StringIO()
+        with mock.patch.object(self.cli.killswitch.KillSwitch, "arm", lambda self, wan, bootstrap_ips=None: None), \
+                mock.patch("sys.stdout", out):
+            self.assertEqual(self.run_cli(home, "connect", SELLER), 0)
+        lines = out.getvalue().splitlines()
+        i = next(i for i, l in enumerate(lines) if l.startswith("kill switch armed on eth0"))
+        self.assertEqual(lines[i + 1], self.cli.killswitch.NOTE)
+
+    def test_not_printed_without_the_kill_switch(self):
+        home = self.home()
+        out = _io.StringIO()
+        with mock.patch("sys.stdout", out):
+            self.assertEqual(self.run_cli(home, "connect", SELLER, "--no-killswitch"), 0)
+        self.assertNotIn(self.cli.killswitch.NOTE, out.getvalue())
+
+    def test_status_summary_says_it_when_armed(self):
+        info = {"connected": {"seller": SELLER, "killswitch": True}, "dns": "x", "killswitch": "armed",
+                "leases": [], "quotes": []}
+        lines = self.cli.status_text(info).splitlines()
+        i = lines.index("Kill switch: armed")
+        self.assertEqual(lines[i + 1], "  " + self.cli.killswitch.NOTE)
+        info["killswitch"] = "off"
+        self.assertNotIn("  " + self.cli.killswitch.NOTE, self.cli.status_text(info).splitlines())
+
+    def test_page_and_docs_carry_it(self):
+        import re
+        from srnet_exits import killswitch, ui, warning
+        root = Path(__file__).resolve().parents[2]
+        flat = lambda s: re.sub(r"\s+", " ", s)
+        self.assertIn(killswitch.NOTE, flat(warning.WARNING))
+        for doc in (root / "README.md", root / "client" / "README.md"):
+            self.assertIn(killswitch.NOTE, flat(doc.read_text()), doc)
+        js = (Path(ui.__file__).parent / "web" / "tab.js").read_text()
+        self.assertIn('q("ksnote").textContent = r.killswitch_note', js)
+        src = Path(ui.__file__).read_text()
+        self.assertIn('info["killswitch_note"] = killswitch.NOTE', src)

@@ -82,6 +82,10 @@ srnet-exits buy --seller <id> --hours 1
 `srnet-exits ui` opens the same thing as a small page in your browser.
 `client/install.sh --uninstall` removes it again. Details: [client/README.md](client/README.md).
 
+The kill switch blocks everything outside the tunnel except UDP, which Session Router needs. Apps
+that send UDP, such as QUIC in browsers and WebRTC calls, can still leave outside the exit if the
+tunnel drops or they pick your normal connection themselves. DNS outside the tunnel is blocked.
+
 ## Buyer: add exits to SRNet-Desktop
 
 If you use the SRNet client, install exits into it instead:

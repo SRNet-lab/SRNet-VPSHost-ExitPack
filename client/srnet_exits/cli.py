@@ -280,6 +280,7 @@ def cmd_connect(args, st) -> int:
             ks.arm(wan, bootstrap_ips=cfg.get("bootstrap_ips") or [])
             armed = True
             print(f"kill switch armed on {wan} (tun={ks.tun})")
+            print(killswitch.NOTE)
         except Exception as e:
             print(f"kill switch NOT armed: {e}", file=sys.stderr)
             if not args.allow_no_ks:
@@ -547,6 +548,8 @@ def status_text(info: dict, now: float | None = None) -> str:
             ks = (f"{'armed' if conn.get('killswitch') else 'off'} when you connected (checking it now needs root: {look})"
                   if conn else f"not checked (needs root: {look})")
         out.append(f"Kill switch: {ks}")
+        if ks.startswith("armed"):
+            out.append(f"  {killswitch.NOTE}")
     out.append(f"DNS: {info['dns']}")
     for q in info["quotes"]:
         when = (f"good until {_hhmm(q['expires'])}" if q["expires"] > now

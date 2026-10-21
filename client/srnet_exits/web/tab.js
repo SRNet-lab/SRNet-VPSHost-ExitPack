@@ -22,6 +22,7 @@
     root.appendChild(el("h3", "Paid time"));
     const lt = el("table"); lt.className = "kv"; lt.dataset.x = "leases"; root.appendChild(lt);
     const conn = el("p", "", "muted"); conn.dataset.x = "conn"; root.appendChild(conn);
+    const ksn = el("p", "", "muted"); ksn.dataset.x = "ksnote"; ksn.hidden = true; root.appendChild(ksn);
     const dis = el("button", "Disconnect"); dis.addEventListener("click", () => act("disconnect", {})); root.appendChild(dis);
     const pay = el("section"); pay.dataset.x = "pay"; pay.hidden = true; root.appendChild(pay);
     root.appendChild(el("h3", "Exit sellers"));
@@ -64,6 +65,7 @@
     e.hidden = !soon.length;
     if (soon.length) e.textContent = "Your exit time with " + soon[0].seller.slice(0, 12) + "… ends at " + hhmm(soon[0].end) + ". Buy more below to keep going.";
     q("conn").textContent = r.connected ? "Connected through " + String(r.connected.seller).slice(0, 16) + "… · DNS: " + r.dns : "Not connected.";
+    q("ksnote").textContent = r.killswitch_note || ""; q("ksnote").hidden = !r.killswitch_note;
     if (!q("limit").value) q("limit").value = r.max_payment_usdc || "20";
     (r.quotes || []).forEach((x) => { if (!polls[x.id]) watch(x.id); });
   }

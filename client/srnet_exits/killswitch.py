@@ -26,6 +26,11 @@ from . import inbound, priv
 
 DEFAULT_TUN = "sr-tun0"  # the interface Session Router creates (ip link: sr-tun0)
 
+# What the kill switch leaves open, shown wherever connect is (CLI, status, Exits page, warning).
+NOTE = ("The kill switch blocks everything outside the tunnel except UDP, which Session Router needs. "
+        "Apps that send UDP, such as QUIC in browsers and WebRTC calls, can still leave outside the exit "
+        "if the tunnel drops or they pick your normal connection themselves. DNS outside the tunnel is blocked.")
+
 _IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,15}$")
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
