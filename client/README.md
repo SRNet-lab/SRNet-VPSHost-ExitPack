@@ -42,20 +42,13 @@ The installer:
   `~/.local/bin`.
 
 Run it again to update. `client/install.sh --uninstall` removes the command, its environment and
-that one line, and stops the page, reminder and DNS forwarder it started; your paid time and
-settings in `~/.srnet` stay. It refuses while an exit is connected (disconnect first). With
-`--force` it disconnects for you before removing anything: DNS goes back, the exit is unmapped,
-your traffic leaves through your own connection again and the kill switch is removed (sudo may
-ask for your password). Anything it can't undo, it names with the command that does it. Your paid
-time stays, so after a reinstall `connect` works again. Install and uninstall only touch
-`SRNET_EXITS_PREFIX` if it is empty or holds a srnet-exits install.
+that one line; your paid time and settings in `~/.srnet` stay. It refuses while an exit is
+connected. With `--force` it disconnects first.
 
 Every command below works the same with `srnet-exits` in place of `srnet`, and
 `srnet-exits doctor` checks Session Router, `.sesh` names, the clock and everything exits need.
-`srnet-exits ui` opens the Exits page in your browser (on 127.0.0.1 only). Each run picks a free
-port and a new key, and opens an address like `http://127.0.0.1:41873/#t=...`; the page only
-answers calls that carry that key. With `--no-browser` it prints the address for you to open.
-Running it again while the page is up opens the same page.
+`srnet-exits ui` opens the Exits page in your browser (on 127.0.0.1 only). With `--no-browser`
+it prints the address for you to open.
 
 ## Add exits to the SRNet client
 
@@ -88,8 +81,7 @@ The seller answers with a quote bound to your `.sesh` address. The client prints
 the payout address, the exact amount and a QR code (scan it with a phone wallet), with the
 amount, chain, address and end time again below the code, then watches the chain. Send exactly
 that amount of USDC on that chain, from any wallet; you pay the network fee. The amount is the
-price plus a payment ID, usually under one cent (0.50 for an hour can be 0.505521), so your
-payment can be told apart from others; send it as shown.
+price plus a payment ID, usually under one cent (0.50 for an hour can be 0.505521).
 
 Once the transfer is seen, the client tells the seller, the seller checks it on chain and
 admits you for the hours you paid. Then:
@@ -101,9 +93,8 @@ srnet status
 srnet disconnect
 ```
 
-`status` says in a few lines whether you're connected and through which exit, how much paid time
-is left and until when, whether the kill switch is on, where DNS goes, and any quote still
-waiting for payment. `status --json` prints the full record.
+`status` shows whether you're connected, how much paid time is left and whether the kill switch
+is on. `status --json` prints the full record.
 
 `connect` again later works with no new purchase while paid time is left. About 10 minutes
 before it ends you get a warning (a desktop notification if `notify-send` is there). Nothing
@@ -112,12 +103,8 @@ renews by itself: run `srnet buy` again to add time.
 Good to know:
 
 - A quote is good for about 15 minutes. If you close the terminal, `srnet paid` picks up the
-  latest open quote; `srnet paid --tx 0x...` uses a transaction hash you already have. The
-  seller takes that report for 8 days, so a payment made in time still counts if you report
-  it later.
-- If the client couldn't read the chain, it says so: don't pay again, use `srnet paid --tx`.
-- Wrong amount or wrong chain: nothing is matched, and the client says so. A payment can't be
-  moved to another quote; ask the seller directly.
+  latest open quote; `srnet paid --tx 0x...` uses a transaction hash you already have.
+- Wrong amount or wrong chain: the payment is not matched. Ask the seller directly.
 - Payments are final. One payment is limited to 20 USDC by default. Change it with
   `--max-usdc` or `"exits": {"max_payment_usdc": "40"}` in `~/.srnet/config.json`.
   Sellers have their own limit too.
@@ -125,17 +112,12 @@ Good to know:
   USDC only.
 - Your own RPC: `"exits": {"rpc": {"42161": "https://...", "8453": "https://..."}}`.
 - Exits from older seller packs show "seller needs to update" and can't be bought from.
-- Quote requests carry your computer's time, so its clock has to be within 2 minutes of the
-  real time. The amount you pay is the price plus a small payment ID; the payment screen shows
-  both parts.
-- The add-on keeps a small key in `~/.srnet/exits/buyer.key`. It only signs quote requests and
-  payment notices; it can't move funds.
+- Your computer's clock has to be within 2 minutes of the real time.
 
 ## Connect details
 
 `connect` arms an nftables kill switch and sends all DNS to the exit's own resolver through the
-tunnel (`.sesh` stays on Session Router). `disconnect` puts your DNS settings back exactly as
-they were. It refuses exits that run no resolver unless you pass `--system-dns`, and refuses to
+tunnel (`.sesh` stays on Session Router). `disconnect` puts your DNS settings back. It refuses exits that run no resolver unless you pass `--system-dns`, and refuses to
 run without the kill switch unless you pass `--no-killswitch`. As a normal user `nft` runs
 through sudo; the Exits tab can only connect if sudo needs no password, otherwise run
 `srnet connect` in a terminal (as yourself, not `sudo srnet`).
@@ -144,15 +126,8 @@ The kill switch blocks everything outside the tunnel except UDP, which Session R
 that send UDP, such as QUIC in browsers and WebRTC calls, can still leave outside the exit if the
 tunnel drops or they pick your normal connection themselves. DNS outside the tunnel is blocked.
 
-On a remote machine (a VPS you reach over SSH or RDP), connecting keeps those sessions working:
-connections that come in on your normal interface are marked, and their replies go back out that
-interface (an `ip rule` on a fwmark to a small table with your normal routes). Everything the
-machine starts itself, DNS included, still goes only through the tunnel. `disconnect` removes
-this again, and none of it (kill switch, routes, rules) survives a reboot. Only one bit of the
-packet/connection mark is used, and the rule priority and table are the first free pair from 5352,
-so wg-quick, Tailscale or your own policy routing keep working. With a strict `rp_filter` (RHEL and
-CIS images) inbound packets are checked against your normal routes (`src_valid_mark=1` while
-connected, the old value comes back at disconnect).
+On a remote machine (a VPS you reach over SSH or RDP), connecting keeps those sessions working.
+None of it (kill switch, routes, rules) survives a reboot.
 
 - Containers: published ports (Docker and the like) keep answering on your normal interface while
   connected, but the kill switch covers only this machine's own traffic, not traffic that
@@ -164,12 +139,9 @@ connected, the old value comes back at disconnect).
 Session Router needs two client settings for exits: a persistent key (`keyfile=`; paid time
 belongs to your `.sesh` address, which otherwise changes at every restart) and
 `blackhole-routes=false` (otherwise the router blackholes all traffic while an exit is mapped).
-`srnet setup-router` sets both (one sudo prompt; keeps the rest of `client.ini`, keeps a copy of the
-original as `client.ini.srnet-orig`, restarts the router, changes nothing when already set);
-`client/install.sh` and the desktop's `install.sh --with-exits` run it. It also leaves `srnet-exits.ok` next to
-`client.ini` (world-readable: the settings plus client.ini's size, time and hash), so `srnet doctor`
-can show them without root. `srnet buy` / `srnet connect` refuse until they are set; `srnet doctor`
-points at `srnet setup-router`.
+`srnet setup-router` sets both (one sudo prompt, and it keeps a copy of the original as
+`client.ini.srnet-orig`); `client/install.sh` and the desktop's `install.sh --with-exits` run it.
+`srnet buy` and `srnet connect` refuse until they are set.
 
 ## Tests
 

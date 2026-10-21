@@ -34,23 +34,16 @@ Building the router from source takes about 12 minutes on a 2 vCPU server, longe
 
 1. The buyer runs `srnet buy --seller <id> --hours N` (or presses Buy in the Exits tab).
 2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
-   contract, and an exact amount (the hourly price times N plus a small payment ID, so no two
-   quotes in 7 days share an amount). The payment ID is usually under one
-   cent. When many quotes are out it can grow, but never past 0.05 USDC or 5% of the price,
-   whichever is larger, and never past half the price. The payment screen shows it. The
-   quote is bound to the buyer's `.sesh` address and expires after about 15 minutes. One
+   contract, and an exact amount (the hourly price times N plus a small payment ID, usually under one
+   cent). The quote is bound to the buyer's `.sesh` address and expires after about 15 minutes. One
    payment is capped at 20 USDC by default, and the price is at least 0.10 USDC an hour.
 3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
 4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
-   The seller's watcher checks that transaction on chain itself (read-only) and admits the
-   buyer for the quoted hours once it is a few blocks deep (Arbitrum 20, Base 5, a few seconds).
-   The block time has to fall inside the quote's 15 minutes (with 5 minutes of slack for a
-   seller clock that runs fast). A transaction can only be used once.
+   The seller checks that transaction on chain and admits the buyer for the quoted hours.
 5. About 10 minutes before the time runs out the client warns. Nothing renews by itself;
    to keep going, buy again.
 
-If the amount or the chain is wrong, nothing is matched and the client says so plainly.
-Payments are final.
+If the amount or the chain is wrong, the payment is not matched. Payments are final.
 
 ## Buyer: use exits without SRNet-Desktop
 
@@ -141,9 +134,7 @@ stops. Nothing is paid. If you installed with `--board-submit-url none`, copy
 `/opt/srnet-seller/listing/listing.json` from the server and add `--listings listing.json` to
 both commands.
 
-Once a release is published, its `ONE-LINER.txt` has the exact `bootstrap.sh` command and hash;
-the bootstrap falls back to a source build if the router tarball is missing or its hash doesn't
-match.
+Once a release is published, its `ONE-LINER.txt` has the exact `bootstrap.sh` command and hash.
 
 See [QUICKSTART.md](QUICKSTART.md) for what gets installed and day-to-day commands.
 `seller/install.sh --help` lists every flag.
@@ -197,8 +188,7 @@ podman build --network host -f docker/Dockerfile \
 sha256sum dist/session-router
 ```
 
-The build stops if the upstream commit doesn't match, a patch doesn't apply, or
-the binary is missing the admission code. `dist/BUILDINFO` records the inputs
+`dist/BUILDINFO` records the inputs
 and hash; `dist/RUNTIME-DEPS` lists the Ubuntu packages the binary needs.
 
 ## Layout
@@ -229,58 +219,20 @@ pinned container and packs `session-router`, `exit-lease-verify` and
 `BUILDINFO` into `session-router-<version>-linux-x86_64.tar.gz` with
 `SHA256SUMS`. `make-release.sh` then writes the seller pack tarball,
 `bootstrap.sh`, `user-data.yaml`, `SHA256SUMS` and `ONE-LINER.txt` into
-`release/v0.1.0/`. `bootstrap.sh` pins both the router tarball and the binary
-inside it, downloads the tarball from GitHub Releases, checks both hashes and
-builds from source if anything is missing or does not match.
+`release/v0.1.0/`.
 
 ## Claim desk
 
 The claim desk (`srnet-seller-claimd`) answers `/claim/quote`, `/claim/paid` and
 `/claim/status/<id>` at the `claim_url` in the listing. It runs on the small client-only
 router the seller also uses to reach the board, listens only on that router's tun address,
-and takes small, signed requests at a limited rate. It never holds a key that can move
-funds. The watcher (`srnet-seller-watcher`) checks each reported payment on chain before it
-admits anyone.
-
-The desk runs as its own user (`srnet-claim`). It holds the quote key, but it can't read the
-watcher's admission key, its RPC settings or its record of used payments. The watcher doesn't
-take the desk's word for a quote either: it reads the signed listing itself and checks every
-quote's payout address, chain, token, price and hours against it before it looks at the chain.
+and takes signed requests at a limited rate. The watcher (`srnet-seller-watcher`) checks each
+reported payment on chain before it admits anyone.
 
 To change the price or max hours, re-run `seller/install.sh` with the new
-`--price-per-hour-usdc` or `--max-hours`. Don't edit `listing.json` by hand. The installer
-keeps the last few listings, with the time each was replaced, in `listing/previous.json`, so
-quotes made just before the change still count. If a paid quote matches no listing the
-watcher knows (say the price was changed some other way), the buyer is not refused: the
-payment is checked on chain, the buyer sees "the seller has to confirm it", and the
-watcher's log names the quote. `sudo srnet-seller held` lists those quotes with the amount,
-hours, price per hour, chain and age, and `sudo srnet-seller admit <quote id>` admits one after
-the watcher checks the payment again. Answer held quotes within 8 days of the quote: after
-that the watcher refuses them as too old. Only quotes our own listings could have made are
-held (at least the 0.10 minimum price, no more hours than the largest max hours). A quote
-that pays another address, uses another token or isn't signed by the quote key is still
-refused.
-
-Limits per connection and overall (requests a minute, quotes an hour, open quotes, 3
-transaction hashes per quote, 10 second socket timeouts) keep one requester from wearing the
-desk down. Open quotes are counted per buyer key and per connection, never by the `.sesh`
-address a request names. Quote requests are signed by the buyer key with the current time,
-and each signed request is taken once, so another seller who has seen your requests can't
-send them again to use up your limit. One buyer key per install is enough for that, so the
-client doesn't keep one per seller.
-
-The desk gives out at most 150 new quotes an hour overall (`--quotes-per-hour` in the seller
-installer, `QUOTES_PER_HOUR` in `config/claimd.env`). At that rate the 7-day pool of payment IDs
-can't run out, even for a 1-hour purchase at the 0.10 minimum price; above 267 an hour a busy
-desk may answer "busy" to some cheap purchases.
-
-Known beta limit: someone who keeps restarting Session Router to get new addresses can use up
-the desk's hourly quote limit, and new buyers then get "busy" for a while; no money is at risk.
-
-If the desk's index (`claims/index.sqlite`) is damaged, the desk moves it aside and rebuilds it
-from its files on the next start. To check that two buyers come in on different sessions, set
-`SRNET_CLAIM_DEBUG_SOURCES=1` in `config/claimd.env` and restart the desk: it then logs a salted
-tag for each quote's connection (never the address).
+`--price-per-hour-usdc` or `--max-hours`. Don't edit `listing.json` by hand. If a paid quote
+matches no current listing, the watcher holds it. `sudo srnet-seller held` lists held quotes and
+`sudo srnet-seller admit <quote id>` admits one. Answer held quotes within 8 days.
 
 ## Old SRNet balance
 
@@ -294,9 +246,7 @@ An exit sends other people's traffic out from your IP address. You are
 responsible for it under your local law and your host's terms. Only tcp/80 and
 tcp/443 are forwarded to the internet. DNS is never forwarded: buyers' lookups
 are answered by the exit's own recursive resolver (unbound on 10.195.0.53, reachable
-only through the tunnel). It resolves from the root servers itself (no forwarding
-to any public resolver), validates DNSSEC, uses QNAME minimisation, keeps no query
-logs and is rate limited per buyer. The listing advertises it as `"dns"`. Turn it
+only through the tunnel), which keeps no query logs. Turn it
 off with `--no-dns` (buyers' clients then refuse to connect unless they opt out of
 tunnel DNS).
 

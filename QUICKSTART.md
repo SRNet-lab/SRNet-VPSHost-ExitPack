@@ -8,13 +8,11 @@ Run an SRNet exit on a fresh server.
 - A public IPv4 address with udp/1193 reachable
 - 2+ vCPU and 4 GB RAM (or swap) for a source build, which takes about 12 minutes on 2 vCPU
   and longer on slower servers. The release install uses a prebuilt router and needs less.
-- A payout wallet address that can receive USDC on Arbitrum One and Base. Only the address;
-  the pack never needs a private key.
+- A payout wallet address that can receive USDC on Arbitrum One and Base
 - An hourly price in USDC (at least 0.10)
 
 Buyers pay USDC straight to your payout address on Arbitrum One or Base (both by default;
-`--chain arbitrum` or `--chain base` for one). The watcher reads the chain through public RPCs
-unless you pass `--rpc CHAINID=URL`. Real USDC; keep amounts small.
+`--chain arbitrum` or `--chain base` for one). Real USDC; keep amounts small.
 
 ## Install from a clone
 
@@ -44,9 +42,7 @@ curl -fsSLo srnet-bootstrap.sh https://github.com/SRNet-lab/SRNet-VPSHost-ExitPa
   && sudo bash srnet-bootstrap.sh
 ```
 
-The bootstrap checks the pack and the prebuilt router against the sha256s
-pinned inside it (and builds from source if the router doesn't match), asks for the
-payout address and price, shows the operator notice and installs.
+The bootstrap asks for the payout address and price, shows the operator notice and installs.
 
 Without SSH, paste the release's `user-data.yaml` into your provider's user data
 field and set `SRNET_PAYOUT`, `SRNET_PRICE_PER_HOUR_USDC` and
@@ -59,29 +55,23 @@ boot. Progress goes to the serial console and
 - The patched Session Router, built from the pinned upstream commit.
 - Forwarding for tcp/80 and tcp/443 only. DNS is never forwarded; buyers use the
   exit's own resolver (`srnet-seller-dns`: unbound on 10.195.0.53, tunnel only,
-  recursive from the root servers, DNSSEC, no query logs). Private,
+  no query logs). Private,
   link-local and cloud metadata ranges are blocked, and buyers can't reach
   services on the server itself.
 - ufw: incoming traffic denied except SSH and udp/1193.
 - systemd services, each under its own user:
   - `srnet-seller-exit`: the router, with only `CAP_NET_ADMIN`
   - `srnet-seller-claimd`: the claim desk; gives signed quotes and takes payment notices
-    (user `srnet-claim`; it can't read the watcher's admission key)
   - `srnet-seller-watcher`: checks reported payments on chain and admits the buyer for the
-    paid hours; holds no wallet key
+    paid hours
   - `srnet-seller-listing.timer`: re-signs the listing every hour
   - `srnet-seller-submit.service`: client-only router used to reach the board
 - A new exit identity key and a signed listing at
   `/opt/srnet-seller/listing/listing.json`.
 
 The listing is re-signed every hour and sent to the SRNet board
-(`exitsrjnc…sesh`) through `srnet-seller-submit`, a small client-only router
-with no exit and no key of its own to protect. Pass
-`--board-submit-url none` to keep it local. The listing is published to the board
-automatically (no approval step) and appears to buyers within minutes. Boards
-hide a listing that hasn't been refreshed for 3 hours and show it again after
-the next valid refresh. Each listing carries `exit_version`, the pack version from
-`seller/VERSION`.
+(`exitsrjnc…sesh`) through `srnet-seller-submit`. It appears to buyers within minutes, with no
+approval step. Pass `--board-submit-url none` to keep it local.
 
 ## Usage
 
@@ -98,10 +88,9 @@ Payments land in your payout wallet directly; there is nothing to claim. Each ad
 payment is logged by the watcher (`journalctl -u srnet-seller-watcher`).
 
 To change the price, re-run the installer with the new `--price-per-hour-usdc` (and the
-other flags you used). Don't edit `listing.json` by hand: the installer keeps the old
-listing in `listing/previous.json` so quotes made just before the change still count. If a
-paid quote ever matches no listing, the watcher holds it, logs the quote id, and waits for
-`sudo srnet-seller admit <quote id>`. Answer within 8 days; after that it is refused as too old.
+other flags you used). Don't edit `listing.json` by hand. If a
+paid quote matches no listing, the watcher holds it until you run
+`sudo srnet-seller admit <quote id>`. Answer within 8 days.
 
 ## Uninstall
 

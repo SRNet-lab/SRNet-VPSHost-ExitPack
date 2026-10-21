@@ -4,10 +4,9 @@
 
 ### Changed
 
-- `connect`, `status`, the Exits page and the first-run warning say what the kill switch leaves
-  open: UDP stays allowed on your normal connection because Session Router needs it, so QUIC and
-  WebRTC can leave outside the exit if the tunnel drops or they pick your normal connection
-  themselves. DNS outside the tunnel stays blocked.
+- `connect`, `status`, the Exits page and the first-run warning say that the kill switch allows
+  UDP, so QUIC and WebRTC can leave outside the exit.
+- Shorter README, QUICKSTART and client README.
 
 ## [0.4.0] - 2026-10-20
 
@@ -41,11 +40,8 @@
   routes and the kill switch go back to normal. Your paid time is kept.
 - Uninstall puts tunnel DNS back, stops the page, the lease reminder and the DNS forwarder, and
   won't remove a folder it didn't install.
-- Shared state is written atomically and changed through a locked update, so the page and a
-  terminal can no longer overwrite each other's connection or DNS state.
-- A stored quote's state never moves backwards.
-- The claim desk notices every listing change, and listings are written atomically.
-- The page's reuse check never sends its token, and a bad Content-Length gets a clear error.
+- The page and a terminal no longer overwrite each other's connection or DNS state.
+- The claim desk picks up every listing change.
 
 ## [0.3.0] - 2026-10-20
 
@@ -63,8 +59,7 @@
   or Base. Each quote is signed, has its own exact amount, and is checked on chain against the
   signed listing.
 - The exit board takes the new listing format and marks old listings as needing an update.
-- Connecting keeps SSH and RDP to your own machine working. The kill switch, inbound routing and
-  router setup are hardened.
+- Connecting keeps SSH and RDP to your own machine working.
 
 ### Removed
 
