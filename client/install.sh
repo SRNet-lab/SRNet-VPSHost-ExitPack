@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# srnet-exits installer for Linux (made for Ubuntu 24.04): buy time on SRNet exits and connect
+# srnet-exits installer for Linux (made for Ubuntu 24.04): buy exit time and connect
 # through them, without the SRNet client. Installs into your user account only; the one-time
 # Session Router setup asks sudo once.
 #   client/install.sh                   install or upgrade

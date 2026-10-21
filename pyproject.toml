@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "srnet-exits"
 version = "0.4.0"
-description = "SRNet Exits: buy time on SRNet exits with a direct USDC payment, and connect through them"
+description = "SRNet Exits: buy exit time with a direct USDC payment to the seller, and connect through the exit"
 readme = "client/README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

@@ -33,7 +33,7 @@
 #   --cap-usdc N             largest single payment you will quote (default 20)
 #   --quotes-per-hour N      new quotes per hour overall on the claim desk (default 150)
 #   --board-submit-url URL   where the hourly listing refresh is sent (default on mainnet chains:
-#                            the SRNet board; 'none' = re-sign locally only)
+#                            the exit board; 'none' = re-sign locally only)
 #
 # Host settings:
 #   --listen-port N (1193/udp)  --wan-if IF  --ssh-port N  --max-mbit N (100; 0=off)

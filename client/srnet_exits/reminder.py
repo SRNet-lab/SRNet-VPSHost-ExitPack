@@ -30,7 +30,7 @@ def _lease(home: Path, seller: str) -> dict | None:
 
 def message(seller: str, end: int, now: float) -> str:
     mins = max(0, int(end - now) // 60)
-    return (f"Your SRNet exit time with {seller[:12]}... ends in about {mins} min "
+    return (f"Your exit time with {seller[:12]}... ends in about {mins} min "
             f"({time.strftime('%H:%M %Z', time.localtime(end)).strip()}). To keep going, buy more: "
             f"{_P()} buy --seller {seller} --hours 1")
 
@@ -39,7 +39,7 @@ def notify(text: str) -> None:
     print(text, flush=True)
     if shutil.which("notify-send"):
         try:
-            subprocess.run(["notify-send", "-a", "SRNet", "SRNet exit ending soon", text], timeout=10,
+            subprocess.run(["notify-send", "-a", "SRNet", "Exit time ending soon", text], timeout=10,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             pass

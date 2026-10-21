@@ -76,7 +76,7 @@
     info.textContent = "Loading the signed exit board…"; tb.replaceChildren();
     const r = await call("board", {});
     if (!r.ok) { info.textContent = "Couldn't load the exit board (" + (r.err || "?") + "). Is Session Router running? Try Refresh."; return; }
-    info.textContent = "Board " + r.seq + " from " + (r.source === "cache" ? "the cached copy" : "SRNet") + (r.needs_update ? " · " + r.needs_update + " seller(s) need to update" : "");
+    info.textContent = "Board " + r.seq + (r.source === "cache" ? " (cached copy)" : "") + (r.needs_update ? " · " + r.needs_update + " seller(s) need to update" : "");
     if (!r.listings.length) { const tr = el("tr"); tr.appendChild(el("td", "No sellers right now.")); tb.appendChild(tr); }
     r.listings.forEach((x) => {
       const tr = el("tr"); const s = el("td", x.seller.slice(0, 16) + "…"); s.title = x.seller; tr.appendChild(s);

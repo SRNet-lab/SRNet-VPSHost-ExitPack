@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SRNet exit-seller board: operator CLI.
+"""Exit board: admin CLI.
 
   board.py init    --state DIR --key BOARD.key        # BOARD.key = session-router keyfile (128 hex)
   board.py submit  --state DIR listing.json ...       # verify + publish (also what the server's /submit does)

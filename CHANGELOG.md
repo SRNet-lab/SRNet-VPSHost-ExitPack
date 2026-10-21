@@ -13,7 +13,10 @@
   open.
 - `status` and the Exits page say to reconnect if Session Router now runs as a different user than
   when you connected (the kill switch blocks it then).
-- Shorter README, QUICKSTART and client README.
+- The README, QUICKSTART (now the seller guide) and client README are shorter and walk through
+  buying and selling step by step.
+- Clearer wording in the help text, and one name for the exit board throughout.
+- Build and release notes moved to RELEASING.md.
 
 ## [0.4.0] - 2026-10-20
 

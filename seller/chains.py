@@ -1,4 +1,4 @@
-"""Chains and tokens SRNet exits accept. Shared by the buyer add-on, the seller pack and the board.
+"""Chains and tokens exits accept. Shared by the buyer add-on, the seller pack and the board.
 
 Only USDC, only on the chains below. The token address and the default RPC come from this
 table, never from a listing or a quote, so a listing can't point buyers at a look-alike token.

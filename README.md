@@ -9,46 +9,30 @@
 
 Full history: [CHANGELOG.md](CHANGELOG.md)
 
-Everything for SRNet exits in one place:
+An exit is a server that sends your internet traffic out from its own IP address, like a VPN.
+This repository lets you **buy** time on an exit and connect through it, or **sell** time on a
+server of your own. Buyers pay sellers directly in USDC, by the hour.
 
-- **Seller pack** (`seller/`): patches, build scripts and an installer for running a paid,
-  lease-gated Session Router exit on Ubuntu 24.04.
-- **Buyer client** (`client/`, the `srnet-exits` package): runs on its own as `srnet-exits`, or
-  plugs into the SRNet client ([SRNet-Desktop](https://github.com/SRNet-lab/SRNet-Desktop)) and
-  adds `srnet exits`, `srnet buy`, `srnet connect` and the Exits tab.
-- **Board** (`board/`): the signed list of exits that buyers browse.
-
-Buyers pay sellers directly in USDC on Arbitrum One or Base, from any wallet. There is no
-contract, no balance to top up and no middleman: the seller's payout address gets the payment,
-and the buyer pays the network fee. This is beta software; keep amounts small.
+This is beta software. Keep amounts small.
 
 SRNet is an independent project. It is not affiliated with or endorsed by the Session Foundation
 or the Session Technology Foundation.
 
-Install from a clone (below). Release builds (a prebuilt router tarball, the seller pack and a
-pinned `bootstrap.sh`, made with `scripts/make-release.sh`) go on
-[GitHub Releases](https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack/releases) when published.
-Building the router from source takes about 12 minutes on a 2 vCPU server, longer on a slower one.
+## Buy exit time
 
-## How paying works
+You need:
 
-1. The buyer runs `srnet buy --seller <id> --hours N` (or presses Buy in the Exits tab).
-2. The seller's claim desk answers with a signed quote: payout address, chain, the official USDC
-   contract, and an exact amount (the hourly price times N plus a small payment ID, usually under one
-   cent). The quote is bound to the buyer's `.sesh` address and expires after about 15 minutes. One
-   payment is capped at 20 USDC by default, and the price is at least 0.10 USDC an hour.
-3. The client shows the address, the amount and a QR code (EIP-681), then watches the chain.
-4. When the exact transfer shows up, the client tells the seller "quote X is paid, tx Y".
-   The seller checks that transaction on chain and admits the buyer for the quoted hours.
-5. About 10 minutes before the time runs out the client warns. Nothing renews by itself;
-   to keep going, buy again.
+- A computer with Ubuntu 24.04.
+- A few USDC on Arbitrum One or Base in any wallet (a phone wallet works), plus a little ETH on
+  the same network to pay the network fee.
 
-If the amount or the chain is wrong, the payment is not matched. Payments are final.
+If you already use SRNet-Desktop, skip to [Add exits to SRNet-Desktop](#add-exits-to-srnet-desktop).
 
-## Buyer: use exits without SRNet-Desktop
+**1. Install Session Router.** Session Router is the private network exits run on. Follow steps
+1 and 2 of the [SRNet-Desktop install guide](https://github.com/SRNet-lab/SRNet-Desktop#1-session-router).
+When you're done, `getent hosts localhost.sesh` prints an address starting with `fd2e:`.
 
-On Ubuntu 24.04, with Session Router installed and running (steps 1 and 2 of the
-[SRNet-Desktop install guide](https://github.com/SRNet-lab/SRNet-Desktop#1-session-router)):
+**2. Install the exits client.** Run this as yourself, not with `sudo`:
 
 ```sh
 cd ~
@@ -57,145 +41,153 @@ git clone https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack.git
 SRNet-VPSHost-ExitPack/client/install.sh
 ```
 
-This installs only the exits client, as the `srnet-exits` command, into
-`~/.local/share/srnet-exits`. It sets up Session Router for exits (sudo asks once) and puts
-`~/.local/bin` on your PATH for new terminals. Then:
+It asks for your password once, to set up Session Router for exits. Then open a new terminal, so
+the `srnet-exits` command is found.
+
+**3. Check your setup.**
 
 ```sh
 srnet-exits doctor
-srnet-exits exits
-srnet-exits buy --seller <id> --hours 1
 ```
 
-`srnet-exits ui` opens the same thing as a small page in your browser.
-`client/install.sh --uninstall` removes it again. Details: [client/README.md](client/README.md).
+It ends with `all good` when everything is ready. A `FAIL` line says what is missing.
 
-The kill switch blocks everything outside the tunnel except DHCP lease renewal and Session
-Router's own UDP, which it needs. DNS outside the tunnel is blocked. If connect can't tell which user Session Router runs as,
-it lets all UDP out and says so.
+**4. Pick a seller.**
 
-## Buyer: add exits to SRNet-Desktop
+```sh
+srnet-exits exits
+```
 
-If you use the SRNet client, install exits into it instead:
+You get a table of sellers with their country and hourly price. Copy the seller id (the long
+name ending in `.sesh`) from the first column.
+
+**5. Buy an hour.**
+
+```sh
+srnet-exits buy --seller <seller id> --hours 1
+```
+
+The first time, it shows what the exit can see about your traffic and asks you to type
+`I UNDERSTAND`. Then it shows a QR code, the address and the exact amount to send. Send exactly
+that amount from your wallet, on the network it names. Leave the terminal open: it waits for the
+payment and says when the seller has confirmed it. This usually takes a minute or two.
+
+**6. Connect.**
+
+```sh
+srnet-exits connect <seller id>
+curl -s https://api.ipify.org; echo
+```
+
+`connect` asks for your password. The second line prints the exit's IP address instead of yours.
+
+**7. Disconnect when you're done.**
+
+```sh
+srnet-exits disconnect
+```
+
+Your normal connection comes back. Paid time you haven't used stays, and `connect` works again
+until it runs out. About 10 minutes before the end you get a warning. To add time, run `buy`
+again.
+
+`srnet-exits status` shows your paid time and whether you're connected. `srnet-exits ui` does all
+of this in a page in your browser. More: [client/README.md](client/README.md).
+
+### Add exits to SRNet-Desktop
 
 ```sh
 ~/SRNet-Desktop/install.sh --with-exits
 ```
 
-or, by hand, `<the client's python> -m pip install "srnet-exits @ git+https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack"`.
-`srnet doctor` shows whether it is loaded. You can have both: `srnet` and `srnet-exits` share
-`~/.srnet`, so they see the same paid time, buyer key and connection.
+Then use `srnet exits`, `srnet buy`, `srnet connect` and `srnet disconnect` the same way as
+above, or the **Exits** tab in the app. `srnet` and `srnet-exits` share your paid time, so you
+can have both.
 
-## Seller: install
+## Sell exit time
 
-You need a fresh Ubuntu 24.04 x86_64 server with at least 2 vCPU and 4 GB RAM, a public IPv4
-address, and a wallet address that can receive USDC on Arbitrum One and Base. The installer
-builds Session Router from source. That takes about 12 minutes on a 2 vCPU server, longer on a
-slower one.
+You need:
 
-Log in as a user who can use sudo, then:
+- A new Ubuntu 24.04 server (x86_64) from any VPS provider, with at least 2 vCPU, 4 GB RAM and a
+  public IPv4 address. If the provider has its own firewall, allow UDP port 1193 in.
+- A wallet address that can receive USDC on Arbitrum One and Base. Only the address goes on the
+  server, never a private key.
+- An hourly price in USDC, at least 0.10.
+
+Running an exit sends other people's web traffic out from your server's IP address. You are
+responsible for that traffic under your local law and your provider's terms. Only web traffic
+(ports 80 and 443) goes out.
+
+**1. Log in to the server** over SSH as a user who can use `sudo`.
+
+**2. Download the pack.**
 
 ```sh
 cd ~
 sudo apt update && sudo apt install -y git
 git clone https://github.com/SRNet-lab/SRNet-VPSHost-ExitPack.git
 cd SRNet-VPSHost-ExitPack
-sudo seller/install.sh --source --payout 0xYourPayoutWallet --price-per-hour-usdc 1.00 \
+```
+
+**3. Install.** Put in your own wallet address and price:
+
+```sh
+sudo seller/install.sh --payout 0xYourPayoutWallet --price-per-hour-usdc 1.00 \
   --enable-exit --i-accept-exit-operator-responsibility
 ```
 
-The installer asks no questions. At the end it prints your seller id (`seller .sesh:`), your
-signed listing and a health check that ends with `health: OK`.
+The last two flags turn on forwarding and confirm that you accept the responsibility above.
+The installer asks no questions. It builds Session Router, which takes about 12 minutes on a
+2 vCPU server and longer on a slower one. At the end it prints your seller id (the
+`seller .sesh:` line) and a health check that ends with `health: OK`.
 
-Your listing goes on the public SRNet board within minutes, and buyers can pay you from then on.
-To try the pack first without being listed, add `--board-submit-url none`. When you are ready,
-run the same command again without it.
+Your listing goes on the public exit board within minutes, and buyers can pay you from then on.
+Payments go straight to your wallet; there is nothing to claim.
 
-The installer sets the firewall to block all incoming traffic except SSH and udp/1193. It reads
-the SSH port from your SSH server's settings. To set it yourself, add `--ssh-port N`.
+To try it first without being listed, add `--board-submit-url none` to the install command.
+Run the command again without it when you're ready.
 
-Check on it any time:
+**4. Check on it any time.**
 
 ```sh
 sudo srnet-seller health
-sudo srnet-seller listing
-sudo srnet-seller logs
 ```
 
-To see what a buyer sees, run this on any computer with `srnet-exits` installed:
+`sudo srnet-seller logs` shows recent activity. To change the price, run the install command
+again with the new `--price-per-hour-usdc`.
 
-```sh
-srnet-exits exits
-srnet-exits buy --seller <your seller id> --hours 1 --no-wait
-```
+Day-to-day commands, options and what the installer sets up: [QUICKSTART.md](QUICKSTART.md).
+`seller/install.sh --help` lists every option.
 
-The second command shows the payment screen with your payout address and the exact amount, then
-stops. Nothing is paid. If you installed with `--board-submit-url none`, copy
-`/opt/srnet-seller/listing/listing.json` from the server and add `--listings listing.json` to
-both commands.
+## Details
 
-Once a release is published, its `ONE-LINER.txt` has the exact `bootstrap.sh` command and hash.
+### How paying works
 
-See [QUICKSTART.md](QUICKSTART.md) for what gets installed and day-to-day commands.
-`seller/install.sh --help` lists every flag.
+1. `buy` asks the seller for a quote: its payout address, the network and an exact amount. The
+   amount is the hourly price times the hours, plus a payment ID of under one cent that tells
+   your payment apart from others.
+2. You send that amount from any wallet. The client watches the chain and tells the seller when
+   it sees the payment.
+3. The seller checks the payment on chain and lets you in for the hours you paid.
 
-## Build
+A quote is good for about 15 minutes. A wrong amount or the wrong network is not matched.
+Payments are final. One payment is limited to 20 USDC by default.
 
-The router is built from public upstream Session Router at
-`afb98f959f4f7e0ef996aef02fa21a6caf26b1e9` (dev, v1.0.2-126) with the patches in
-`patches/` applied. Submodule pins and apply order:
+### Kill switch
 
-```
-url:      https://github.com/session-foundation/session-router.git
-  branch:   dev
-  commit:   afb98f959f4f7e0ef996aef02fa21a6caf26b1e9
-  describe: v1.0.2-126-gafb98f959  ("Merge pull request #59 from jagerman/embedded-path-stats")
+`connect` turns on a kill switch. The kill switch blocks everything outside the tunnel except
+DHCP lease renewal and Session Router's own UDP, which it needs. DNS outside the tunnel is
+blocked. If connect can't tell which user Session Router runs as, it lets all UDP out and says so.
 
-Submodules: the public pins recorded in that commit (no forks, .gitmodules unchanged).
-  cmake/session-deps      65a7618f72367e659bae0620be350e420d04f0e6
-  external/CLI11          bfffd37e1f804ca4fae1caae106935791696b6a9
-  external/mlkem-native   ebed0f388fb4a8a4ff99ef7c32e19ac36b0cdba3
-  external/nlohmann       9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
-  external/oxen-libquic   c1835882a09cce6ff120ad7cba29b7d050359f5e
-  external/oxen-mq        5117440a87a4199f14da8956247c695ed21d1c2f
-  external/pybind11       3e9dfa2866941655c56877882565e7577de6fc7b
-  external/sqlite_orm     ff7c878af872f7987b62d825284fb25d6043af10
-  (gui and test/Catch2 are not needed for the daemon; Catch2 is fetched for tests)
+### Building and releasing
 
-Apply, in order:
-  1. patches/0000-linux-base-exit-client-prereqs.patch
-  2. patches/0001-exit-lease-admission-and-policy.patch
-     (patches/series/0001-0005 are the same change split per commit; use either
-      the combined 0001 file or the five series files, not both)
-  3. patches/session-deps/0001-libngtcp2-find-system-gnutls.patch inside every vendored
-     session-deps copy (cmake/session-deps and external/oxen-libquic/cmake/session-deps)
-     (backport of public session-deps d74f5b1376 so the static ngtcp2 that libquic builds
-      on Ubuntu 24.04 finds the system gnutls)
-  4. cp -r contrib/exit-lease <src>/contrib/exit-lease   (needed by the exit-lease-verify target)
+Build pins, patch order and release steps: [RELEASING.md](RELEASING.md).
 
-scripts/build-session-router.sh does all of this and checks every hash.
-```
-
-```sh
-scripts/build-session-router.sh --install-deps --tests --out dist
-```
-
-Or in a container:
-
-```sh
-podman build --network host -f docker/Dockerfile \
-  --build-arg APT_SNAPSHOT=20261011T000000Z --target out -o dist .
-sha256sum dist/session-router
-```
-
-`dist/BUILDINFO` records the inputs
-and hash; `dist/RUNTIME-DEPS` lists the Ubuntu packages the binary needs.
-
-## Layout
+### Layout
 
 ```
 patches/            changes to upstream Session Router
-board/              signed seller board: operator CLI, server, deploy script
+board/              signed exit board: admin CLI, server, deploy script
 contrib/exit-lease/ admission issuer and exit-lease-verify
 scripts/            build and release scripts
 docker/             pinned container build
@@ -205,50 +197,11 @@ contrib/legacy-cashout/  take out USDC left in the old SRNet balance (until 2027
 cloud-init/         user-data for installs without SSH
 ```
 
-## Release
-
-```sh
-scripts/build-release.sh --version v0.1.0            # container build, or --dist DIR to reuse one
-scripts/make-release.sh --version v0.1.0 \
-  --router-tarball release/v0.1.0/session-router-v0.1.0-linux-x86_64.tar.gz \
-  [--board-submit-url URL]
-```
-
-`build-release.sh` builds the pinned upstream commit with `patches/` in the
-pinned container and packs `session-router`, `exit-lease-verify` and
-`BUILDINFO` into `session-router-<version>-linux-x86_64.tar.gz` with
-`SHA256SUMS`. `make-release.sh` then writes the seller pack tarball,
-`bootstrap.sh`, `user-data.yaml`, `SHA256SUMS` and `ONE-LINER.txt` into
-`release/v0.1.0/`.
-
-## Claim desk
-
-The claim desk (`srnet-seller-claimd`) answers `/claim/quote`, `/claim/paid` and
-`/claim/status/<id>` at the `claim_url` in the listing. It runs on the small client-only
-router the seller also uses to reach the board, listens only on that router's tun address,
-and takes signed requests at a limited rate. The watcher (`srnet-seller-watcher`) checks each
-reported payment on chain before it admits anyone.
-
-To change the price or max hours, re-run `seller/install.sh` with the new
-`--price-per-hour-usdc` or `--max-hours`. Don't edit `listing.json` by hand. If a paid quote
-matches no current listing, the watcher holds it. `sudo srnet-seller held` lists held quotes and
-`sudo srnet-seller admit <quote id>` admits one. Answer held quotes within 8 days.
-
-## Old SRNet balance
+### Old SRNet balance
 
 Payments used to go through an SRNet balance on Arbitrum One. That is gone. If you still have
 USDC there, `contrib/legacy-cashout/` sends it back to your wallet; see its
 [README](contrib/legacy-cashout/README.md). It stays in this repository until 2027-01-18.
-
-## Operating an exit
-
-An exit sends other people's traffic out from your IP address. You are
-responsible for it under your local law and your host's terms. Only tcp/80 and
-tcp/443 are forwarded to the internet. DNS is never forwarded: buyers' lookups
-are answered by the exit's own recursive resolver (unbound on 10.195.0.53, reachable
-only through the tunnel), which keeps no query logs. Turn it
-off with `--no-dns` (buyers' clients then refuse to connect unless they opt out of
-tunnel DNS).
 
 ## Related repositories
 

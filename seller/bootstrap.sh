@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SRNet exit seller bootstrap: downloads the sha256-pinned seller pack release, asks for the
+# Seller pack bootstrap: downloads the sha256-pinned seller pack release, asks for the
 # payout address and hourly price (everything else has defaults), and runs install.sh.
 #
 #   sudo bash srnet-bootstrap.sh                     # interactive
@@ -53,7 +53,7 @@ ask() {  # ask VAR "prompt" default validator-regex
   printf -v "$var" '%s' "$val"
 }
 
-echo "SRNet exit seller setup ($RELEASE)"
+echo "Exit seller setup ($RELEASE)"
 ask SRNET_PAYOUT "Payout wallet ADDRESS (0x..., not a private key)" "" '^0x[0-9a-fA-F]{40}$'
 [[ "$SRNET_PAYOUT" =~ ^0x0{40}$ ]] && die "SRNET_PAYOUT is the zero address; set your payout wallet"
 ask SRNET_PRICE_PER_HOUR_USDC "Price per hour in USDC" "1.00" '^[0-9]+([.][0-9]{1,6})?$'

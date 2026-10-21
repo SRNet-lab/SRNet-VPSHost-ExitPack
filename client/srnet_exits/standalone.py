@@ -1,4 +1,4 @@
-"""srnet-exits: buy time on SRNet exits and connect through them, without the SRNet client.
+"""srnet-exits: buy exit time and connect through the exit, without the SRNet client.
 
   srnet-exits doctor                       check Session Router, .sesh names, the clock and what exits need
   srnet-exits setup-router                 once: persistent router key, no blackhole routes (asks sudo)

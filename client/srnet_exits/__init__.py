@@ -1,4 +1,4 @@
-"""SRNet Exits: buy time on SRNet exits with a direct USDC payment, and connect through them.
+"""SRNet Exits: buy exit time with a direct USDC payment to the seller, and connect through the exit.
 
 Runs on its own as `srnet-exits` (client/install.sh), or as an add-on for the SRNet client: there
 it plugs into the `srnet` command and the desktop app through the "srnet.addons" entry point.

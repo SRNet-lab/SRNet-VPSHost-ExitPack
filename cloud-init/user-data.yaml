@@ -1,5 +1,5 @@
 #cloud-config
-# SRNet exit seller: paste as "user data" when creating an Ubuntu 24.04 x86_64 server.
+# Exit seller pack: paste as "user data" when creating an Ubuntu 24.04 x86_64 server.
 # Edit the three values under write_files first. The server installs itself on first boot;
 # progress and the signed listing are written to /var/log/srnet-seller-install.log and to the
 # serial console (most providers show it in the web console), so no SSH login is needed.

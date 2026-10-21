@@ -2,7 +2,7 @@
 
 The signed list of exit sellers that `srnet exits` shows.
 
-- `board.py`: operator CLI (init, list, ban, unban, sign, tick, publish, verify)
+- `board.py`: admin CLI (init, list, ban, unban, sign, tick, publish, verify)
 - `board_server.py`: serves `board.json` + `board.sig`; the primary takes `POST /submit`,
   mirrors take `POST /publish` of a newer board signed by the pinned key
 - `deploy/install-board.sh`: one host, three Session Router names, systemd units

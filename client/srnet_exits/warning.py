@@ -7,8 +7,8 @@ from pathlib import Path
 from .killswitch import NOTE, NOTE_FALLBACK
 
 WARNING = """\
-SRNet exit visibility warning
-=============================
+Exit visibility warning
+=======================
 Exits are Beta: they work but are not production-certified.
 Keep amounts small.
 
