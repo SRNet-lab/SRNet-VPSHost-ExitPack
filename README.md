@@ -1,5 +1,10 @@
 # SRNet VPS Host Exit Pack
 
+<table>
+<tr><td align="center" colspan="2"><img src="docs/images/exit-sellers.png" width="860" alt="Exit sellers"><br>Exit sellers</td></tr>
+<tr><td align="center"><img src="docs/images/connected.png" width="420" alt="Connected"><br>Connected</td><td align="center"><img src="docs/images/buy-exit-time.png" width="420" alt="Buying exit time"><br>Buying exit time</td></tr>
+</table>
+
 **What's new**
 
 - No developer fee anywhere in SRNet.
